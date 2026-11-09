@@ -24,16 +24,22 @@ fn sample_pk(env: &Env, tag: u8) -> BytesN<65> {
     BytesN::from_array(env, &bytes)
 }
 
-/// Registers a factory, uploads the real smart-wallet wasm, and pins it via
-/// `initialize` — the setup every test below needs before `deploy` will do
-/// anything.
+const TEST_ORIGIN: &[u8] = b"https://polaris-frontend-iota.vercel.app";
+
+fn test_origin(env: &Env) -> Bytes {
+    Bytes::from_slice(env, TEST_ORIGIN)
+}
+
+/// Registers a factory, uploads the real smart-wallet wasm, and pins it
+/// (plus a fixed origin) via `initialize` — the setup every test below
+/// needs before `deploy` will do anything.
 fn setup(env: &Env) -> (Address, BytesN<32>) {
     env.mock_all_auths();
     let factory_id = env.register(SmartWalletFactory, ());
     let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
     let admin = Address::generate(env);
     let client = SmartWalletFactoryClient::new(env, &factory_id);
-    client.initialize(&admin, &wasm_hash);
+    client.initialize(&admin, &wasm_hash, &test_origin(env));
     (factory_id, wasm_hash)
 }
 
@@ -88,6 +94,23 @@ fn deployed_wallet_is_initialized_with_the_given_key() {
 }
 
 #[test]
+fn deployed_wallet_is_bound_to_the_factorys_pinned_origin() {
+    let env = Env::default();
+    let (factory_id, _) = setup(&env);
+    let pk = sample_pk(&env, 7);
+
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+    let wallet_address = client.deploy(&pk);
+
+    let stored_origin: Bytes = env.invoke_contract(
+        &wallet_address,
+        &soroban_sdk::Symbol::new(&env, "get_origin"),
+        soroban_sdk::vec![&env],
+    );
+    assert_eq!(stored_origin, test_origin(&env));
+}
+
+#[test]
 fn same_public_key_cannot_deploy_twice() {
     let env = Env::default();
     let (factory_id, _) = setup(&env);
@@ -120,8 +143,8 @@ fn double_initialize_rejected() {
     let admin = Address::generate(&env);
     let client = SmartWalletFactoryClient::new(&env, &factory_id);
 
-    client.initialize(&admin, &wasm_hash);
-    let result = client.try_initialize(&admin, &wasm_hash);
+    client.initialize(&admin, &wasm_hash, &test_origin(&env));
+    let result = client.try_initialize(&admin, &wasm_hash, &test_origin(&env));
     assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
 }
 
@@ -137,7 +160,7 @@ fn initialize_requires_the_admins_own_authorization() {
     let client = SmartWalletFactoryClient::new(&env, &factory_id);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.initialize(&admin, &wasm_hash)
+        client.initialize(&admin, &wasm_hash, &test_origin(&env))
     }));
     assert!(result.is_err(), "initialize without the admin's authorization must fail, not succeed");
 }

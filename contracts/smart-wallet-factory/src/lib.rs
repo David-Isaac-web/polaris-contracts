@@ -56,9 +56,10 @@
 //! code being deployed is always this factory's own known-good wallet
 //! implementation, never a caller's choice.
 
-use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, vec, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, vec, Address, Bytes, BytesN, Env, Symbol};
 
 const STORAGE_KEY_WASM_HASH: Symbol = symbol_short!("wasm");
+const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -74,29 +75,46 @@ pub struct SmartWalletFactory;
 #[contractimpl]
 impl SmartWalletFactory {
     /// One-time setup pinning which wallet code this factory will ever
-    /// deploy. `admin` is whoever controls this factory's configuration —
-    /// not a role any deployed wallet answers to, just the authority to set
-    /// this once. Must run before `deploy` will do anything.
-    pub fn initialize(env: Env, admin: Address, wasm_hash: BytesN<32>) -> Result<(), Error> {
+    /// deploy, and which WebAuthn relying-party `origin` every wallet it
+    /// deploys will be bound to (see `polaris-smart-wallet`'s `__check_auth`
+    /// doc comment for why this can't safely be a `deploy()`-time caller
+    /// parameter instead: `deploy` is deliberately unauthenticated, and a
+    /// caller-chosen origin would let anyone front-run a victim's own
+    /// `deploy` call and permanently brick their wallet with a wrong
+    /// origin before they ever use it — the exact same shape of bug this
+    /// factory already fixed once for `wasm_hash`, see this file's own
+    /// module doc, applied proactively here instead of waiting to find it
+    /// the same way.
+    ///
+    /// `admin` is whoever controls this factory's configuration — not a
+    /// role any deployed wallet answers to, just the authority to set this
+    /// once. Must run before `deploy` will do anything.
+    pub fn initialize(env: Env, admin: Address, wasm_hash: BytesN<32>, origin: Bytes) -> Result<(), Error> {
         admin.require_auth();
         if env.storage().instance().has(&STORAGE_KEY_WASM_HASH) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&STORAGE_KEY_WASM_HASH, &wasm_hash);
+        env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
         Ok(())
     }
 
     /// Deploys (and atomically initializes) a smart-wallet for
-    /// `public_key`, always running this factory's own pinned wasm — see
-    /// the module doc for why `wasm_hash` isn't a parameter anymore.
-    /// Deliberately unauthenticated: anyone can pay to deploy anyone's
-    /// wallet, which is what lets this system's backend onboard a user who
-    /// holds zero XLM.
+    /// `public_key`, always running this factory's own pinned wasm and
+    /// bound to this factory's own pinned origin — see the module doc for
+    /// why neither is a parameter here. Deliberately unauthenticated:
+    /// anyone can pay to deploy anyone's wallet, which is what lets this
+    /// system's backend onboard a user who holds zero XLM.
     pub fn deploy(env: Env, public_key: BytesN<65>) -> Result<Address, Error> {
         let wasm_hash: BytesN<32> = env
             .storage()
             .instance()
             .get(&STORAGE_KEY_WASM_HASH)
+            .ok_or(Error::NotInitialized)?;
+        let origin: Bytes = env
+            .storage()
+            .instance()
+            .get(&STORAGE_KEY_ORIGIN)
             .ok_or(Error::NotInitialized)?;
         let salt = env.crypto().sha256(&public_key.clone().into());
         let address = env
@@ -106,7 +124,7 @@ impl SmartWalletFactory {
         let _: () = env.invoke_contract(
             &address,
             &symbol_short!("init"),
-            vec![&env, public_key.to_val()],
+            vec![&env, public_key.to_val(), origin.to_val()],
         );
         Ok(address)
     }

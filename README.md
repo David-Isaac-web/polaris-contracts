@@ -24,7 +24,7 @@ This is one of three repos that make up Polaris:
 | Contract | Address |
 |---|---|
 | Capital-efficiency vault | [`CDAZVYBSONMRKSXILQGYWIMDHIAWNWISBOEEPU6EG7RUBJPGHP6VZZBW`](https://stellar.expert/explorer/testnet/contract/CDAZVYBSONMRKSXILQGYWIMDHIAWNWISBOEEPU6EG7RUBJPGHP6VZZBW) (redeployed — see `polaris-oracle`'s README, bug 16, for why the original instance was abandoned rather than reused) |
-| Smart-wallet factory | [`CCLDHPEJBENBV3GRZRHO7RH5OZRTBWP7DWB36L3OCWLKEEAP6FJTTJ5U`](https://stellar.expert/explorer/testnet/contract/CCLDHPEJBENBV3GRZRHO7RH5OZRTBWP7DWB36L3OCWLKEEAP6FJTTJ5U) |
+| Smart-wallet factory | [`CCBVJYZWNEOQTY6KVCPZ2G6YJ7QTBPUEO6IE6YT7J2QZDQW2Q5Z43VQY`](https://stellar.expert/explorer/testnet/contract/CCBVJYZWNEOQTY6KVCPZ2G6YJ7QTBPUEO6IE6YT7J2QZDQW2Q5Z43VQY) (redeployed — see the smart-wallet section's "relying-party `origin`/`type` checks" below for why the prior instance's wallets run code with no origin binding and are unaffected, not reused) |
 | Mock RedStone (testnet stand-in) | [`CAFAVGX6VUIRPK2KDCK7QGJEOOBM2EWCIA5UJBLOR2T7HZINKVKYRYTI`](https://stellar.expert/explorer/testnet/contract/CAFAVGX6VUIRPK2KDCK7QGJEOOBM2EWCIA5UJBLOR2T7HZINKVKYRYTI) |
 
 Individual market/perpetual contracts are deployed on demand by
@@ -280,12 +280,55 @@ anyone's wallet" is the intended, safe design `polaris-oracle` relies on to
 onboard a user who holds zero XLM — that's only ever safe once the code
 being deployed can no longer be the caller's choice.
 
-Verified live: deployed a fresh factory instance
-(`CCLDHPEJBENBV3GRZRHO7RH5OZRTBWP7DWB36L3OCWLKEEAP6FJTTJ5U`, the address
-listed under [Live on testnet](#live-on-testnet) above), initialized it,
-and confirmed via the running `polaris-oracle` (a real email-login wallet
+Verified live: deployed a fresh factory instance, initialized it, and
+confirmed via the running `polaris-oracle` (a real email-login wallet
 deploy) plus a direct on-chain `get_public_key` read that the deployed
 wallet's stored key matches exactly what the backend generated.
+
+### Relying-party `origin`/`type` checks — a missing WebAuthn verification step, found in a security review
+
+`__check_auth` originally verified only two of the three things the
+WebAuthn spec (§7.2) requires: the signature's cryptographic validity, and
+`client_data_json.challenge` binding to the host-computed
+`signature_payload`. It never checked `client_data_json.type` or `.origin`.
+
+Those two checks exist for a specific reason the first two don't cover: a
+signature proves *a* WebAuthn ceremony produced it, for *any* origin
+sharing the wallet's `rpId` scope — not that the ceremony happened in a
+context the wallet owner actually meant to authorize a transaction from. A
+WebAuthn assertion silently requested from an untrusted page (a same-origin
+XSS calling `navigator.credentials.get()` directly, bypassing the app's own
+trade-confirmation UI entirely) would pass both original checks — the
+browser's Face ID/Touch ID prompt gives no indication of *what* is being
+authorized, so the victim approves what looks like an ordinary sign-in.
+Without the `origin` check, that silently authorizes whatever transaction
+the script asked for.
+
+Fixed by storing an `origin` at `init()` time (alongside the public key,
+same fixed-for-the-wallet's-lifetime treatment) and requiring
+`client_data_json.type == "webauthn.get"` and `.origin == stored_origin` in
+`__check_auth`. `origin` is pinned once at **factory** setup
+(`initialize(admin, wasm_hash, origin)`), not a `deploy()`-time caller
+parameter — `deploy` is deliberately unauthenticated, so a caller-chosen
+origin would let anyone front-run a victim's own deploy call and
+permanently brick their wallet with a wrong origin before they ever use
+it, the same shape of bug this file already fixed once for `wasm_hash`
+above, applied proactively here instead of waiting to find it the same
+way.
+
+Verified with real, independently-signed secp256r1 vectors (not
+byte-edited forgeries — editing `client_data_json` after signing would
+just invalidate the signature): `wrong_origin_rejected` inits a wallet
+with one origin and presents a validly-signed assertion for a different
+one; `wrong_ceremony_type_rejected` is a second, genuinely distinct signed
+vector whose `type` is `"webauthn.create"` instead of `"webauthn.get"`. See
+`contracts/smart-wallet/src/test.rs`.
+
+Deployed as a fresh factory instance (existing wallets from the prior
+factory keep running their original wasm, with no origin binding —
+unaffected, same "redeploy rather than retrofit" pattern as the vault's
+admin-rotation incident above) — the address listed under
+[Live on testnet](#live-on-testnet).
 
 ## The capital-efficiency vault
 
@@ -509,7 +552,7 @@ live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 96 across the whole workspace)
+# unit tests (native target; 100 across the whole workspace)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -527,12 +570,12 @@ shasum -a 256 target/wasm32v1-none/release/*.wasm
 |---|---|
 | `polaris-market` | 48 |
 | `polaris-perpetual` | 22 |
-| `polaris-smart-wallet` | 8 |
-| `polaris-smart-wallet-factory` | 8 |
+| `polaris-smart-wallet` | 11 |
+| `polaris-smart-wallet-factory` | 9 |
 | `polaris-vault` | 6 |
 | `polaris-mock-redstone` | 3 |
 | `polaris-mock-lazer` | 1 |
-| **Total** | **96** |
+| **Total** | **100** |
 
 Current build (regenerate after any contract change — `polaris-oracle`'s
 `MARKET_WASM_HASH`/`PERPETUAL_WASM_HASH` must track whatever hash is
@@ -540,12 +583,12 @@ actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 59,432 bytes | `da91d0c96215ca6c9744dc6e678299132061e749e945de206e4ff8f725d967be` |
+| `polaris_market.wasm` | 59,407 bytes | `8ad8d17ad08c78f6afb52152fe4976422102e2c9f125716532a4a0396ccb4918` |
 | `polaris_perpetual.wasm` | 57,367 bytes | `b62909fa2c78b083a8973b7b733b0ce9e4b8cdb1efd1d0169f61c93370af9727` |
 | `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
 | `polaris_mock_redstone.wasm` | 7,280 bytes | `0db6ff0394999bb28e97a786c5b64891f341290aa323d8a8aec78b711eb28cdf` |
-| `polaris_smart_wallet.wasm` | 25,308 bytes | `7f03d5d0c640280a38b36b5fb7e4fa9b4d3d0cfb77764d4a66207e3812407616` |
-| `polaris_smart_wallet_factory.wasm` | 6,427 bytes | `c004f94b67dabab142804abc924cf28b0f159b3c4d4c18a3f26e017f642caf9e` |
+| `polaris_smart_wallet.wasm` | 27,049 bytes | `bb2e397ba9d56cb58649941576c51e452063554bb43d15d4dfbd29987b1f7dbf` |
+| `polaris_smart_wallet_factory.wasm` | 7,583 bytes | `d64cd44f402db8fb657e8256b20ef7c1b89ebb011bf5adf7e48e3ca335729710` |
 | `polaris_vault.wasm` | 10,568 bytes | `5847a7781556d7c4e727e63fe48a84d6bed9ff6c34686e6a0b09a03d3c925c3d` |
 
 ## Deploying

@@ -37,24 +37,41 @@
 //! WebAuthn doesn't sign `signature_payload` directly — it signs
 //! `authenticator_data ‖ sha256(client_data_json)`, and `client_data_json`
 //! contains a `challenge` field that the *browser* base64url-encodes from
-//! whatever bytes it was asked to sign. So verification has two parts:
+//! whatever bytes it was asked to sign. So verification has three parts:
 //! 1. Cryptographic: does `signature` verify against the wallet's stored
 //!    public key for `sha256(authenticator_data ‖ sha256(client_data_json))`?
-//! 2. Binding: does `client_data_json.challenge` actually equal
+//! 2. Challenge binding: does `client_data_json.challenge` actually equal
 //!    `base64url(signature_payload)` — i.e. did the passkey sign *this*
 //!    transaction and not some other payload?
-//! Skipping either check breaks the whole scheme — (1) alone would accept a
-//! valid signature over an unrelated challenge; (2) alone has nothing to
-//! verify against.
+//! 3. Relying-party binding (`type`/`origin`, WebAuthn spec §7.2): does
+//!    `client_data_json.type` equal `"webauthn.get"`, and `.origin` equal
+//!    the one origin this wallet was initialized to trust? A signature
+//!    cryptographically covers *whatever* ceremony produced it, for *any*
+//!    origin that shares this wallet's `rpId` scope — (1) and (2) alone
+//!    prove "the right key signed the right challenge," not "this ceremony
+//!    was actually performed in a context the wallet owner meant to
+//!    authorize a transaction from." A WebAuthn ceremony silently relayed
+//!    from an untrusted page (a phishing clone, a different origin under
+//!    the same `rpId` registrable domain) would pass (1) and (2) with no
+//!    way to tell it apart from the real thing without this third check.
+//! Skipping any of the three breaks the scheme: (1) alone accepts a valid
+//! signature over an unrelated challenge; (2) alone has nothing to verify
+//! against; (1)+(2) without (3) can't distinguish *where* the signing
+//! ceremony actually happened.
 //!
 //! ## A property this build does not implement
 //!
 //! Real WebAuthn deployments must track and reject replayed authenticator
 //! `signCount` values (clone detection) and typically support multiple
 //! registered signers per wallet with revocation. This build stores exactly
-//! one public key, set once at `init`, with no rotation — enough to
-//! demonstrate the passkey-as-Soroban-signer mechanism, not a production
-//! account-recovery story.
+//! one public key and one trusted origin, set once at `init`, with no
+//! rotation — enough to demonstrate the passkey-as-Soroban-signer
+//! mechanism, not a production account-recovery story. A future frontend
+//! domain change (this project has already moved domains more than once)
+//! means a new factory deployment pinned to the new origin, same pattern
+//! already used for this project's other no-rotation gaps (see this
+//! repo's vault admin-rotation issue) — existing wallets keep running
+//! their original wasm, bound to their original origin, unaffected.
 
 use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
@@ -68,6 +85,7 @@ mod base64_url;
 mod test;
 
 const STORAGE_KEY_PK: Symbol = symbol_short!("pk");
+const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -77,6 +95,8 @@ pub enum Error {
     AlreadyInitialized = 2,
     ChallengeMismatch = 3,
     ClientDataJsonParseError = 4,
+    OriginMismatch = 5,
+    TypeMismatch = 6,
 }
 
 #[contract]
@@ -86,12 +106,19 @@ pub struct SmartWallet;
 impl SmartWallet {
     /// One-time init with the wallet's secp256r1 public key (65-byte
     /// uncompressed SEC1 point, as returned by
-    /// `crypto.subtle.exportKey('raw', ...)` on the passkey's public key).
-    pub fn init(env: Env, public_key: BytesN<65>) -> Result<(), Error> {
+    /// `crypto.subtle.exportKey('raw', ...)` on the passkey's public key)
+    /// and the WebAuthn relying-party origin this wallet will ever accept
+    /// a signature from (e.g. `b"https://polaris-frontend-iota.vercel.app"`).
+    ///
+    /// `origin` is fixed for the wallet's lifetime, same as `public_key` —
+    /// see `__check_auth`'s doc comment for why this can't be a
+    /// `deploy()`-time caller parameter instead.
+    pub fn init(env: Env, public_key: BytesN<65>, origin: Bytes) -> Result<(), Error> {
         if env.storage().instance().has(&STORAGE_KEY_PK) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&STORAGE_KEY_PK, &public_key);
+        env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
         Ok(())
     }
 
@@ -99,6 +126,13 @@ impl SmartWallet {
         env.storage()
             .instance()
             .get(&STORAGE_KEY_PK)
+            .ok_or(Error::NotInitialized)
+    }
+
+    pub fn get_origin(env: Env) -> Result<Bytes, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_ORIGIN)
             .ok_or(Error::NotInitialized)
     }
 }
@@ -122,7 +156,10 @@ pub struct Signature {
 
 #[derive(serde::Deserialize)]
 struct ClientDataJson<'a> {
+    #[serde(rename = "type")]
+    type_: &'a str,
     challenge: &'a str,
+    origin: &'a str,
 }
 
 #[contractimpl]
@@ -169,6 +206,25 @@ impl CustomAccountInterface for SmartWallet {
 
         if client_data.challenge.as_bytes() != expected_challenge {
             return Err(Error::ChallengeMismatch);
+        }
+
+        // Relying-party binding — see the module doc's "three parts" for
+        // why cryptographic validity plus challenge binding alone isn't
+        // enough. `type` must be exactly the assertion ceremony type (not
+        // e.g. `webauthn.create`, which signs a different structure but
+        // could otherwise collide); `origin` must match what this specific
+        // wallet was initialized to trust.
+        if client_data.type_ != "webauthn.get" {
+            return Err(Error::TypeMismatch);
+        }
+
+        let expected_origin: Bytes = env
+            .storage()
+            .instance()
+            .get(&STORAGE_KEY_ORIGIN)
+            .ok_or(Error::NotInitialized)?;
+        if Bytes::from_slice(&env, client_data.origin.as_bytes()) != expected_origin {
+            return Err(Error::OriginMismatch);
         }
 
         Ok(())
