@@ -421,6 +421,71 @@ fn merge_more_than_held_rejected() {
     );
 }
 
+// ---------- pause / unpause ----------
+
+#[test]
+fn pause_blocks_buy_and_sell_but_not_split_merge_or_redeem() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.pause();
+    assert!(client.is_paused());
+
+    assert_eq!(
+        client.try_buy(&user, &Prediction::Yes, &1_000, &0),
+        Err(Ok(Error::Paused))
+    );
+    assert_eq!(
+        client.try_sell(&user, &Prediction::Yes, &1_000, &0),
+        Err(Ok(Error::Paused))
+    );
+
+    // split/merge are fixed 1:1, not AMM-priced — a pause meant to stop a
+    // buggy AMM curve has no reason to also freeze these.
+    client.split(&user, &1_000);
+    client.merge(&user, &1_000);
+
+    client.unpause();
+    assert!(!client.is_paused());
+    let total_yes = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    assert!(total_yes > 0);
+}
+
+#[test]
+fn pause_requires_admin_auth() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.pause();
+    // `mock_all_auths()` auto-approves every call regardless of caller, but
+    // still records which address's `require_auth()` fired — confirming
+    // it's the market's admin, not e.g. an arbitrary caller, is the
+    // meaningful check here (catches a copy-paste bug like gating on
+    // `user` instead of `m.admin`).
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+}
+
+#[test]
+fn redeem_still_works_while_paused() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000);
+
+    client.pause();
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace + 1);
+    client.cancel();
+    // Cancelled payout is always callable, pause or not — funds already
+    // resolved/cancelled must never be frozen by a trading-halt switch.
+    let payout = client.redeem(&user);
+    assert_eq!(payout, 1_000);
+}
+
 // ---------- buy / sell (AMM) ----------
 
 #[test]

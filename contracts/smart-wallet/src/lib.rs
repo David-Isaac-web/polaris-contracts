@@ -86,6 +86,17 @@ mod test;
 
 const STORAGE_KEY_PK: Symbol = symbol_short!("pk");
 const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
+/// Same bump window `contracts/market`/`contracts/perpetual` use — see
+/// #11: unlike those two (bumped as a side effect of every trade), this
+/// contract is only ever touched by `init` (once) and `__check_auth`
+/// (only when its owner actually trades), so a wallet that goes dormant
+/// for a long stretch needs an explicit extend, not an incidental one.
+const BUMP_TO: u32 = 535_680;
+const BUMP_THRESHOLD: u32 = 500_000;
+
+fn touch(env: &Env) {
+    env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -119,6 +130,7 @@ impl SmartWallet {
         }
         env.storage().instance().set(&STORAGE_KEY_PK, &public_key);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
+        touch(&env);
         Ok(())
     }
 
@@ -227,6 +239,7 @@ impl CustomAccountInterface for SmartWallet {
             return Err(Error::OriginMismatch);
         }
 
+        touch(&env);
         Ok(())
     }
 }

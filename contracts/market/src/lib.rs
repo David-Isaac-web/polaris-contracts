@@ -140,6 +140,11 @@ pub enum Error {
     /// variant above — unanimous, not majority: either leg disagreeing
     /// rejects the call the same way.
     InvalidRedstoneConfig = 34,
+    /// `buy`/`sell` are blocked while the admin has paused trading — see
+    /// `pause()`'s doc comment. `split`/`merge`/`redeem` are never blocked
+    /// by this, only the AMM-math-dependent entrypoints a pause exists to
+    /// protect against.
+    Paused = 35,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +228,14 @@ pub enum DataKey {
     /// Present only if this market was `initialize`d with a `redstone`
     /// oracle configured — see `RedstoneOracle`'s doc comment.
     Redstone,
+    /// Deliberately its own storage key, not a `Market` struct field — a
+    /// struct field would change `Market`'s stored shape, breaking
+    /// deserialization of every already-deployed instance's existing data
+    /// the moment this code redeploys. A missing key just means "never
+    /// paused" via `is_paused`'s `unwrap_or(false)`, so this is purely
+    /// additive for old and new instances alike. See #4's identical
+    /// reasoning for `vault`'s `PendingAdmin` key.
+    Paused,
 }
 
 fn touch(env: &Env) {
@@ -245,6 +258,10 @@ fn save_market(env: &Env, m: &Market) {
 
 fn load_redstone_oracle(env: &Env) -> Option<RedstoneOracle> {
     env.storage().instance().get(&DataKey::Redstone)
+}
+
+fn is_paused(env: &Env) -> bool {
+    env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
 }
 
 fn balance_of(env: &Env, side: Prediction, addr: &Address) -> i128 {
@@ -421,6 +438,38 @@ impl PolarisMarket {
         Ok(())
     }
 
+    /// Admin-gated circuit breaker for `buy`/`sell` specifically — the two
+    /// entrypoints whose correctness depends on the shared AMM/fee-curve
+    /// math (`cpmm_out`/`cpmm_sell_out`/`apply_fee`). Independent of
+    /// `status`: a paused-but-`Open` market still allows `split`/`merge`
+    /// (fixed 1:1 collateral<->share pairs, not priced by the AMM, so a
+    /// bug in the AMM math can't reach them) and always allows `redeem`
+    /// once resolved/cancelled, so funds are never frozen by a pause. See
+    /// the top-level README's pre-mainnet checklist for why this exists:
+    /// before this, a live AMM-math bug had no faster mitigation than
+    /// waiting for natural expiry.
+    pub fn pause(env: Env) -> Result<(), Error> {
+        let m = load_market(&env)?;
+        m.admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        touch(&env);
+        env.events().publish((symbol_short!("paused"),), ());
+        Ok(())
+    }
+
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        let m = load_market(&env)?;
+        m.admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        touch(&env);
+        env.events().publish((symbol_short!("unpaused"),), ());
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
     /// Lock `amount` collateral, mint `amount` YES + `amount` NO to `user`.
     pub fn split(env: Env, user: Address, amount: i128) -> Result<(), Error> {
         user.require_auth();
@@ -482,6 +531,9 @@ impl PolarisMarket {
         min_shares_out: i128,
     ) -> Result<i128, Error> {
         user.require_auth();
+        if is_paused(&env) {
+            return Err(Error::Paused);
+        }
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -544,6 +596,9 @@ impl PolarisMarket {
         min_collateral_out: i128,
     ) -> Result<i128, Error> {
         user.require_auth();
+        if is_paused(&env) {
+            return Err(Error::Paused);
+        }
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
             return Err(Error::MarketNotOpen);

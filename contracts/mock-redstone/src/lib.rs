@@ -44,6 +44,13 @@ const DEFAULT_DECIMALS: u32 = 8;
 /// need to accommodate a half-day-stale reading just to pass
 /// `initialize`'s validation.
 const DEFAULT_RESOLUTION_SECS: u32 = 300;
+/// Same bump window used across this workspace — see #11.
+const BUMP_TO: u32 = 535_680;
+const BUMP_THRESHOLD: u32 = 500_000;
+
+fn touch(env: &Env) {
+    env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+}
 
 #[contract]
 pub struct MockRedstone;
@@ -54,18 +61,22 @@ impl MockRedstone {
     /// this whole contract only exists to be poked freely on testnet.
     pub fn set_price(env: Env, price: i128, timestamp: u64) {
         env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
+        touch(&env);
     }
 
     pub fn set_none(env: Env) {
         env.storage().instance().remove(&PRICE_KEY);
+        touch(&env);
     }
 
     pub fn set_decimals(env: Env, decimals: u32) {
         env.storage().instance().set(&DECIMALS_KEY, &decimals);
+        touch(&env);
     }
 
     pub fn set_resolution(env: Env, resolution: u32) {
         env.storage().instance().set(&RESOLUTION_KEY, &resolution);
+        touch(&env);
     }
 
     pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {

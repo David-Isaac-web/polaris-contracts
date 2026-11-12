@@ -14,12 +14,22 @@
 
 use soroban_sdk::{contract, contractimpl, Bytes, Env};
 
+/// Same bump window used across this workspace — see #11. This contract
+/// writes no instance *storage* at all, but the instance ledger entry
+/// itself (which also holds the deployed executable) still has its own
+/// TTL independent of whether any storage key is ever set — extending it
+/// on every call is the only thing standing between this contract and
+/// archival if it goes untouched long enough.
+const BUMP_TO: u32 = 535_680;
+const BUMP_THRESHOLD: u32 = 500_000;
+
 #[contract]
 pub struct MockLazer;
 
 #[contractimpl]
 impl MockLazer {
-    pub fn verify_update(_env: Env, data: Bytes) -> Bytes {
+    pub fn verify_update(env: Env, data: Bytes) -> Bytes {
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
         data
     }
 }

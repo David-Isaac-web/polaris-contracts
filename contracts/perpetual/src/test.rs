@@ -298,6 +298,62 @@ fn trading_continues_correctly_across_a_very_long_time_window_with_no_expiry_eve
     assert_solvent(&h);
 }
 
+// ---------- pause / unpause ----------
+
+#[test]
+fn pause_blocks_buy_and_sell_but_not_split_merge_or_redeem() {
+    let h = setup(10_000, true);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+
+    client.pause();
+    assert!(client.is_paused());
+
+    assert_eq!(
+        client.try_buy(&user, &Prediction::Yes, &1_000, &0),
+        Err(Ok(Error::Paused))
+    );
+    assert_eq!(
+        client.try_sell(&user, &Prediction::Yes, &1_000, &0),
+        Err(Ok(Error::Paused))
+    );
+
+    client.split(&user, &1_000);
+    client.merge(&user, &1_000);
+
+    client.unpause();
+    assert!(!client.is_paused());
+    let total_yes = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    assert!(total_yes > 0);
+}
+
+#[test]
+fn pause_requires_admin_auth() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    client.pause();
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+}
+
+#[test]
+fn redeem_still_works_while_paused() {
+    let h = setup(10_000, true);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000);
+
+    client.pause();
+    client.terminate(&h.admin);
+    // Terminate (and the redeem it unlocks) is a wind-down/exit path, not
+    // an AMM-math-dependent trade — pause must never block it.
+    let payout = client.redeem(&user);
+    assert_eq!(payout, 1_000);
+}
+
 // ---------- record_price_checkpoint: zero economic effect ----------
 
 #[test]

@@ -139,6 +139,10 @@ pub enum Error {
     /// precision, and can change): see this repo's README.
     RedstoneDecimalsChanged = 29,
     InvalidRedstoneConfig = 30,
+    /// `buy`/`sell` are blocked while the admin has paused trading — see
+    /// `pause()`'s doc comment, identical rationale to `polaris-market`'s
+    /// `Error::Paused`.
+    Paused = 31,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,6 +237,11 @@ pub enum DataKey {
     /// the struct-field `ScVal` path — so the optional config lives under
     /// its own key instead.
     PriceOracle,
+    /// Own storage key, not a `Perpetual` struct field — same reasoning as
+    /// `polaris-market`'s `DataKey::Paused`: adding a struct field would
+    /// break deserialization of every already-deployed instance's stored
+    /// data on redeploy, while a missing key just means "never paused".
+    Paused,
 }
 
 fn touch(env: &Env) {
@@ -241,6 +250,10 @@ fn touch(env: &Env) {
 
 fn load_market(env: &Env) -> Result<Perpetual, Error> {
     env.storage().instance().get(&DataKey::Market).ok_or(Error::NotInitialized)
+}
+
+fn is_paused(env: &Env) -> bool {
+    env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
 }
 
 fn save_market(env: &Env, m: &Perpetual) {
@@ -385,6 +398,31 @@ impl PolarisPerpetual {
         Ok(())
     }
 
+    /// Admin-gated circuit breaker for `buy`/`sell` — identical rationale
+    /// to `polaris-market`'s `pause()`. `split`/`merge`/`redeem` are never
+    /// blocked by this.
+    pub fn pause(env: Env) -> Result<(), Error> {
+        let m = load_market(&env)?;
+        m.admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        touch(&env);
+        env.events().publish((symbol_short!("paused"),), ());
+        Ok(())
+    }
+
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        let m = load_market(&env)?;
+        m.admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        touch(&env);
+        env.events().publish((symbol_short!("unpaused"),), ());
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
     /// Lock `amount` collateral, mint `amount` YES + `amount` NO to `user`.
     /// Identical to `polaris-market`'s `split`.
     pub fn split(env: Env, user: Address, amount: i128) -> Result<(), Error> {
@@ -439,6 +477,9 @@ impl PolarisPerpetual {
         min_shares_out: i128,
     ) -> Result<i128, Error> {
         user.require_auth();
+        if is_paused(&env) {
+            return Err(Error::Paused);
+        }
         let mut m = load_market(&env)?;
         if m.status != PerpetualStatus::Open {
             return Err(Error::MarketNotOpen);
@@ -483,6 +524,9 @@ impl PolarisPerpetual {
         min_collateral_out: i128,
     ) -> Result<i128, Error> {
         user.require_auth();
+        if is_paused(&env) {
+            return Err(Error::Paused);
+        }
         let mut m = load_market(&env)?;
         if m.status != PerpetualStatus::Open {
             return Err(Error::MarketNotOpen);

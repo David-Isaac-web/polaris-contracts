@@ -58,9 +58,25 @@ mod market_contract {
     soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/polaris_market.wasm");
 }
 
+/// Same TTL bump market/perpetual already use (~31 days at 5s/ledger) —
+/// see #11: this vault can go long stretches with no calls at all
+/// (unlike market/perpetual, bumped as a side effect of every trade), so
+/// without this every entrypoint explicitly calls `touch()` to extend
+/// its own instance-storage TTL, not just the ones that happen to write.
+const BUMP_TO: u32 = 535_680;
+const BUMP_THRESHOLD: u32 = 500_000;
+
+fn touch(env: &Env) {
+    env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+}
+
 const STORAGE_KEY_ADMIN: Symbol = symbol_short!("admin");
 const STORAGE_KEY_COLLATERAL: Symbol = symbol_short!("collat");
 const STORAGE_KEY_TOTAL_DEPOSITED: Symbol = symbol_short!("deposit");
+/// Set only between a `propose_admin` and the matching `accept_admin` —
+/// absent the rest of the time. See `propose_admin`'s doc comment for why
+/// this is two steps, not a single `set_admin`.
+const STORAGE_KEY_PENDING_ADMIN: Symbol = symbol_short!("pending");
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -70,6 +86,9 @@ pub enum Error {
     NotInitialized = 2,
     InvalidAmount = 3,
     Unauthorized = 4,
+    /// `accept_admin` called with no `propose_admin` ever having been
+    /// called (or one already consumed by a prior `accept_admin`).
+    NoPendingAdmin = 5,
 }
 
 #[contract]
@@ -90,6 +109,7 @@ impl Vault {
         env.storage().instance().set(&STORAGE_KEY_ADMIN, &admin);
         env.storage().instance().set(&STORAGE_KEY_COLLATERAL, &collateral);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &0i128);
+        touch(&env);
         Ok(())
     }
 
@@ -108,6 +128,7 @@ impl Vault {
 
         let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_DEPOSITED).unwrap_or(0);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &(total + amount));
+        touch(&env);
         env.events().publish((symbol_short!("deposit"), from), amount);
         Ok(())
     }
@@ -126,6 +147,7 @@ impl Vault {
         }
         let collateral = Self::require_collateral(&env)?;
         token::Client::new(&env, &collateral).transfer(&env.current_contract_address(), &to, &amount);
+        touch(&env);
         env.events().publish((symbol_short!("withdraw"), to), amount);
         Ok(())
     }
@@ -141,8 +163,55 @@ impl Vault {
         Self::require_admin(&env, &admin)?;
         let market = market_contract::Client::new(&env, &market_id);
         let payout = market.redeem(&env.current_contract_address());
+        touch(&env);
         env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
         Ok(payout)
+    }
+
+    /// Step 1 of a two-step admin rotation. Deliberately not a single-call
+    /// `set_admin`: a typo'd/unreachable `proposed` address would
+    /// permanently brick the vault out of its own funds exactly the way
+    /// the *absence* of any rotation entrypoint already did once in
+    /// production (see this repo's README / issue #4) — the new admin
+    /// has to actually show up and sign `accept_admin` with its own key
+    /// before the swap takes effect, so a bad proposal is harmless and
+    /// reversible (just propose again) instead of a one-way mistake.
+    pub fn propose_admin(env: Env, current_admin: Address, proposed: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &current_admin)?;
+        env.storage().instance().set(&STORAGE_KEY_PENDING_ADMIN, &proposed);
+        touch(&env);
+        env.events().publish((symbol_short!("propose"),), proposed.clone());
+        Ok(())
+    }
+
+    /// Step 2: the proposed admin confirms with their own signature. Only
+    /// the exact address `propose_admin` named can call this successfully
+    /// — not the current admin, not anyone else — which is what actually
+    /// proves the new key is live, held, and able to sign before it
+    /// becomes the only key that can move funds.
+    pub fn accept_admin(env: Env, proposed: Address) -> Result<(), Error> {
+        proposed.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&STORAGE_KEY_PENDING_ADMIN)
+            .ok_or(Error::NoPendingAdmin)?;
+        if pending != proposed {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&STORAGE_KEY_ADMIN, &proposed);
+        env.storage().instance().remove(&STORAGE_KEY_PENDING_ADMIN);
+        touch(&env);
+        env.events().publish((symbol_short!("newadmin"),), proposed);
+        Ok(())
+    }
+
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&STORAGE_KEY_PENDING_ADMIN)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage().instance().get(&STORAGE_KEY_ADMIN).ok_or(Error::NotInitialized)
     }
 
     pub fn get_balance(env: Env) -> Result<i128, Error> {

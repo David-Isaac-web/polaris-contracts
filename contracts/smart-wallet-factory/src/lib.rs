@@ -60,6 +60,17 @@ use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, vec, Addr
 
 const STORAGE_KEY_WASM_HASH: Symbol = symbol_short!("wasm");
 const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
+/// Same bump window used across this workspace — see #11. `initialize`
+/// only ever runs once per factory instance, so without this the
+/// factory's own storage TTL has nothing else to keep it alive between
+/// then and whenever `deploy` is next called — which, on a low-traffic
+/// deployment, could be a long time.
+const BUMP_TO: u32 = 535_680;
+const BUMP_THRESHOLD: u32 = 500_000;
+
+fn touch(env: &Env) {
+    env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -96,6 +107,7 @@ impl SmartWalletFactory {
         }
         env.storage().instance().set(&STORAGE_KEY_WASM_HASH, &wasm_hash);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
+        touch(&env);
         Ok(())
     }
 
@@ -126,6 +138,7 @@ impl SmartWalletFactory {
             &symbol_short!("init"),
             vec![&env, public_key.to_val(), origin.to_val()],
         );
+        touch(&env);
         Ok(address)
     }
 

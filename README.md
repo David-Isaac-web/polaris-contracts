@@ -210,9 +210,50 @@ pool drained it from 10,000 down to 1 before this guard existed (see
 ## Errors, not panics
 
 Every entrypoint returns `Result<T, Error>` with a typed `#[contracterror]`
-enum (23 variants) rather than trapping. A failed call still reverts the
-whole transaction — atomicity isn't lost — but callers get a structured
-reason instead of an opaque panic.
+enum rather than trapping. A failed call still reverts the whole
+transaction — atomicity isn't lost — but callers get a structured reason
+instead of an opaque panic.
+
+## Emergency pause
+
+Neither `market` nor `perpetual` used to have any way to stop trading
+faster than natural expiry (classic market) or a full, irreversible
+`terminate()` (perpetual) — so a critical bug in the shared
+`cpmm_out`/`cpmm_sell_out`/`apply_fee` math on an already-live market had
+no faster mitigation than waiting it out. Fixed with an admin-gated
+`pause()`/`unpause()` pair on both contracts, scoped narrowly to `buy`/
+`sell` specifically — the two entrypoints whose correctness actually
+depends on that shared AMM math. `split`/`merge` stay available while
+paused (fixed 1:1 collateral↔share pairs, not AMM-priced, so a pricing bug
+can't reach them), and `redeem` is *never* blocked by a pause — funds
+already resolved/cancelled/terminated can never be frozen by this switch.
+Independent of `status`/`PerpetualStatus`: pausing doesn't change whether
+a market is `Open`, it just gates the two riskiest entrypoints within that
+state.
+([#8](https://github.com/PolarisQ-xyz/polaris-contracts/issues/8), tests:
+`pause_blocks_buy_and_sell_but_not_split_merge_or_redeem`,
+`pause_requires_admin_auth`, `redeem_still_works_while_paused`, in both
+`contracts/market/src/test.rs` and `contracts/perpetual/src/test.rs`.)
+
+## Instance-storage TTL
+
+`market` and `perpetual` have always called `extend_ttl` on every write —
+but `vault`, `smart-wallet`, `smart-wallet-factory`, `mock-redstone`, and
+`mock-lazer` never did, despite all five writing to (or, for `mock-lazer`,
+simply owning) instance storage. Soroban archives an entry once its TTL
+lapses; the next call touching it fails until someone submits a
+`RestoreFootprintOp`. Market/perpetual are low-risk in practice (every
+`buy`/`sell` bumps TTL as a side effect of ordinary usage) — the vault
+specifically holds real pooled capital and can go long stretches between
+`deposit`/`withdraw` calls, and a low-traffic `smart-wallet-factory` could
+see long gaps between any two signups. All five now call the same
+`extend_ttl(BUMP_THRESHOLD, BUMP_TO)` pattern market/perpetual already
+established, on every entrypoint that touches instance storage (or, for
+`smart-wallet`'s `__check_auth` and `smart-wallet-factory`'s `deploy`,
+on every successful *use* of the contract, not just its one-time setup
+call — a dormant wallet/factory needs the TTL refreshed by something other
+than a setup call that only ever runs once).
+([#11](https://github.com/PolarisQ-xyz/polaris-contracts/issues/11).)
 
 ## Cost-driven fee curve
 
@@ -355,14 +396,21 @@ not fractional LP shares. Multiple depositors can `deposit`, but there's no
 proportional-withdrawal accounting yet — a real multi-LP product needs
 share accounting before this is safe to open past a single trusted
 operator ([tracked as an open issue](https://github.com/PolarisQ-xyz/polaris-contracts/issues/2)).
-**A second, equally real consequence of v1's simplicity**: `admin` is set
-once at `initialize()` and the contract has no rotation function at all —
+**A second, real consequence of v1's simplicity, now fixed**: `admin` used
+to be set once at `initialize()` with no rotation function at all —
 confirmed the hard way when a production signing-key rotation (see
 `polaris-oracle`'s README, bug 16) permanently locked the first deployed
 vault instance out of its own funds, with no way to recover access short
-of abandoning it and deploying a fresh one. Worth an admin-rotation
-entrypoint in a future round, same honesty-about-scope as the
-single-LP-share gap above.
+of abandoning it and deploying a fresh one. Fixed with a two-step
+`propose_admin(current_admin, proposed)` / `accept_admin(proposed)` pair
+(not a single-call `set_admin`): the proposed address must show up and
+sign `accept_admin` with its own key before the rotation takes effect, so
+a typo'd or unreachable address is harmless — just propose again — instead
+of permanently bricking the vault the way the *missing* rotation already
+did once. ([#4](https://github.com/PolarisQ-xyz/polaris-contracts/issues/4),
+tests: `propose_then_accept_rotates_admin`,
+`accept_admin_rejects_a_different_address_than_the_one_proposed`,
+`a_bad_proposal_is_harmless_and_can_be_overwritten`.)
 
 Verified live on testnet, the full loop: deployed the vault above,
 deposited 20,000,000 stroops, withdrew 10,000,000 of it to seed a real

@@ -190,6 +190,92 @@ fn double_initialize_rejected() {
     assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
 }
 
+// ---------- admin rotation (#4) ----------
+
+#[test]
+fn propose_then_accept_rotates_admin() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let new_admin = Address::generate(&h.env);
+
+    client.propose_admin(&h.admin, &new_admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+    assert_eq!(client.get_admin(), h.admin); // not yet in effect
+
+    client.accept_admin(&new_admin);
+    assert_eq!(client.get_admin(), new_admin);
+    assert_eq!(client.get_pending_admin(), None); // consumed
+
+    // The OLD admin can no longer withdraw — proves the rotation actually
+    // took effect, not just that the getters report a new value.
+    let recipient = Address::generate(&h.env);
+    let result = client.try_withdraw(&h.admin, &recipient, &1);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    // The NEW admin can.
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 1_000);
+    client.deposit(&lp, &1_000);
+    client.withdraw(&new_admin, &recipient, &500);
+    assert_eq!(client.get_balance(), 500);
+}
+
+#[test]
+fn propose_admin_requires_the_current_admins_own_authorization() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let not_admin = Address::generate(&h.env);
+    let new_admin = Address::generate(&h.env);
+    let result = client.try_propose_admin(&not_admin, &new_admin);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(client.get_pending_admin(), None);
+}
+
+#[test]
+fn accept_admin_rejects_an_address_that_was_never_proposed() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let impostor = Address::generate(&h.env);
+    // No propose_admin call at all — NoPendingAdmin, not Unauthorized,
+    // distinguishes "nothing to accept" from "wrong address accepting".
+    let result = client.try_accept_admin(&impostor);
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+}
+
+#[test]
+fn accept_admin_rejects_a_different_address_than_the_one_proposed() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let proposed = Address::generate(&h.env);
+    let impostor = Address::generate(&h.env);
+    client.propose_admin(&h.admin, &proposed);
+
+    let result = client.try_accept_admin(&impostor);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    // Rejected means rejected — admin is still unchanged, proposal intact.
+    assert_eq!(client.get_admin(), h.admin);
+    assert_eq!(client.get_pending_admin(), Some(proposed));
+}
+
+#[test]
+fn a_bad_proposal_is_harmless_and_can_be_overwritten() {
+    // The whole point of two-step rotation: proposing a typo'd/unreachable
+    // address never bricks anything, since accept_admin always requires
+    // that exact address's own live signature before anything changes.
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let typo = Address::generate(&h.env);
+    let correct = Address::generate(&h.env);
+
+    client.propose_admin(&h.admin, &typo);
+    // Re-propose with the correct address — overwrites the bad one outright.
+    client.propose_admin(&h.admin, &correct);
+    assert_eq!(client.get_pending_admin(), Some(correct.clone()));
+
+    client.accept_admin(&correct);
+    assert_eq!(client.get_admin(), correct);
+}
+
 // ---------- the integration this vault exists for: fund a market's seed
 // liquidity, collect the payout back after settlement ----------
 
