@@ -677,3 +677,6 @@ that applies to fund-safety-critical code.
 
 <!-- handsoff-issue-130 -->
 - #130: Oracle error-mapping closures are still inlined three times (market Reflector leg, perpetual Reflector and RedStone legs)
+
+<!-- handsoff-issue-131 -->
+- #131: Lazer payload verification (verify, find feed, validate price/exponent/timestamp) is duplicated between market settle() and perpetual checkpoint
