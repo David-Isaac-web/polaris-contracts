@@ -672,3 +672,8 @@ that applies to fund-safety-critical code.
 ## License
 
 [MIT](./LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-130 -->
+- #130: Oracle error-mapping closures are still inlined three times (market Reflector leg, perpetual Reflector and RedStone legs)
