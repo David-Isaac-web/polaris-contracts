@@ -672,3 +672,8 @@ that applies to fund-safety-critical code.
 ## License
 
 [MIT](./LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-134 -->
+- #134: contracts/market: every trade rewrites the whole Market struct, including immutable config, to instance storage
