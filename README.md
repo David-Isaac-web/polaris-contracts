@@ -672,3 +672,8 @@ that applies to fund-safety-critical code.
 ## License
 
 [MIT](./LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-138 -->
+- #138: ctf-math: staleness boundary (price.timestamp + max_staleness == now) is untested
