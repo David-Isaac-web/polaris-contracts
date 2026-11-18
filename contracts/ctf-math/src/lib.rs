@@ -68,8 +68,18 @@ pub fn cpmm_sell_out(reserve_in: i128, reserve_out: i128, effective_in: i128) ->
     (s - sqrt_disc) / 2
 }
 
+/// Applies `fee_bps` basis points of fee to `amount`, returning the
+/// post-fee amount (`amount - fee`).
+///
+/// The fee is rounded **up** (`(amount * fee_bps + 9_999) / 10_000`), in the
+/// pool's favor: any nonzero fee on any nonzero trade charges at least 1
+/// stroop, and the rounding remainder accrues to the pool rather than the
+/// trader. This is the standard AMM convention — it keeps the constant-
+/// product invariant monotonically non-decreasing across trades instead of
+/// letting sub-stroop rounding leak value out of the pool. (The direction
+/// matters more once collateral with different decimals arrives; see #29.)
 pub fn apply_fee(amount: i128, fee_bps: u32) -> i128 {
-    let fee = amount * fee_bps as i128 / 10_000;
+    let fee = (amount * fee_bps as i128 + 9_999) / 10_000;
     amount - fee
 }
 
@@ -163,14 +173,6 @@ pub mod sep40 {
     // spec-driven encoder (the `stellar` CLI's JSON arg parser, and
     // `@stellar/stellar-sdk`'s `contract.Spec.funcArgsToScVals` used by
     // `polaris-oracle`) with "Missing Entry Asset" the moment anything
-    // tried to construct an `OracleFeedConfig` from outside Rust source.
-    #[contracttype]
-    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-    pub enum Asset {
-        Stellar(Address),
-        Other(Symbol),
-    }
+    // tried to construct an `OracleFeedConfig` 
 
-    #[contracttype(export
-
-/* … truncated 4085 chars — edit only what you need near the top … */
+/* … truncated 280 chars — edit only what you need near the top … */
