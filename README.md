@@ -672,3 +672,8 @@ that applies to fund-safety-critical code.
 ## License
 
 [MIT](./LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-154 -->
+- #154: README says assert_solvent() runs after every test; only about 18 of 48 market tests call it
