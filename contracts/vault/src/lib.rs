@@ -154,76 +154,57 @@ impl Vault {
 
     /// Collects this vault's own payout from a settled/cancelled market it
     /// was `treasury` for, by calling that market's existing `redeem`
-    /// on the vault's own behalf. The one cross-contract call in this
-    /// design, and it's into an entrypoint that already exists, is already
-    /// tested, and needs no `require_auth` from the vault side — `redeem`
-    /// only ever pays out to whichever address it's called with, and only
-    /// from that address's own on-chain share balance.
-    pub fn redeem_from_market(env: Env, admin: Address, market_id: Address) -> Result<i128, Error> {
+    /// on the vault's behalf. Admin-gated: this makes a cross-contract call
+    /// with the vault as the beneficiary, so keeping it admin-only is a
+    /// deliberate part of the design — a non-admin must not be able to
+    /// trigger it.
+    pub fn redeem_from_market(env: Env, admin: Address, market_id: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        let market = market_contract::Client::new(&env, &market_id);
-        let payout = market.redeem(&env.current_contract_address());
+        let client = market_contract::Client::new(&env, &market_id);
+        client.redeem(&env.current_contract_address());
         touch(&env);
-        env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
-        Ok(payout)
-    }
-
-    /// Step 1 of a two-step admin rotation. Deliberately not a single-call
-    /// `set_admin`: a typo'd/unreachable `proposed` address would
-    /// permanently brick the vault out of its own funds exactly the way
-    /// the *absence* of any rotation entrypoint already did once in
-    /// production (see this repo's README / issue #4) — the new admin
-    /// has to actually show up and sign `accept_admin` with its own key
-    /// before the swap takes effect, so a bad proposal is harmless and
-    /// reversible (just propose again) instead of a one-way mistake.
-    pub fn propose_admin(env: Env, current_admin: Address, proposed: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &current_admin)?;
-        env.storage().instance().set(&STORAGE_KEY_PENDING_ADMIN, &proposed);
-        touch(&env);
-        env.events().publish((symbol_short!("propose"),), proposed.clone());
+        env.events().publish((symbol_short!("redeem"), market_id), admin);
         Ok(())
     }
 
-    /// Step 2: the proposed admin confirms with their own signature. Only
-    /// the exact address `propose_admin` named can call this successfully
-    /// — not the current admin, not anyone else — which is what actually
-    /// proves the new key is live, held, and able to sign before it
-    /// becomes the only key that can move funds.
-    pub fn accept_admin(env: Env, proposed: Address) -> Result<(), Error> {
-        proposed.require_auth();
+    /// Two-step admin rotation: `propose_admin` records a pending successor,
+    /// `accept_admin` (called by that successor) commits it. A single-step
+    /// `set_admin` would let a typo'd address permanently lock the vault;
+    /// this way the new admin must prove control before the old one is
+    /// replaced. See `accept_admin` for the commit half.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_PENDING_ADMIN, &new_admin);
+        touch(&env);
+        env.events().publish((symbol_short!("propose"), new_admin), admin);
+        Ok(())
+    }
+
+    /// Commits a pending rotation. Must be called by the proposed successor
+    /// itself — proving it controls the address — not by the outgoing admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
         let pending: Address = env
             .storage()
             .instance()
             .get(&STORAGE_KEY_PENDING_ADMIN)
             .ok_or(Error::NoPendingAdmin)?;
-        if pending != proposed {
+        if pending != new_admin {
             return Err(Error::Unauthorized);
         }
-        env.storage().instance().set(&STORAGE_KEY_ADMIN, &proposed);
+        env.storage().instance().set(&STORAGE_KEY_ADMIN, &new_admin);
         env.storage().instance().remove(&STORAGE_KEY_PENDING_ADMIN);
         touch(&env);
-        env.events().publish((symbol_short!("newadmin"),), proposed);
+        env.events().publish((symbol_short!("accept"), new_admin), ());
         Ok(())
     }
 
-    pub fn get_pending_admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&STORAGE_KEY_PENDING_ADMIN)
-    }
-
-    pub fn get_admin(env: Env) -> Result<Address, Error> {
+    pub fn admin(env: Env) -> Result<Address, Error> {
         env.storage().instance().get(&STORAGE_KEY_ADMIN).ok_or(Error::NotInitialized)
     }
 
-    pub fn get_balance(env: Env) -> Result<i128, Error> {
-        let collateral = Self::require_collateral(&env)?;
-        Ok(token::Client::new(&env, &collateral).balance(&env.current_contract_address()))
-    }
-
-    pub fn get_total_deposited(env: Env) -> Result<i128, Error> {
-        env.storage()
-            .instance()
-            .get(&STORAGE_KEY_TOTAL_DEPOSITED)
-            .ok_or(Error::NotInitialized)
+    pub fn total_deposited(env: Env) -> i128 {
+        env.storage().instance().get(&STORAGE_KEY_TOTAL_DEPOSITED).unwrap_or(0)
     }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
@@ -232,11 +213,7 @@ impl Vault {
             .instance()
             .get(&STORAGE_KEY_ADMIN)
             .ok_or(Error::NotInitialized)?;
-        if stored != *admin {
-            // require_auth on the WRONG address doesn't help an attacker —
-            // they'd need that address's own signature, which they don't
-            // have — but check identity first anyway so a mismatched caller
-            // gets a clear typed error rather than an auth trap.
+        if &stored != admin {
             return Err(Error::Unauthorized);
         }
         admin.require_auth();
@@ -244,10 +221,7 @@ impl Vault {
     }
 
     fn require_collateral(env: &Env) -> Result<Address, Error> {
-        env.storage()
-            .instance()
-            .get(&STORAGE_KEY_COLLATERAL)
-            .ok_or(Error::NotInitialized)
+        env.storage().instance().get(&STORAGE_KEY_COLLATERAL).ok_or(Error::NotInitialized)
     }
 }
 
