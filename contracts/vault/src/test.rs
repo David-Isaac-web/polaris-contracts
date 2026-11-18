@@ -236,6 +236,58 @@ fn accept_admin_rejects_an_address_that_was_never_proposed() {
     let h = setup();
     let client = VaultClient::new(&h.env, &h.vault_id);
     let impostor = Address::generate(&h.env);
-    // No propose_a
+    // No propose_admin call at all.
+    let result = client.try_accept_admin(&impostor);
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+    assert_eq!(client.get_admin(), h.admin);
+}
 
-/* … truncated 4234 chars — edit only what you need near the top … */
+// ---------- admin proposal lifetime (#153) ----------
+
+#[test]
+fn expired_admin_proposal_is_rejected() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let new_admin = Address::generate(&h.env);
+
+    client.propose_admin(&h.admin, &new_admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    // Jump past the 7-day proposal window.
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 7 * DAY + 1);
+
+    let result = client.try_accept_admin(&new_admin);
+    assert_eq!(result, Err(Ok(Error::ProposalExpired)));
+    // The stale proposal is cleared and the admin is unchanged.
+    assert_eq!(client.get_pending_admin(), None);
+    assert_eq!(client.get_admin(), h.admin);
+}
+
+#[test]
+fn cancelled_admin_proposal_is_rejected() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let new_admin = Address::generate(&h.env);
+
+    client.propose_admin(&h.admin, &new_admin);
+    client.cancel_admin_proposal(&h.admin);
+    assert_eq!(client.get_pending_admin(), None);
+
+    let result = client.try_accept_admin(&new_admin);
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+    assert_eq!(client.get_admin(), h.admin);
+}
+
+#[test]
+fn cancel_admin_proposal_requires_the_current_admin() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let new_admin = Address::generate(&h.env);
+    client.propose_admin(&h.admin, &new_admin);
+
+    let not_admin = Address::generate(&h.env);
+    let result = client.try_cancel_admin_proposal(&not_admin);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    // Proposal survives an unauthorized cancel attempt.
+    assert_eq!(client.get_pending_admin(), Some(new_admin));
+}
