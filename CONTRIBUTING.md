@@ -125,6 +125,20 @@ When you add a variant, also add a row to the matching table in
 [ERRORS.md](./ERRORS.md), which is the canonical per-contract reference
 (code, variant, meaning, returning entrypoints, suggested user message).
 
+## Changing storage
+
+Storage keys, storage classes (instance vs persistent), and TTL bump
+policies are documented per contract in [docs/storage.md](./docs/storage.md).
+Before adding or changing any storage key or stored struct:
+
+- [ ] Read [docs/storage.md](./docs/storage.md) and confirm you are not
+  changing the shape of an already-deployed struct (add a new key instead).
+- [ ] Add a row for any new key to the matching table in
+  [docs/storage.md](./docs/storage.md), including its storage class, value
+  type, and TTL bump policy.
+- [ ] If the key is persistent, note it so archival/restore planning picks
+  it up.
+
 ## Peer review
 
 Anyone may review a pull request via comments. A review typically covers
