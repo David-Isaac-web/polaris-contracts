@@ -680,3 +680,6 @@ that applies to fund-safety-critical code.
 
 <!-- handsoff-issue-139 -->
 - #139: contracts/perpetual: no permissionless wind-down backstop; terminate() is admin-only forever
+
+<!-- handsoff-issue-140 -->
+- #140: contracts/market+perpetual: initialize() accepts treasury == the contract's own address, permanently stranding the seed liquidity
