@@ -683,3 +683,6 @@ that applies to fund-safety-critical code.
 
 <!-- handsoff-issue-140 -->
 - #140: contracts/market+perpetual: initialize() accepts treasury == the contract's own address, permanently stranding the seed liquidity
+
+<!-- handsoff-issue-141 -->
+- #141: contracts/market+perpetual: pause()/unpause() aren't idempotent; repeated calls emit duplicate events
