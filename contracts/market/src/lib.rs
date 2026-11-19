@@ -145,6 +145,12 @@ pub enum Error {
     /// by this, only the AMM-math-dependent entrypoints a pause exists to
     /// protect against.
     Paused = 35,
+    /// Reflector's `price.timestamp` is further in the future than
+    /// `polaris_ctf_math::MAX_FUTURE_SKEW_SECS` allows — see
+    /// `polaris_ctf_math::OracleCheckError::FutureDated`.
+    ReflectorPriceFutureDated = 36,
+    /// Same, for the optional RedStone leg.
+    RedstonePriceFutureDated = 37,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -716,6 +722,7 @@ impl PolarisMarket {
                 OracleCheckError::Stale => Error::ReflectorPriceStale,
                 OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
                 OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::FutureDated => Error::ReflectorPriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             },
         )?;
@@ -762,6 +769,9 @@ impl PolarisMarket {
         if price.timestamp + m.reflector.max_staleness_secs < now {
             return Err(Error::ReflectorPriceStale);
         }
+        if price.timestamp > now + polaris_ctf_math::MAX_FUTURE_SKEW_SECS {
+            return Err(Error::ReflectorPriceFutureDated);
+        }
         // Same "timestamped near expiry, not just not-stale-right-now"
         // bound the Lazer path enforces via PRICE_FRESHNESS_WINDOW_SECS —
         // a price that's merely within max_staleness_secs of `now` could
@@ -800,6 +810,7 @@ impl PolarisMarket {
             OracleCheckError::Stale => Error::RedstonePriceStale,
             OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
             OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+            OracleCheckError::FutureDated => Error::RedstonePriceFutureDated,
             OracleCheckError::Divergent => Error::OracleDivergence,
         }
     }

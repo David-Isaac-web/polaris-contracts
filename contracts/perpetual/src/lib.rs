@@ -143,6 +143,12 @@ pub enum Error {
     /// `pause()`'s doc comment, identical rationale to `polaris-market`'s
     /// `Error::Paused`.
     Paused = 31,
+    /// Reflector's `price.timestamp` is further in the future than
+    /// `polaris_ctf_math::MAX_FUTURE_SKEW_SECS` allows — see
+    /// `polaris_ctf_math::OracleCheckError::FutureDated`.
+    ReflectorPriceFutureDated = 32,
+    /// Same, for the RedStone leg.
+    RedstonePriceFutureDated = 33,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,6 +623,7 @@ impl PolarisPerpetual {
                 OracleCheckError::Stale => Error::ReflectorPriceStale,
                 OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
                 OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::FutureDated => Error::ReflectorPriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             })?;
         verify_oracle_corroboration(&env, &oracle.redstone, oracle.redstone_decimals_at_init, now, final_cents)
@@ -625,6 +632,7 @@ impl PolarisPerpetual {
                 OracleCheckError::Stale => Error::RedstonePriceStale,
                 OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
                 OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+                OracleCheckError::FutureDated => Error::RedstonePriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             })?;
 
