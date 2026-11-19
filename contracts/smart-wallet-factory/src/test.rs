@@ -61,6 +61,26 @@ fn resolve_matches_what_deploy_actually_produces() {
 }
 
 #[test]
+fn is_deployed_is_false_before_deploy_and_true_after() {
+    let env = Env::default();
+    let (factory_id, _) = setup(&env);
+    let pk = sample_pk(&env, 3);
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+
+    assert!(!client.is_deployed(&pk));
+    let (resolved, deployed_before) = client.resolve_with_status(&pk);
+    assert!(!deployed_before);
+
+    let address = client.deploy(&pk);
+
+    assert!(client.is_deployed(&pk));
+    let (resolved_after, deployed_after) = client.resolve_with_status(&pk);
+    assert!(deployed_after);
+    assert_eq!(resolved, address);
+    assert_eq!(resolved_after, address);
+}
+
+#[test]
 fn resolve_differs_for_different_keys() {
     let env = Env::default();
     let factory_id = env.register(SmartWalletFactory, ());
