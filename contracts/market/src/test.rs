@@ -3,7 +3,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{token, Address, Env, Symbol};
+use soroban_sdk::{symbol_short, token, Address, Env, Symbol};
 
 /// Wire-format payload matching pyth-lazer-stellar-sdk's parser: magic(4) +
 /// timestamp(8, LE µs) + channel(1) + num_feeds(1) + [feed_id(4) +
@@ -466,6 +466,116 @@ fn pause_requires_admin_auth() {
     let auths = h.env.auths();
     assert_eq!(auths.len(), 1);
     assert_eq!(auths[0].0, h.admin);
+}
+
+/// Issue #107: `mock_all_auths()` auto-approves every address, so a
+/// `require_auth()` on the *wrong* address (e.g. `treasury` instead of
+/// `user`) would still pass every other test in this file. These assert the
+/// exact `(address, invocation)` pair recorded by `env.auths()` for each
+/// user-gated entrypoint, so deleting or mis-targeting any single
+/// `require_auth` line breaks a test.
+#[test]
+fn split_requires_exactly_the_users_auth() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.split(&user, &1_000);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, user);
+    assert_eq!(auths[0].1.fn_name, symbol_short!("split"));
+}
+
+#[test]
+fn merge_requires_exactly_the_users_auth() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000);
+
+    client.merge(&user, &1_000);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, user);
+    assert_eq!(auths[0].1.fn_name, symbol_short!("merge"));
+}
+
+#[test]
+fn buy_requires_exactly_the_users_auth() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, user);
+    assert_eq!(auths[0].1.fn_name, symbol_short!("buy"));
+}
+
+#[test]
+fn sell_requires_exactly_the_users_auth() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+
+    client.sell(&user, &Prediction::Yes, &shares, &0);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, user);
+    assert_eq!(auths[0].1.fn_name, symbol_short!("sell"));
+}
+
+#[test]
+fn transfer_requires_exactly_the_senders_auth() {
+    let h = setup(1_000_000, 10_000);
+    let from = Address::generate(&h.env);
+    let to = Address::generate(&h.env);
+    fund(&h, &from, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&from, &1_000);
+
+    client.transfer(&from, &to, &Prediction::Yes, &400);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, from);
+    assert_eq!(auths[0].1.fn_name, symbol_short!("transfer"));
+}
+
+#[test]
+fn redeem_requires_exactly_the_users_auth() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace + 1);
+    client.cancel();
+    client.redeem(&user);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, user);
+    assert_eq!(auths[0].1.fn_name, symbol_short!("redeem"));
+}
+
+#[test]
+fn unpause_requires_exactly_the_admins_auth() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.pause();
+
+    client.unpause();
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+    assert_eq!(auths[0].1.fn_name, symbol_short!("unpause"));
 }
 
 #[test]
