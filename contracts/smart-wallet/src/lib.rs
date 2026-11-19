@@ -125,6 +125,8 @@ pub enum Error {
     OriginMismatch = 5,
     TypeMismatch = 6,
     RpIdMismatch = 7,
+    AuthenticatorDataTooShort = 8,
+    UserNotVerified = 9,
 }
 
 #[contract]
@@ -299,6 +301,26 @@ impl CustomAccountInterface for SmartWallet {
         );
         if BytesN::from_array(&env, &rp_id_hash) != expected_rp_id_hash {
             return Err(Error::RpIdMismatch);
+        }
+
+        // WebAuthn §6.1: `authenticator_data` is
+        //   rpIdHash(32) ‖ flags(1) ‖ signCount(4) ‖ ...
+        // so the flags byte is at offset 32 and the fixed prefix is 37
+        // bytes. Anything shorter can't carry flags at all — reject with a
+        // typed error rather than slicing out of bounds (which would trap).
+        if signature.authenticator_data.len() < 37 {
+            return Err(Error::AuthenticatorDataTooShort);
+        }
+        let flags = signature.authenticator_data.get(32).unwrap_or(0);
+        const FLAG_UP: u8 = 0x01; // user present
+        const FLAG_UV: u8 = 0x04; // user verified
+        // UP must be set: the user was physically present at the
+        // authenticator. UV must be set too — this wallet's whole premise is
+        // a Face ID / Touch ID / Windows Hello passkey, i.e. a *verified*
+        // user; accepting a bare presence check would silently downgrade
+        // that promise.
+        if flags & FLAG_UP == 0 || flags & FLAG_UV == 0 {
+            return Err(Error::UserNotVerified);
         }
 
         touch(&env);
