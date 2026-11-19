@@ -111,6 +111,7 @@ impl SmartWalletFactory {
         env.storage().instance().set(&STORAGE_KEY_WASM_HASH, &wasm_hash);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
         touch(&env);
+        env.events().publish((symbol_short!("init"),), (wasm_hash, origin));
         Ok(())
     }
 
