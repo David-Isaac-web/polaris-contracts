@@ -401,6 +401,23 @@ fn checkpoint_without_a_configured_oracle_is_rejected() {
 }
 
 #[test]
+fn checkpoint_rejected_once_terminated() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    client.terminate(&h.admin);
+
+    let now = h.env.ledger().timestamp();
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+
+    let res = client.try_record_price_checkpoint(&bytes);
+    assert_eq!(res, Err(Ok(Error::MarketNotOpen)));
+    assert_eq!(client.get_market().last_price_cents, 0, "a rejected checkpoint must not record anything");
+}
+
+#[test]
 fn checkpoint_rejects_on_gross_lazer_reflector_divergence() {
     let h = setup(10_000, true);
     let client = PolarisPerpetualClient::new(&h.env, &h.market_id);

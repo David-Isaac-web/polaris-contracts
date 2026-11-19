@@ -591,6 +591,9 @@ impl PolarisPerpetual {
     /// `total_supply` mutation, ever.
     pub fn record_price_checkpoint(env: Env, payload: Bytes) -> Result<(), Error> {
         let mut m = load_market(&env)?;
+        if m.status != PerpetualStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
         let oracle = load_price_oracle(&env).ok_or(Error::PriceOracleNotConfigured)?;
         let now = env.ledger().timestamp();
 
