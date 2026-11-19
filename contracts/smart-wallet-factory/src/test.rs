@@ -189,6 +189,63 @@ fn initialize_requires_the_admins_own_authorization() {
     assert!(result.is_err(), "initialize without the admin's authorization must fail, not succeed");
 }
 
+// ---------- origin validation at initialize() ----------
+
+#[test]
+fn initialize_accepts_well_formed_origins() {
+    let accepted: [&[u8]; 5] = [
+        b"https://polaris-frontend-iota.vercel.app",
+        b"https://polaris.xyz",
+        b"https://localhost:3000",
+        b"http://localhost",
+        b"http://localhost:8080",
+    ];
+    for origin in accepted {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register(SmartWalletFactory, ());
+        let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
+        let admin = Address::generate(&env);
+        let client = SmartWalletFactoryClient::new(&env, &factory_id);
+        let origin = Bytes::from_slice(&env, origin);
+        assert_eq!(
+            client.try_initialize(&admin, &wasm_hash, &origin),
+            Ok(Ok(())),
+            "origin should be accepted"
+        );
+    }
+}
+
+#[test]
+fn initialize_rejects_malformed_origins() {
+    let rejected: [&[u8]; 10] = [
+        b"",
+        b"https://",
+        b"https://polaris.xyz/",
+        b"https://polaris.xyz/app",
+        b"https://polaris.xyz?x=1",
+        b"https://polaris.xyz#frag",
+        b"http://polaris.xyz",
+        b"ftp://polaris.xyz",
+        b"polaris.xyz",
+        b"https://user@polaris.xyz",
+    ];
+    for origin in rejected {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register(SmartWalletFactory, ());
+        let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
+        let admin = Address::generate(&env);
+        let client = SmartWalletFactoryClient::new(&env, &factory_id);
+        let origin = Bytes::from_slice(&env, origin);
+        assert_eq!(
+            client.try_initialize(&admin, &wasm_hash, &origin),
+            Err(Ok(Error::InvalidOrigin)),
+            "origin should be rejected"
+        );
+    }
+}
+
 // ---------- regression: deploy() always uses the pinned wasm, no matter
 // what a caller might wish it would use instead ----------
 
