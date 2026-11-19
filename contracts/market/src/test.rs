@@ -174,7 +174,7 @@ fn setup_with_redstone(strike_cents: i128, initial_liquidity: i128) -> (Harness,
     )
 }
 
-fn fund(h: &Harness, who: &Address, amount: i128) {
+pub(crate) fn fund(h: &Harness, who: &Address, amount: i128) {
     token::StellarAssetClient::new(&h.env, &h.token_id).mint(who, &amount);
 }
 
@@ -1252,7 +1252,7 @@ fn fee_never_exceeds_base_even_if_total_supply_dips_back_toward_seed() {
 
 // ---------- global solvency invariant ----------
 
-fn assert_solvent(h: &Harness) {
+pub(crate) fn assert_solvent(h: &Harness) {
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     let m = client.get_market();
     let bal = token::Client::new(&h.env, &h.token_id).balance(&h.market_id);
