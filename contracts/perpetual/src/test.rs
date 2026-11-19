@@ -292,6 +292,72 @@ fn buy_large_enough_to_exhaust_a_reserve_is_rejected() {
     assert_solvent(&h);
 }
 
+/// Smallest `collateral_amount` whose post-fee `cpmm_out` against
+/// `(reserve_in, reserve_out)` lands exactly on `target_out`. `cpmm_out` is
+/// monotonic in `effective_in`, so a binary search finds the boundary trade
+/// without hardcoding fee-curve internals.
+fn collateral_for_amount_out(
+    h: &Harness,
+    reserve_in: i128,
+    reserve_out: i128,
+    target_out: i128,
+) -> i128 {
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let fee_bps = client.get_fee();
+    let out_at = |collateral: i128| {
+        cpmm_out(reserve_in, reserve_out, apply_fee(collateral, fee_bps))
+    };
+    let mut lo = 1i128;
+    let mut hi = reserve_out * 1_000;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if out_at(mid) >= target_out {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    assert_eq!(out_at(lo), target_out, "no collateral amount hits target_out");
+    lo
+}
+
+#[test]
+fn buy_at_exactly_half_the_reserve_is_rejected() {
+    // Boundary equality: `amount_out * 2 == reserve_out` must be rejected.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000_000);
+
+    let collateral = collateral_for_amount_out(&h, 10_000, 10_000, 5_000);
+    let res = client.try_buy(&user, &Prediction::Yes, &collateral, &0);
+    assert_eq!(res, Err(Ok(Error::PoolDepthExceeded)));
+
+    let m = client.get_market();
+    assert_eq!(m.pool_yes, 10_000);
+    assert_eq!(m.pool_no, 10_000);
+    assert_solvent(&h);
+}
+
+#[test]
+fn buy_one_stroop_under_half_the_reserve_is_accepted() {
+    // Adjacent case: `amount_out * 2 == reserve_out - 1` must be accepted,
+    // and the pool must stay solvent afterwards.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000_000);
+
+    let collateral = collateral_for_amount_out(&h, 10_000, 10_000, 4_999);
+    let total = client.buy(&user, &Prediction::Yes, &collateral, &0);
+    assert_eq!(total, collateral + 4_999);
+
+    let m = client.get_market();
+    assert_eq!(m.pool_yes, 10_000 - 4_999);
+    assert_eq!(m.pool_no, 10_000 + collateral);
+    assert_solvent(&h);
+}
+
 // ---------- no fixed expiry: trading keeps working indefinitely ----------
 
 #[test]
