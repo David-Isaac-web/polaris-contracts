@@ -108,6 +108,7 @@ pub enum Error {
     ClientDataJsonParseError = 4,
     OriginMismatch = 5,
     TypeMismatch = 6,
+    InvalidPublicKey = 7,
 }
 
 #[contract]
@@ -124,9 +125,23 @@ impl SmartWallet {
     /// `origin` is fixed for the wallet's lifetime, same as `public_key` —
     /// see `__check_auth`'s doc comment for why this can't be a
     /// `deploy()`-time caller parameter instead.
+    ///
+    /// The key must be an *uncompressed* SEC1 point, i.e. its first byte
+    /// must be `0x04`; anything else (compressed `0x02`/`0x03`, hybrid
+    /// `0x06`/`0x07`, or garbage) is rejected with `InvalidPublicKey`.
+    /// Note this is a cheap prefix check only: a full on-curve check would
+    /// need 256-bit modular arithmetic (field/curve constants, point
+    /// addition, `y² = x³ - 3x + b mod p`) which is not available in the
+    /// Soroban host API and is too expensive to hand-roll here. A key that
+    /// passes this check but is not on the curve simply can never produce a
+    /// valid signature, so it can only brick its own wallet — never
+    /// authorize anything.
     pub fn init(env: Env, public_key: BytesN<65>, origin: Bytes) -> Result<(), Error> {
         if env.storage().instance().has(&STORAGE_KEY_PK) {
             return Err(Error::AlreadyInitialized);
+        }
+        if public_key.get(0) != Some(0x04) {
+            return Err(Error::InvalidPublicKey);
         }
         env.storage().instance().set(&STORAGE_KEY_PK, &public_key);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);

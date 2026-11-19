@@ -111,6 +111,30 @@ fn deployed_wallet_is_bound_to_the_factorys_pinned_origin() {
 }
 
 #[test]
+fn deploy_with_malformed_key_fails_atomically() {
+    let env = Env::default();
+    let (factory_id, _) = setup(&env);
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+
+    let mut bytes = [9u8; 65];
+    bytes[0] = 0x02; // compressed prefix, not an uncompressed SEC1 point
+    let bad_pk = BytesN::from_array(&env, &bytes);
+
+    let result = client.try_deploy(&bad_pk);
+    assert!(result.is_err());
+
+    // The child's `init` rejected the key, so the whole deploy rolled back:
+    // no contract exists at the address `resolve` predicts for that key.
+    let predicted = client.resolve(&bad_pk);
+    let stored_pk: Result<BytesN<65>, _> = env.try_invoke_contract(
+        &predicted,
+        &soroban_sdk::Symbol::new(&env, "get_public_key"),
+        soroban_sdk::vec![&env],
+    );
+    assert!(stored_pk.is_err());
+}
+
+#[test]
 fn same_public_key_cannot_deploy_twice() {
     let env = Env::default();
     let (factory_id, _) = setup(&env);
