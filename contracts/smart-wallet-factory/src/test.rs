@@ -114,6 +114,30 @@ fn deployed_wallet_is_initialized_with_the_given_key() {
 }
 
 #[test]
+fn deploy_emits_a_deploy_event_indexing_the_wallet() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{Symbol, TryIntoVal};
+
+    let env = Env::default();
+    let (factory_id, _) = setup(&env);
+    let pk = sample_pk(&env, 9);
+
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+    let wallet_address = client.deploy(&pk);
+
+    let events = env.events().all();
+    let (contract, topics, data) = events.last().expect("deploy must emit an event");
+    assert_eq!(contract, factory_id);
+    assert_eq!(topics.len(), 2);
+    let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+    let topic1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic0, symbol_short!("deploy"));
+    assert_eq!(topic1, wallet_address);
+    let emitted_pk: BytesN<65> = data.try_into_val(&env).unwrap();
+    assert_eq!(emitted_pk, pk);
+}
+
+#[test]
 fn deployed_wallet_is_bound_to_the_factorys_pinned_origin() {
     let env = Env::default();
     let (factory_id, _) = setup(&env);

@@ -142,6 +142,10 @@ impl SmartWalletFactory {
             vec![&env, public_key.to_val(), origin.to_val()],
         );
         touch(&env);
+        // On-chain index of deployed wallets: topic (deploy, wallet address),
+        // data = the passkey public key the wallet is bound to.
+        env.events()
+            .publish((symbol_short!("deploy"), address.clone()), public_key);
         Ok(address)
     }
 
