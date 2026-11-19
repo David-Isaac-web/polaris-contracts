@@ -61,8 +61,8 @@ fn default_reflector_config(env: &Env, reflector_id: &Address) -> OracleFeedConf
 /// RedStone's real Stellar SEP-40 wrapper keys XLM under
 /// `Asset::Stellar(<native XLM SAC address>)`, not `Asset::Other("XLM")`
 /// like Reflector — confirmed live against the real mainnet contract, see
-/// this repo's README. The mock doesn't actually gate on the asset value,
-/// but a fresh address stands in for "the SAC" for realism.
+/// this repo's README. The mock keys prices by asset, so this must match
+/// exactly what `set_redstone_price_cents` prices.
 fn default_redstone_config(env: &Env, redstone_id: &Address) -> OracleFeedConfig {
     OracleFeedConfig {
         contract: redstone_id.clone(),
@@ -186,7 +186,8 @@ fn fund(h: &Harness, who: &Address, amount: i128) {
 fn set_reflector_price_cents(h: &Harness, cents: i128) {
     let client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
     let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
-    client.set_price(&price, &h.env.ledger().timestamp());
+    let asset = default_reflector_config(&h.env, &h.reflector_id).asset;
+    client.set_price(&asset, &price, &h.env.ledger().timestamp());
 }
 
 /// Same conversion as `set_reflector_price_cents`, for the RedStone leg —
@@ -195,7 +196,8 @@ fn set_reflector_price_cents(h: &Harness, cents: i128) {
 fn set_redstone_price_cents(env: &Env, redstone_id: &Address, cents: i128) {
     let client = mock_sep40::MockSep40Client::new(env, redstone_id);
     let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
-    client.set_price(&price, &env.ledger().timestamp());
+    let asset = default_redstone_config(env, redstone_id).asset;
+    client.set_price(&asset, &price, &env.ledger().timestamp());
 }
 
 mod mock_lazer {
@@ -225,9 +227,9 @@ mod mock_lazer {
 /// the XDR-shape-drift trap that redeclaring would open.
 mod mock_sep40 {
     use polaris_ctf_math::sep40::{Asset, PriceData};
-    use soroban_sdk::{contract, contractimpl, symbol_short, Env};
+    use soroban_sdk::{contract, contractimpl, symbol_short, Env, Map};
 
-    const PRICE_KEY: soroban_sdk::Symbol = symbol_short!("px");
+    const PRICES_KEY: soroban_sdk::Symbol = symbol_short!("px");
     const DECIMALS_KEY: soroban_sdk::Symbol = symbol_short!("dec");
     const RESOLUTION_KEY: soroban_sdk::Symbol = symbol_short!("res");
 
@@ -236,12 +238,20 @@ mod mock_sep40 {
 
     #[contractimpl]
     impl MockSep40 {
-        pub fn set_price(env: Env, price: i128, timestamp: u64) {
-            env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
+        /// Keyed by `asset`, like the real SEP-40 providers — a price set for
+        /// one asset is invisible to `lastprice` for any other, so a
+        /// mis-configured `OracleFeedConfig.asset` fails a test instead of
+        /// silently passing.
+        pub fn set_price(env: Env, asset: Asset, price: i128, timestamp: u64) {
+            let mut prices = Self::prices(&env);
+            prices.set(asset, (price, timestamp));
+            env.storage().instance().set(&PRICES_KEY, &prices);
         }
 
+        /// Clears every asset's price — the mock is a single shared instance,
+        /// so "no price yet" is a whole-contract state, not a per-asset one.
         pub fn set_none(env: Env) {
-            env.storage().instance().remove(&PRICE_KEY);
+            env.storage().instance().remove(&PRICES_KEY);
         }
 
         /// Defaults to `REFLECTOR_DECIMALS` until overridden — lets a test
@@ -257,11 +267,8 @@ mod mock_sep40 {
             env.storage().instance().set(&RESOLUTION_KEY, &resolution);
         }
 
-        pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
-            env.storage()
-                .instance()
-                .get::<_, (i128, u64)>(&PRICE_KEY)
-                .map(|(price, timestamp)| PriceData { price, timestamp })
+        pub fn lastprice(env: Env, asset: Asset) -> Option<PriceData> {
+            Self::prices(&env).get(asset).map(|(price, timestamp)| PriceData { price, timestamp })
         }
 
         pub fn decimals(env: Env) -> u32 {
@@ -270,6 +277,10 @@ mod mock_sep40 {
 
         pub fn resolution(env: Env) -> u32 {
             env.storage().instance().get(&RESOLUTION_KEY).unwrap_or(super::REFLECTOR_RESOLUTION_SECS)
+        }
+
+        fn prices(env: &Env) -> Map<Asset, (i128, u64)> {
+            env.storage().instance().get(&PRICES_KEY).unwrap_or_else(|| Map::new(env))
         }
     }
 }
