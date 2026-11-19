@@ -430,6 +430,51 @@ fn checkpoint_succeeds_when_lazer_reflector_and_redstone_all_agree() {
 }
 
 #[test]
+fn checkpoint_stores_the_feed_timestamp_not_ledger_time() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    // Feed timestamp deliberately behind ledger time (but still fresh).
+    let feed_ts = now - 60;
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, feed_ts * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    client.record_price_checkpoint(&bytes);
+
+    let after = client.get_market();
+    assert_eq!(after.last_price_at, feed_ts, "stored timestamp must be the feed's own");
+    assert_ne!(after.last_price_at, now);
+}
+
+#[test]
+fn checkpoint_rejects_an_older_payload_after_a_newer_one() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+
+    let newer_ts = now - 10;
+    let newer = build_payload(FEED_ID, 10_000_00000000, -8, newer_ts * 1_000_000);
+    client.record_price_checkpoint(&Bytes::from_slice(&h.env, &newer));
+    assert_eq!(client.get_market().last_price_at, newer_ts);
+
+    // Older payload, still inside the freshness window — must be rejected
+    // rather than rolling the checkpoint backwards.
+    let older_ts = now - 120;
+    let older = build_payload(FEED_ID, 20_000_00000000, -8, older_ts * 1_000_000);
+    let res = client.try_record_price_checkpoint(&Bytes::from_slice(&h.env, &older));
+    assert_eq!(res, Err(Ok(Error::StaleCheckpoint)));
+
+    let after = client.get_market();
+    assert_eq!(after.last_price_at, newer_ts);
+    assert_eq!(after.last_price_cents, 1_000_000, "rejected checkpoint must not overwrite the price");
+}
+
+#[test]
 fn checkpoint_rejects_on_redstone_divergence_even_when_reflector_agrees() {
     // Unanimous, not majority — same proof as polaris-market's
     // settle_rejects_on_redstone_divergence_even_when_reflector_agrees.
