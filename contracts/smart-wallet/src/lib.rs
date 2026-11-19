@@ -175,9 +175,10 @@ impl SmartWallet {
 /// authorization "signature". `signature` is the raw 64-byte r‖s ECDSA
 /// signature. Browsers return DER by default, and DER-decoded (r, s) is not
 /// guaranteed low-S — Soroban's `secp256r1_verify` traps on a high-S
-/// signature (confirmed empirically in `test.rs`: an otherwise-valid
-/// signature generated without normalizing was rejected by the host until
-/// `s` was replaced with `n - s`). The frontend must convert DER to raw r‖s
+/// signature (regression-tested by
+/// `test.rs::high_s_variant_of_a_valid_signature_rejected`, which shows the
+/// same bytes passing with low-S and being rejected once `s` is replaced
+/// with `n - s`). The frontend must convert DER to raw r‖s
 /// *and* normalize to low-S before submitting; see
 /// `polaris-frontend`'s `lib/webauthn.ts`.
 #[derive(Clone)]

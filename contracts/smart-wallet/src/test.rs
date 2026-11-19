@@ -757,6 +757,70 @@ fn tampered_signature_rejected() {
 }
 
 #[test]
+fn high_s_variant_of_a_valid_signature_rejected() {
+    let env = Env::default();
+    let contract_id = env.register(SmartWallet, ());
+    let client = SmartWalletClient::new(&env, &contract_id);
+
+    let (pk, payload, signature) = known_good_vector(&env);
+    client.init(&pk, &origin(&env));
+
+    // The same bytes, unmodified, are accepted.
+    let result: Result<(), Result<Error, _>> = env.try_invoke_contract_check_auth::<Error>(
+        &contract_id,
+        &payload,
+        signature.clone().into_val(&env),
+        &vec![&env],
+    );
+    assert_eq!(result, Ok(()));
+
+    // Replace `s` with `n - s` (n = order of the P-256 group). This is the
+    // other, equally-valid ECDSA signature for the same (r, digest, key) —
+    // malleability — but it is high-S, which `secp256r1_verify` rejects.
+    let mut bytes = signature.signature.to_array();
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&bytes[32..]);
+    let n = p256_order();
+    let mut borrow = 0i16;
+    let mut high_s = [0u8; 32];
+    for i in (0..32).rev() {
+        let diff = n[i] as i16 - s[i] as i16 - borrow;
+        if diff < 0 {
+            high_s[i] = (diff + 256) as u8;
+            borrow = 1;
+        } else {
+            high_s[i] = diff as u8;
+            borrow = 0;
+        }
+    }
+    assert_eq!(borrow, 0, "s must be <= n");
+    bytes[32..].copy_from_slice(&high_s);
+
+    let mut high_s_signature = signature;
+    high_s_signature.signature = BytesN::from_array(&env, &bytes);
+
+    // As with `tampered_signature_rejected`, the host trap surfaces as
+    // `Err(Err(InvokeError::Abort))` — still unambiguously "rejected".
+    let result: Result<(), Result<Error, soroban_sdk::InvokeError>> = env
+        .try_invoke_contract_check_auth::<Error>(
+            &contract_id,
+            &payload,
+            high_s_signature.into_val(&env),
+            &vec![&env],
+        );
+    assert_eq!(result, Err(Err(soroban_sdk::InvokeError::Abort)));
+}
+
+/// Order `n` of the NIST P-256 group, big-endian.
+fn p256_order() -> [u8; 32] {
+    [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
+        0x25, 0x51,
+    ]
+}
+
+#[test]
 fn check_auth_before_init_rejected() {
     let env = Env::default();
     let contract_id = env.register(SmartWallet, ());
