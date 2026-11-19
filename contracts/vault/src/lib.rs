@@ -85,6 +85,9 @@ const STORAGE_KEY_TOTAL_REDEEMED: Symbol = symbol_short!("redeemed");
 /// absent the rest of the time. See `propose_admin`'s doc comment for why
 /// this is two steps, not a single `set_admin`.
 const STORAGE_KEY_PENDING_ADMIN: Symbol = symbol_short!("pending");
+/// `market_id -> ()` for every market this vault has seeded via
+/// `seed_market` — the on-chain record of what capital is deployed where.
+const STORAGE_KEY_MARKETS: Symbol = symbol_short!("markets");
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -97,6 +100,8 @@ pub enum Error {
     /// `accept_admin` called with no `propose_admin` ever having been
     /// called (or one already consumed by a prior `accept_admin`).
     NoPendingAdmin = 5,
+    /// `seed_market` called with a `market_id` this vault already seeded.
+    MarketAlreadySeeded = 6,
 }
 
 #[contract]
@@ -182,6 +187,107 @@ impl Vault {
         touch(&env);
         env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
         Ok(payout)
+    }
+
+    /// Seeds a brand-new market directly from this vault's own balance —
+    /// no admin EOA in the middle. Calls the market's existing
+    /// `initialize` with `admin` and `treasury` both set to this vault's
+    /// address, and authorizes the market's own `transfer(admin, market,
+    /// initial_liquidity)` from the vault via
+    /// `authorize_as_current_contract`, so the seed capital moves
+    /// vault → market inside the same call. If `initialize` rejects
+    /// anything (bad expiry, bad fee bps, bad oracle config, …) the whole
+    /// call reverts and the vault's balance is untouched.
+    ///
+    /// `admin` is the vault's own admin, gated exactly like `withdraw` —
+    /// seeding is a capital deployment, not a permissionless action.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_market(
+        env: Env,
+        admin: Address,
+        market_id: Address,
+        collateral: Address,
+        strike_price: i128,
+        expiry: u64,
+        grace_period: u64,
+        lazer_contract: Address,
+        feed_id: u32,
+        base_fee_bps: u32,
+        min_fee_bps: u32,
+        initial_liquidity: i128,
+        reflector: market_contract::OracleFeedConfig,
+        redstone: Option<market_contract::OracleFeedConfig>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if initial_liquidity <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let vault = env.current_contract_address();
+        let mut seeded: soroban_sdk::Vec<Address> =
+            env.storage().instance().get(&STORAGE_KEY_MARKETS).unwrap_or(soroban_sdk::Vec::new(&env));
+        if seeded.contains(&market_id) {
+            return Err(Error::MarketAlreadySeeded);
+        }
+
+        // The market's `initialize` calls `collateral.transfer(admin, …)`
+        // with `admin` = this vault, so the SAC requires this contract's
+        // own authorization for that transfer. Authorize exactly that one
+        // invocation — not a blanket grant — and only for the duration of
+        // the `initialize` call below.
+        let token_client = token::Client::new(&env, &collateral);
+        env.authorize_as_current_contract(soroban_sdk::vec![
+            &env,
+            soroban_sdk::auth::InvokerContractAuthEntry::Contract(
+                soroban_sdk::auth::SubContractInvocation {
+                    context: soroban_sdk::auth::ContractContext {
+                        contract: collateral.clone(),
+                        fn_name: Symbol::new(&env, "transfer"),
+                        args: soroban_sdk::vec![
+                            &env,
+                            vault.to_val(),
+                            market_id.to_val(),
+                            initial_liquidity.into_val(&env),
+                        ],
+                    },
+                    sub_invocations: soroban_sdk::vec![&env],
+                },
+            ),
+        ]);
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+
+        let market = market_contract::Client::new(&env, &market_id);
+        market.initialize(
+            &vault, // admin = this vault
+            &collateral,
+            &strike_price,
+            &expiry,
+            &grace_period,
+            &lazer_contract,
+            &feed_id,
+            &base_fee_bps,
+            &min_fee_bps,
+            &vault, // treasury = this vault
+            &initial_liquidity,
+            &reflector,
+            &redstone,
+        );
+
+        seeded.push_back(market_id.clone());
+        env.storage().instance().set(&STORAGE_KEY_MARKETS, &seeded);
+        touch(&env);
+        env.events().publish((symbol_short!("mkt_seed"), market_id), initial_liquidity);
+        Ok(())
+    }
+
+    /// Every market this vault has seeded via `seed_market`.
+    pub fn get_seeded_markets(env: Env) -> soroban_sdk::Vec<Address> {
+        env.storage().instance().get(&STORAGE_KEY_MARKETS).unwrap_or(soroban_sdk::Vec::new(&env))
     }
 
     /// Step 1 of a two-step admin rotation. Deliberately not a single-call
