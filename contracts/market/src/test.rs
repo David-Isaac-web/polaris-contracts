@@ -694,6 +694,168 @@ fn double_settle_rejected() {
     assert_eq!(res, Err(Ok(Error::AlreadyFinalized)));
 }
 
+// ---------- emitted events ----------
+//
+// Every event-emitting entrypoint gets one test asserting the exact
+// `(topics, data)` pair it publishes, so an accidental topic rename or
+// payload-shape change fails here instead of silently breaking an indexer.
+// Downstream consumers per event:
+//   init    -> deployment tooling / market directory indexers (strike, expiry)
+//   paused  -> trading UIs + keeper bots that stop quoting on a halt
+//   unpaused-> same, resuming quotes
+//   split   -> position indexers (per-user YES/NO balances)
+//   merge   -> position indexers
+//   buy     -> price/volume indexers, portfolio trackers, AMM analytics
+//   sell    -> price/volume indexers, portfolio trackers, AMM analytics
+//   xfer    -> position indexers / transfer feeds
+//   settle  -> settlement watchers, redemption UIs, oracle-consumed feeds
+//   cancel  -> settlement watchers, redemption UIs
+//   redeem  -> payout ledgers, treasury accounting
+
+/// Asserts the last emitted event is exactly `(topics, data)`, comparing
+/// the XDR `ScVal` forms so the assertion is on the wire shape an indexer
+/// actually sees, not on Rust-side equality of the source values.
+fn assert_last_event<T, D>(h: &Harness, topics: T, data: D)
+where
+    T: IntoVal<Env, soroban_sdk::Vec<soroban_sdk::Val>>,
+    D: IntoVal<Env, soroban_sdk::Val>,
+{
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::TryFromVal;
+    let all = h.env.events().all();
+    let (_, last_topics, last_data) = all.last().expect("no events emitted");
+    let want_topics = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &topics.into_val(&h.env)).unwrap();
+    let want_data = soroban_sdk::xdr::ScVal::try_from_val(&h.env, &data.into_val(&h.env)).unwrap();
+    assert_eq!(
+        soroban_sdk::xdr::ScVal::try_from_val(&h.env, &last_topics).unwrap(),
+        want_topics,
+        "event topics mismatch"
+    );
+    assert_eq!(
+        soroban_sdk::xdr::ScVal::try_from_val(&h.env, &last_data).unwrap(),
+        want_data,
+        "event data mismatch"
+    );
+}
+
+#[test]
+fn init_emits_strike_and_expiry() {
+    let h = setup(1_000_000, 10_000);
+    assert_last_event(&h, (symbol_short!("init"),), (1_000_000i128, h.expiry));
+}
+
+#[test]
+fn pause_and_unpause_emit_events() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.pause();
+    assert_last_event(&h, (symbol_short!("paused"),), ());
+    client.unpause();
+    assert_last_event(&h, (symbol_short!("unpaused"),), ());
+}
+
+#[test]
+fn split_and_merge_emit_events() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.split(&user, &2_000);
+    assert_last_event(&h, (symbol_short!("split"), user.clone()), 2_000i128);
+
+    client.merge(&user, &2_000);
+    assert_last_event(&h, (symbol_short!("merge"), user.clone()), 2_000i128);
+}
+
+#[test]
+fn buy_emits_collateral_and_shares_out() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    let total_yes = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    assert_last_event(
+        &h,
+        (symbol_short!("buy"), user.clone(), Prediction::Yes),
+        (1_000i128, total_yes - 1_000),
+    );
+}
+
+#[test]
+fn sell_emits_shares_in_and_collateral_out() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let collateral_back = client.sell(&user, &Prediction::Yes, &shares, &0);
+    assert_last_event(
+        &h,
+        (symbol_short!("sell"), user.clone(), Prediction::Yes),
+        (shares, collateral_back),
+    );
+}
+
+#[test]
+fn transfer_emits_xfer_event() {
+    let h = setup(1_000_000, 10_000);
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    fund(&h, &alice, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.split(&alice, &1_000);
+    client.transfer(&alice, &bob, &Prediction::Yes, &400);
+    assert_last_event(
+        &h,
+        (symbol_short!("xfer"), alice.clone(), bob.clone(), Prediction::Yes),
+        400i128,
+    );
+}
+
+#[test]
+fn settle_emits_status_and_final_price() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle(&bytes);
+
+    assert_last_event(
+        &h,
+        (symbol_short!("settle"),),
+        (MarketStatus::ResolvedYes, 1_000_000i128),
+    );
+}
+
+#[test]
+fn cancel_emits_event() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry + h.grace + 1);
+    client.cancel();
+    assert_last_event(&h, (symbol_short!("cancel"),), ());
+}
+
+#[test]
+fn redeem_emits_payout() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace + 1);
+    client.cancel();
+    let payout = client.redeem(&user);
+    assert_last_event(&h, (symbol_short!("redeem"), user.clone()), payout);
+}
+
 // ---------- on-chain Reflector cross-check ----------
 
 #[test]
