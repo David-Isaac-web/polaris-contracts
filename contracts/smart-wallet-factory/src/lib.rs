@@ -48,7 +48,8 @@
 //! wasm_and_hijack_a_victims_address` in `test.rs` for the reproduction.
 //!
 //! Fixed by pinning the wasm hash once, at factory setup
-//! (`initialize(admin, wasm_hash)`, admin-authenticated, one-time), and
+//! (`__constructor(admin, wasm_hash, origin)`, admin-authenticated, runs
+//! atomically with the deploy — see #95), and
 //! having `deploy` always use that stored hash. `deploy` itself stays
 //! deliberately unauthenticated — "anyone can pay to deploy anyone's
 //! wallet" is the intended, safe design the backend already relies on to
@@ -60,7 +61,7 @@ use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, vec, Addr
 
 const STORAGE_KEY_WASM_HASH: Symbol = symbol_short!("wasm");
 const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
-/// Same bump window used across this workspace — see #11. `initialize`
+/// Same bump window used across this workspace — see #11. The constructor
 /// only ever runs once per factory instance, so without this the
 /// factory's own storage TTL has nothing else to keep it alive between
 /// then and whenever `deploy` is next called — which, on a low-traffic
@@ -76,6 +77,8 @@ fn touch(env: &Env) {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 #[repr(u32)]
 pub enum Error {
+    /// Retained for ABI stability; the constructor (#95) can no longer
+    /// report it — a second deploy at the same address fails in the host.
     AlreadyInitialized = 1,
     NotInitialized = 2,
 }
@@ -99,16 +102,18 @@ impl SmartWalletFactory {
     ///
     /// `admin` is whoever controls this factory's configuration — not a
     /// role any deployed wallet answers to, just the authority to set this
-    /// once. Must run before `deploy` will do anything.
-    pub fn initialize(env: Env, admin: Address, wasm_hash: BytesN<32>, origin: Bytes) -> Result<(), Error> {
+    /// once.
+    ///
+    /// A `__constructor` (#95), not a separate `initialize` entrypoint:
+    /// `deploy` + `initialize` as two transactions left a window where the
+    /// factory existed unconfigured, and anyone could race the legitimate
+    /// setup. The constructor runs atomically inside the deploy invocation,
+    /// so the factory is never observable in an unconfigured state.
+    pub fn __constructor(env: Env, admin: Address, wasm_hash: BytesN<32>, origin: Bytes) {
         admin.require_auth();
-        if env.storage().instance().has(&STORAGE_KEY_WASM_HASH) {
-            return Err(Error::AlreadyInitialized);
-        }
         env.storage().instance().set(&STORAGE_KEY_WASM_HASH, &wasm_hash);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
         touch(&env);
-        Ok(())
     }
 
     /// Deploys (and atomically initializes) a smart-wallet for
