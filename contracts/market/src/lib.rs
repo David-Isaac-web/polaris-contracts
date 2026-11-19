@@ -67,6 +67,10 @@ use polaris_ctf_math::{
 
 /// Protocol fee ceiling: 1000 bps = 10%.
 const MAX_FEE_BPS: u32 = 1_000;
+/// Oracle corroboration tolerance ceiling: 1000 bps = 10%. A tolerance at or
+/// above 10_000 bps would accept any divergence at all, silently disabling
+/// the second-oracle cross-check; 0 would reject every price outright.
+const MAX_TOLERANCE_BPS: u32 = 1_000;
 /// Settlement price must be timestamped within this many seconds of expiry.
 const PRICE_FRESHNESS_WINDOW_SECS: u64 = 300;
 /// Instance/persistent storage TTL bump (ledgers), applied on every write.
@@ -388,6 +392,12 @@ impl PolarisMarket {
         if reflector.max_staleness_secs < reflector_client.resolution() as u64 {
             return Err(Error::InvalidReflectorConfig);
         }
+        // A tolerance of 0 rejects every price, and one above
+        // `MAX_TOLERANCE_BPS` (or at/above 10_000 bps) accepts any
+        // divergence — either way the corroboration check is disabled.
+        if reflector.tolerance_bps == 0 || reflector.tolerance_bps > MAX_TOLERANCE_BPS {
+            return Err(Error::InvalidReflectorConfig);
+        }
         // Pinned once here, re-checked on every `settle()` call — see
         // `Market::reflector_decimals_at_init`'s doc comment.
         let reflector_decimals_at_init = reflector_client.decimals();
@@ -398,6 +408,9 @@ impl PolarisMarket {
         if let Some(cfg) = &redstone {
             let redstone_client = Sep40Client::new(&env, &cfg.contract);
             if cfg.max_staleness_secs < redstone_client.resolution() as u64 {
+                return Err(Error::InvalidRedstoneConfig);
+            }
+            if cfg.tolerance_bps == 0 || cfg.tolerance_bps > MAX_TOLERANCE_BPS {
                 return Err(Error::InvalidRedstoneConfig);
             }
             let redstone_decimals_at_init = redstone_client.decimals();
