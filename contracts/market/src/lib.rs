@@ -770,6 +770,12 @@ impl PolarisMarket {
         if price.timestamp + PRICE_FRESHNESS_WINDOW_SECS < m.expiry {
             return Err(Error::StalePrice);
         }
+        // Upper bound mirroring the Lazer path: a price timestamped after
+        // expiry + PRICE_FRESHNESS_WINDOW_SECS is not a settlement price for
+        // this market, so reject it rather than settling on a future print.
+        if price.timestamp > m.expiry + PRICE_FRESHNESS_WINDOW_SECS {
+            return Err(Error::FuturePrice);
+        }
         let decimals = client.decimals();
         if decimals != m.reflector_decimals_at_init {
             return Err(Error::ReflectorDecimalsChanged);
