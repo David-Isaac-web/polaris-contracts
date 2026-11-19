@@ -92,6 +92,12 @@ fn default_redstone_config(env: &Env, redstone_id: &Address) -> OracleFeedConfig
 }
 
 fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
+    setup_with_fees(strike_cents, initial_liquidity, 100, 20)
+}
+
+/// `setup` with an explicit fee curve — for the degenerate configs
+/// (`min == base`, and `base == 0`) that `initialize` also accepts.
+fn setup_with_fees(strike_cents: i128, initial_liquidity: i128, base_fee_bps: u32, min_fee_bps: u32) -> Harness {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(1_000_000);
@@ -121,8 +127,8 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
         &grace,
         &lazer_id,
         &FEED_ID,
-        &100u32, // base fee: 1%
-        &20u32,  // min fee: 0.2%
+        &base_fee_bps,
+        &min_fee_bps,
         &treasury,
         &initial_liquidity,
         &default_reflector_config(&env, &reflector_id),
@@ -1220,6 +1226,53 @@ fn fee_never_exceeds_base_even_if_total_supply_dips_back_toward_seed() {
 
     client.merge(&user, &40_000); // back down to exactly initial_liquidity
     assert_eq!(client.get_fee(), 100); // curve is a pure function of current total_supply, not a ratchet
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn flat_fee_curve_keeps_fee_constant_across_volume_growth() {
+    // min == base is a legal config: the (base - min) == 0 arm of the curve.
+    let h = setup_with_fees(1_000_000, 10_000, 50, 50);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000);
+
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &10_000); // total_supply: 10_000 -> 20_000
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &30_000); // total_supply: 20_000 -> 50_000
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &950_000); // total_supply: 50_000 -> 1_000_000
+    assert_eq!(client.get_fee(), 50);
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn zero_fee_config_charges_nothing_and_round_trip_loses_only_slippage() {
+    // base == 0 forces min == 0: the all-zero arm of the curve, and
+    // apply_fee(amount, 0) must be a true no-op.
+    let h = setup_with_fees(1_000_000, 10_000, 0, 0);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000);
+
+    assert_eq!(client.get_fee(), 0);
+    client.split(&user, &40_000); // total_supply: 10_000 -> 50_000
+    assert_eq!(client.get_fee(), 0);
+
+    let before = token::Client::new(&h.env, &h.token_id).balance(&user);
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let back = client.sell(&user, &Prediction::Yes, &shares, &0);
+    let after = token::Client::new(&h.env, &h.token_id).balance(&user);
+
+    // Round trip is a loss (CPMM slippage) but never a fee: with zero fee the
+    // pool's k is unchanged by the pair of trades, so the loss is bounded by
+    // slippage alone and strictly less than any 1-bps fee would cost.
+    assert!(back < 1_000, "round trip must lose slippage, got {back}");
+    assert_eq!(after, before - 1_000 + back);
+    assert!(1_000 - back < 100, "loss must be slippage-only, got {}", 1_000 - back);
 
     assert_solvent(&h);
 }
