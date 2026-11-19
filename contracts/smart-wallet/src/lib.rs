@@ -59,6 +59,18 @@
 //! against; (1)+(2) without (3) can't distinguish *where* the signing
 //! ceremony actually happened.
 //!
+//! ## What `__check_auth` still does not constrain: *what* was authorized
+//!
+//! All three checks above prove the owner's passkey approved *this*
+//! transaction's `signature_payload`. They say nothing about the contents of
+//! that payload: `_auth_contexts` is accepted and ignored, so a single valid
+//! assertion authorizes every invocation in the tree the host built — any
+//! contract, any function, any amount. A malicious frontend or embedder that
+//! gets the owner to approve one Face ID prompt can therefore have the wallet
+//! call anything the wallet's address is allowed to call. An optional
+//! allowlist / spend-cap policy enforced by iterating `auth_contexts` is
+//! designed in `docs/issues/92-wallet-policy.md`; it is not implemented here.
+//!
 //! ## `authenticator_data.rpIdHash` (WebAuthn §7.2 step 13) — checked
 //!
 //! The first 32 bytes of `authenticator_data` are `rpIdHash =
@@ -224,6 +236,10 @@ impl CustomAccountInterface for SmartWallet {
         env: Env,
         signature_payload: Hash<32>,
         signature: Signature,
+        // Deliberately unused: this wallet authorizes *who* signed, not
+        // *what* was signed. See the module doc and
+        // `docs/issues/92-wallet-policy.md` for the optional policy that
+        // would iterate these contexts.
         _auth_contexts: Vec<Context>,
     ) -> Result<(), Error> {
         let public_key = env

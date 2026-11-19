@@ -45,6 +45,7 @@ app is at
 - [Errors, not panics](#errors-not-panics)
 - [Cost-driven fee curve](#cost-driven-fee-curve)
 - [Passkey smart wallets](#passkey-smart-wallets)
+- [Wallet policy: what a passkey assertion authorizes](#wallet-policy-what-a-passkey-assertion-authorizes)
 - [The capital-efficiency vault](#the-capital-efficiency-vault)
 - [On-chain second-oracle: Reflector Network](#on-chain-second-oracle-reflector-network)
 - [A second settlement path: settle_via_reflector](#a-second-settlement-path-settle_via_reflector)
@@ -473,6 +474,19 @@ means deploying a new factory — a new generation — not editing the old one.
 If a factory's config must change, deploy a new factory and follow the
 migration procedure above. The only admin power over a factory is the
 one-time `initialize`.
+
+## Wallet policy: what a passkey assertion authorizes
+
+`__check_auth` verifies *who* signed (the passkey, from the pinned origin,
+over this transaction's payload) but not *what* the payload authorizes: the
+`auth_contexts` argument is ignored, so one approved Face ID prompt can
+authorize any invocation tree the host built — any contract, any function,
+any amount. The threat (a malicious frontend or embedder), the candidate
+policies (contract allowlist, native XLM spend cap), and how either would
+interact with the factory-generation upgrade model are written up in
+[`docs/issues/92-wallet-policy.md`](docs/issues/92-wallet-policy.md).
+Implementation is a follow-up; nothing in this section is enforced on-chain
+today.
 
 ## The capital-efficiency vault
 
