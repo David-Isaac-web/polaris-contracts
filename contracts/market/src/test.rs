@@ -178,6 +178,21 @@ fn fund(h: &Harness, who: &Address, amount: i128) {
     token::StellarAssetClient::new(&h.env, &h.token_id).mint(who, &amount);
 }
 
+/// The solvency invariant every redeem must preserve: the market's real
+/// collateral balance always equals the outstanding `total_supply` (the
+/// number of shares still redeemable), so no holder can ever be starved by
+/// an earlier holder's payout.
+fn assert_solvent(h: &Harness) {
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let m = client.get_market();
+    let balance = token::Client::new(&h.env, &h.token_id).balance(&h.market_id);
+    assert_eq!(
+        balance, m.total_supply,
+        "market collateral balance must equal remaining total_supply"
+    );
+    assert!(balance >= 0, "market collateral balance must never go negative");
+}
+
 /// Sets the mock Reflector's price to exactly agree with `cents` (converted
 /// through the same `REFLECTOR_DECIMALS` scaling `reflector_price_to_cents`
 /// inverts), timestamped at the current ledger time — for tests that need
@@ -1279,4 +1294,97 @@ fn cancel_redeem_stays_solvent_for_every_holder_including_treasury() {
 
     assert_eq!(user_payout + treasury_payout, 11_000); // == total_supply at cancellation, exactly
     assert_solvent(&h);
+}
+
+// ---------- regression: Resolved (YES/NO) redeem must stay solvent for
+// every legitimate holder, not just whoever redeems first ----------
+
+/// Builds a market with a genuinely mixed holder set — directional buyers on
+/// both sides, split/LP holders, a transferred position, and the treasury's
+/// own pool-seeded shares — then resolves it and redeems every holder in a
+/// shuffled order, asserting the solvency invariant after each redeem.
+///
+/// `resolve_yes` picks which side wins; the price is set to exactly the
+/// strike (YES) or just below it (NO) so the outcome is unambiguous.
+fn resolved_redeem_stays_solvent_for_every_holder(resolve_yes: bool) {
+    let h = setup(1_000_000, 10_000); // strike = $10,000.00
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    let yes_bettor = Address::generate(&h.env);
+    let no_bettor = Address::generate(&h.env);
+    let splitter = Address::generate(&h.env);
+    let transferee = Address::generate(&h.env);
+    fund(&h, &yes_bettor, 5_000);
+    fund(&h, &no_bettor, 5_000);
+    fund(&h, &splitter, 5_000);
+
+    // Directional buyers on both sides — AMM-priced, so their share counts
+    // are not round numbers and don't match what they paid in.
+    client.buy(&yes_bettor, &Prediction::Yes, &1_000, &0);
+    client.buy(&no_bettor, &Prediction::No, &1_000, &0);
+    // A plain split/LP holder: matched YES+NO pair, no AMM involved.
+    client.split(&splitter, &2_000);
+    // A transferred position: the splitter hands some YES to a fresh address
+    // that never traded, so it holds only one side.
+    client.transfer(&splitter, &transferee, &Prediction::Yes, &700);
+
+    assert_solvent(&h);
+
+    h.env.ledger().set_timestamp(h.expiry);
+    if resolve_yes {
+        set_reflector_price_cents(&h, 1_000_000); // exactly at strike -> ResolvedYes
+    } else {
+        set_reflector_price_cents(&h, 999_900); // just below strike -> ResolvedNo
+    }
+    client.settle_via_reflector();
+
+    let m = client.get_market();
+    assert_eq!(
+        m.status,
+        if resolve_yes { MarketStatus::ResolvedYes } else { MarketStatus::ResolvedNo }
+    );
+    assert_solvent(&h);
+
+    // Shuffled, not the order they were created in — the bug class this
+    // guards against is order-dependent starvation, so the order matters.
+    let holders = [
+        transferee.clone(),
+        h.treasury.clone(),
+        no_bettor.clone(),
+        splitter.clone(),
+        yes_bettor.clone(),
+    ];
+
+    let supply_at_resolution = m.total_supply;
+    let mut paid = 0i128;
+    for holder in holders.iter() {
+        let payout = client.redeem(holder);
+        assert!(payout > 0, "every holder with shares must be paid");
+        paid += payout;
+        assert_solvent(&h);
+    }
+
+    // Every share was redeemed exactly once: total paid out equals the
+    // total_supply that existed at resolution.
+    assert_eq!(paid, supply_at_resolution);
+
+    // Final state: nothing left to redeem, and the market holds no dust
+    // beyond what the invariant already pins to total_supply (== 0 here).
+    let final_m = client.get_market();
+    assert_eq!(final_m.total_supply, 0);
+    assert_eq!(
+        token::Client::new(&h.env, &h.token_id).balance(&h.market_id),
+        0
+    );
+    assert_solvent(&h);
+}
+
+#[test]
+fn resolved_yes_redeem_stays_solvent_for_every_holder_including_treasury() {
+    resolved_redeem_stays_solvent_for_every_holder(true);
+}
+
+#[test]
+fn resolved_no_redeem_stays_solvent_for_every_holder_including_treasury() {
+    resolved_redeem_stays_solvent_for_every_holder(false);
 }
