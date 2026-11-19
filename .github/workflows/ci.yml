@@ -61,3 +61,23 @@ jobs:
           cargo build --release --target wasm32v1-none \
             -p polaris-mock-lazer -p polaris-mock-redstone -p polaris-smart-wallet \
             -p polaris-smart-wallet-factory -p polaris-vault -p polaris-perpetual
+
+  wasm-build-with-logs:
+    name: release-with-logs WASM builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+      # Keeps the `release-with-logs` profile (Cargo.toml) from rotting: it is
+      # only for diagnostic testnet deploys, never mainnet, but it must still
+      # compile. Same ordering constraint as the wasm-build job above.
+      - name: Build polaris-market first
+        run: cargo build --profile release-with-logs --target wasm32v1-none -p polaris-market
+      - name: Build the rest
+        run: |
+          cargo build --profile release-with-logs --target wasm32v1-none \
+            -p polaris-mock-lazer -p polaris-mock-redstone -p polaris-smart-wallet \
+            -p polaris-smart-wallet-factory -p polaris-vault -p polaris-perpetual

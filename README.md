@@ -614,6 +614,26 @@ cargo build --release --target wasm32v1-none -p polaris-mock-lazer \
 shasum -a 256 target/wasm32v1-none/release/*.wasm
 ```
 
+### Diagnostic builds (`release-with-logs`)
+
+`Cargo.toml` also defines a `release-with-logs` profile: it inherits
+`release` but turns on `debug-assertions`, so contract panics and
+`assert!`/`debug_assert!` failures carry their messages instead of being
+stripped. Use it **only for diagnostic testnet deploys — never for mainnet**:
+the extra checks cost CPU instructions and the artifacts are not the ones
+whose hashes are recorded above.
+
+```sh
+# diagnostic WASM for testnet debugging (same ordering rule as above)
+cargo build --profile release-with-logs --target wasm32v1-none -p polaris-market
+cargo build --profile release-with-logs --target wasm32v1-none \
+  -p polaris-mock-lazer -p polaris-mock-redstone -p polaris-smart-wallet \
+  -p polaris-smart-wallet-factory -p polaris-vault -p polaris-perpetual
+# artifacts land in target/wasm32v1-none/release-with-logs/
+```
+
+CI builds this profile on every push/PR so it cannot silently break.
+
 | Crate | Unit tests |
 |---|---|
 | `polaris-market` | 48 |
