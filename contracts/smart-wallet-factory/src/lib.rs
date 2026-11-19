@@ -62,6 +62,7 @@ use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, vec, Addr
 
 const STORAGE_KEY_WASM_HASH: Symbol = symbol_short!("wasm");
 const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
+const STORAGE_KEY_ADMIN: Symbol = symbol_short!("admin");
 /// Same bump window used across this workspace — see #11. The constructor
 /// only ever runs once per factory instance, so without this the
 /// factory's own storage TTL has nothing else to keep it alive between
@@ -103,7 +104,9 @@ impl SmartWalletFactory {
     ///
     /// `admin` is whoever controls this factory's configuration — not a
     /// role any deployed wallet answers to, just the authority to set this
-    /// once.
+    /// once. It is authenticated here and then stored, so the factory keeps
+    /// a lasting, readable record of that authority (`get_admin`) instead of
+    /// discarding it after the auth check (#96).
     ///
     /// A `__constructor` (#95), not a separate `initialize` entrypoint:
     /// `deploy` + `initialize` as two transactions left a window where the
@@ -114,7 +117,18 @@ impl SmartWalletFactory {
         admin.require_auth();
         env.storage().instance().set(&STORAGE_KEY_WASM_HASH, &wasm_hash);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
+        env.storage().instance().set(&STORAGE_KEY_ADMIN, &admin);
         touch(&env);
+    }
+
+    /// The admin this factory was constructed with — the authority that
+    /// pinned the wasm hash and origin. A pure read, safe to call
+    /// speculatively.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_ADMIN)
+            .ok_or(Error::NotInitialized)
     }
 
     /// Deploys (and atomically initializes) a smart-wallet for

@@ -127,7 +127,19 @@ fn deploy_is_idempotent_for_the_same_public_key() {
 }
 
 #[test]
-fn deploy_before_initialize_rejected() {
+fn constructor_stores_the_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
+    let admin = Address::generate(&env);
+    let factory_id = env.register(SmartWalletFactory, (&admin, &wasm_hash, &test_origin(&env)));
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn get_admin_before_initialize_rejected() {
     let env = Env::default();
     env.mock_all_auths();
     // A factory can no longer be registered unconfigured: the constructor
