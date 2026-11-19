@@ -93,6 +93,9 @@ const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
 /// for a long stretch needs an explicit extend, not an incidental one.
 const BUMP_TO: u32 = 535_680;
 const BUMP_THRESHOLD: u32 = 500_000;
+/// Largest `client_data_json` accepted by `__check_auth`; must match the
+/// buffer size passed to `to_buffer` below.
+const MAX_CLIENT_DATA_JSON_LEN: u32 = 1024;
 
 fn touch(env: &Env) {
     env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
@@ -173,6 +176,10 @@ impl SmartWallet {
 /// `s` was replaced with `n - s`). The frontend must convert DER to raw r‖s
 /// *and* normalize to low-S before submitting; see
 /// `polaris-frontend`'s `lib/webauthn.ts`.
+///
+/// `client_data_json` must be at most 1024 bytes: it is decoded into a
+/// fixed 1024-byte buffer, and a longer payload is rejected with
+/// `Error::ClientDataJsonParseError` rather than trapping.
 #[derive(Clone)]
 #[soroban_sdk::contracttype]
 pub struct Signature {
@@ -223,6 +230,11 @@ impl CustomAccountInterface for SmartWallet {
         // challenge was signed by this key, not that *this transaction*
         // was. Bind them by checking the browser-supplied challenge field
         // equals what the host computed for this specific invocation tree.
+        // `to_buffer` traps on overflow, so reject oversized payloads first
+        // and surface them as a typed error instead.
+        if signature.client_data_json.len() > MAX_CLIENT_DATA_JSON_LEN {
+            return Err(Error::ClientDataJsonParseError);
+        }
         let client_data_json = signature.client_data_json.to_buffer::<1024>();
         let (client_data, _): (ClientDataJson, _) =
             serde_json_core::de::from_slice(client_data_json.as_slice())
