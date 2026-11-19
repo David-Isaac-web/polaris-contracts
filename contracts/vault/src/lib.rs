@@ -72,7 +72,15 @@ fn touch(env: &Env) {
 
 const STORAGE_KEY_ADMIN: Symbol = symbol_short!("admin");
 const STORAGE_KEY_COLLATERAL: Symbol = symbol_short!("collat");
+/// Cumulative lifetime counter: every `deposit` ever made, never decremented
+/// by `withdraw`/`redeem_from_market`. Reconcile the live balance with
+/// `total_deposited - total_withdrawn + total_redeemed == get_balance()`.
 const STORAGE_KEY_TOTAL_DEPOSITED: Symbol = symbol_short!("deposit");
+/// Cumulative lifetime counter: every `withdraw` ever made.
+const STORAGE_KEY_TOTAL_WITHDRAWN: Symbol = symbol_short!("withdrawn");
+/// Cumulative lifetime counter: every payout ever collected from a market
+/// via `redeem_from_market`.
+const STORAGE_KEY_TOTAL_REDEEMED: Symbol = symbol_short!("redeemed");
 /// Set only between a `propose_admin` and the matching `accept_admin` —
 /// absent the rest of the time. See `propose_admin`'s doc comment for why
 /// this is two steps, not a single `set_admin`.
@@ -109,6 +117,8 @@ impl Vault {
         env.storage().instance().set(&STORAGE_KEY_ADMIN, &admin);
         env.storage().instance().set(&STORAGE_KEY_COLLATERAL, &collateral);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &0i128);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_WITHDRAWN, &0i128);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_REDEEMED, &0i128);
         touch(&env);
         Ok(())
     }
@@ -147,6 +157,9 @@ impl Vault {
         }
         let collateral = Self::require_collateral(&env)?;
         token::Client::new(&env, &collateral).transfer(&env.current_contract_address(), &to, &amount);
+
+        let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_WITHDRAWN).unwrap_or(0);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_WITHDRAWN, &(total + amount));
         touch(&env);
         env.events().publish((symbol_short!("withdraw"), to), amount);
         Ok(())
@@ -163,6 +176,9 @@ impl Vault {
         Self::require_admin(&env, &admin)?;
         let market = market_contract::Client::new(&env, &market_id);
         let payout = market.redeem(&env.current_contract_address());
+
+        let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_REDEEMED).unwrap_or(0);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_REDEEMED, &(total + payout));
         touch(&env);
         env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
         Ok(payout)
@@ -223,6 +239,22 @@ impl Vault {
         env.storage()
             .instance()
             .get(&STORAGE_KEY_TOTAL_DEPOSITED)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Cumulative lifetime total ever withdrawn via `withdraw`.
+    pub fn get_total_withdrawn(env: Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_TOTAL_WITHDRAWN)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Cumulative lifetime total ever collected via `redeem_from_market`.
+    pub fn get_total_redeemed(env: Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_TOTAL_REDEEMED)
             .ok_or(Error::NotInitialized)
     }
 
