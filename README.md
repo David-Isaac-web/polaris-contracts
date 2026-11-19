@@ -601,18 +601,25 @@ live.
 
 ```sh
 # unit tests (native target; 100 across the whole workspace)
-cargo test --workspace
+cargo test --locked --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
 # polaris-market first, on its own — polaris-vault's contractimport! reads
 # its compiled wasm as a file at build time, a dependency Cargo's own
 # graph doesn't know about (see "The capital-efficiency vault" above).
-cargo build --release --target wasm32v1-none -p polaris-market
-cargo build --release --target wasm32v1-none -p polaris-mock-lazer \
+cargo build --locked --release --target wasm32v1-none -p polaris-market
+cargo build --locked --release --target wasm32v1-none -p polaris-mock-lazer \
   -p polaris-mock-redstone -p polaris-smart-wallet -p polaris-smart-wallet-factory \
   -p polaris-vault -p polaris-perpetual
 shasum -a 256 target/wasm32v1-none/release/*.wasm
 ```
+
+`Cargo.lock` is committed and every build above uses `--locked`, so a fresh
+clone resolves the exact same dependency versions. The hashes below were
+produced with the stable toolchain CI uses (`dtolnay/rust-toolchain@stable`);
+a different `rustc`/`soroban-sdk` build can still change the bytes, so if a
+rebuild from a fresh clone does not match, check `rustc --version` before
+assuming a source change.
 
 | Crate | Unit tests |
 |---|---|
