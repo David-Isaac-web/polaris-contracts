@@ -595,6 +595,33 @@ fn transfer_insufficient_balance_rejected() {
     assert_eq!(res, Err(Ok(Error::InsufficientBalance)));
 }
 
+#[test]
+fn transfer_to_the_contract_itself_rejected() {
+    let h = setup(1_000_000, 10_000);
+    let alice = Address::generate(&h.env);
+    fund(&h, &alice, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.split(&alice, &1_000);
+    let res = client.try_transfer(&alice, &h.market_id, &Prediction::Yes, &400);
+    assert_eq!(res, Err(Ok(Error::InvalidRecipient)));
+    assert_eq!(client.get_position(&alice), (1_000, 1_000));
+    assert_solvent(&h);
+}
+
+#[test]
+fn transfer_to_self_is_a_noop() {
+    let h = setup(1_000_000, 10_000);
+    let alice = Address::generate(&h.env);
+    fund(&h, &alice, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    client.split(&alice, &1_000);
+    client.transfer(&alice, &alice, &Prediction::Yes, &400);
+    assert_eq!(client.get_position(&alice), (1_000, 1_000));
+    assert_solvent(&h);
+}
+
 // ---------- settle ----------
 
 #[test]
