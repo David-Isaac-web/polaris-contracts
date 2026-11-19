@@ -10,9 +10,23 @@ use soroban_sdk::{token, Address, Env, Symbol};
 /// num_props(1) + properties...]. We only encode price(0), exponent(4), and
 /// feed_update_timestamp(12) — the three properties `settle` reads.
 fn build_payload(feed_id: u32, price: i64, exponent: i16, feed_ts_micros: u64) -> std::vec::Vec<u8> {
+    build_payload_with_feed_ts(feed_id, price, exponent, feed_ts_micros, Some(feed_ts_micros))
+}
+
+/// Same as `build_payload`, but lets the feed's own `feed_update_timestamp`
+/// property be omitted (`None`) while the payload-level timestamp stays
+/// `payload_ts_micros` — the shape that drives `settle`'s
+/// `unwrap_or(verified.timestamp)` fallback.
+fn build_payload_with_feed_ts(
+    feed_id: u32,
+    price: i64,
+    exponent: i16,
+    payload_ts_micros: u64,
+    feed_ts_micros: Option<u64>,
+) -> std::vec::Vec<u8> {
     let mut b = std::vec::Vec::new();
     b.extend_from_slice(&2_479_346_549u32.to_le_bytes()); // magic
-    b.extend_from_slice(&feed_ts_micros.to_le_bytes()); // top-level timestamp
+    b.extend_from_slice(&payload_ts_micros.to_le_bytes()); // top-level timestamp
     b.push(3); // channel = FixedRate200ms
     b.push(1); // num_feeds
     b.extend_from_slice(&feed_id.to_le_bytes());
@@ -22,8 +36,13 @@ fn build_payload(feed_id: u32, price: i64, exponent: i16, feed_ts_micros: u64) -
     b.push(4); // property: exponent
     b.extend_from_slice(&(exponent as u16).to_le_bytes());
     b.push(12); // property: feed_update_timestamp
-    b.push(1); // exists = true
-    b.extend_from_slice(&feed_ts_micros.to_le_bytes());
+    match feed_ts_micros {
+        Some(ts) => {
+            b.push(1); // exists = true
+            b.extend_from_slice(&ts.to_le_bytes());
+        }
+        None => b.push(0), // exists = false
+    }
     b
 }
 
@@ -668,6 +687,39 @@ fn settle_rejects_stale_price() {
     let bytes = Bytes::from_slice(&h.env, &payload);
     let res = client.try_settle(&bytes);
     assert_eq!(res, Err(Ok(Error::StalePrice)));
+}
+
+#[test]
+fn settle_accepts_fresh_payload_level_timestamp_when_feed_omits_its_own() {
+    // Fallback branch: the feed carries no `feed_update_timestamp`, so
+    // `settle` must trust the payload-level `verified.timestamp` instead.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload_with_feed_ts(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000, None);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle(&bytes);
+
+    let m = client.get_market();
+    assert_eq!(m.status, MarketStatus::ResolvedYes);
+    assert_eq!(m.final_price, 1_000_000);
+    assert_solvent(&h);
+}
+
+#[test]
+fn settle_rejects_stale_payload_level_timestamp_when_feed_omits_its_own() {
+    // Same fallback branch, stale outcome: the payload-level timestamp is
+    // what gets freshness-checked, so an old one must reject.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let stale_ts = (h.expiry - 1_000) * 1_000_000; // > 5 min before expiry
+    let payload = build_payload_with_feed_ts(FEED_ID, 10_000_00000000, -8, stale_ts, None);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::StalePrice)));
+    assert_eq!(client.get_market().status, MarketStatus::Open);
 }
 
 #[test]
