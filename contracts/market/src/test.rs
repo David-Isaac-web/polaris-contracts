@@ -610,6 +610,73 @@ fn transfer_insufficient_balance_rejected() {
     assert_eq!(res, Err(Ok(Error::InsufficientBalance)));
 }
 
+#[test]
+fn post_settlement_transfer_moves_redemption_right_to_recipient() {
+    let h = setup(1_000_000, 10_000);
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    fund(&h, &alice, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let shares = client.buy(&alice, &Prediction::Yes, &1_000, &0);
+
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle(&bytes);
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+
+    // Winning shares stay transferable after settlement — the recipient,
+    // not the original buyer, now owns the redemption right.
+    client.transfer(&alice, &bob, &Prediction::Yes, &shares);
+    assert_eq!(client.get_position(&alice), (0, 0));
+    assert_eq!(client.get_position(&bob), (shares, 0));
+    assert_solvent(&h);
+
+    let before = token::Client::new(&h.env, &h.token_id).balance(&bob);
+    let payout = client.redeem(&bob);
+    assert_eq!(payout, shares);
+    let after = token::Client::new(&h.env, &h.token_id).balance(&bob);
+    assert_eq!(after - before, shares);
+    assert_solvent(&h);
+
+    // Alice transferred everything away, so she has nothing left to redeem.
+    assert_eq!(
+        client.try_redeem(&alice),
+        Err(Ok(Error::NothingToRedeem))
+    );
+    assert_solvent(&h);
+}
+
+#[test]
+fn transfer_after_redeem_fails_with_insufficient_balance() {
+    let h = setup(1_000_000, 10_000);
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    fund(&h, &alice, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let shares = client.buy(&alice, &Prediction::Yes, &1_000, &0);
+
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle(&bytes);
+
+    assert_eq!(client.redeem(&alice), shares);
+    assert_eq!(client.get_position(&alice), (0, 0));
+    assert_solvent(&h);
+
+    // Redeemed shares are burned — they can't be transferred (or
+    // double-redeemed) afterwards.
+    assert_eq!(
+        client.try_transfer(&alice, &bob, &Prediction::Yes, &shares),
+        Err(Ok(Error::InsufficientBalance))
+    );
+    assert_eq!(client.get_position(&bob), (0, 0));
+    assert_solvent(&h);
+}
+
 // ---------- settle ----------
 
 #[test]
