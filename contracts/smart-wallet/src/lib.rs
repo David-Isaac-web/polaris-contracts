@@ -59,6 +59,21 @@
 //! against; (1)+(2) without (3) can't distinguish *where* the signing
 //! ceremony actually happened.
 //!
+//! ## `authenticator_data.rpIdHash` (WebAuthn §7.2 step 13) — checked
+//!
+//! The first 32 bytes of `authenticator_data` are `rpIdHash =
+//! sha256(rpId)`, the relying party the authenticator believes it is
+//! signing for. §7.2 requires the verifier to compare it against
+//! `sha256(expected rpId)` and reject on mismatch. This build does check
+//! it: `init` pins `sha256(rp_id)` alongside the origin (the factory
+//! passes it, derived from the same pinned origin), and `__check_auth`
+//! rejects any assertion whose `rpIdHash` differs with `RpIdMismatch`.
+//! Without it, an assertion produced for a *different* relying party that
+//! happens to share this wallet's key would be accepted as long as its
+//! `client_data_json` origin matched — the origin check alone is a
+//! client-supplied string, while `rpIdHash` is covered by the signature
+//! and set by the authenticator itself.
+//!
 //! ## A property this build does not implement
 //!
 //! Real WebAuthn deployments must track and reject replayed authenticator
@@ -86,6 +101,7 @@ mod test;
 
 const STORAGE_KEY_PK: Symbol = symbol_short!("pk");
 const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
+const STORAGE_KEY_RP_ID_HASH: Symbol = symbol_short!("rpidhash");
 /// Same bump window `contracts/market`/`contracts/perpetual` use — see
 /// #11: unlike those two (bumped as a side effect of every trade), this
 /// contract is only ever touched by `init` (once) and `__check_auth`
@@ -108,6 +124,7 @@ pub enum Error {
     ClientDataJsonParseError = 4,
     OriginMismatch = 5,
     TypeMismatch = 6,
+    RpIdMismatch = 7,
 }
 
 #[contract]
@@ -124,12 +141,26 @@ impl SmartWallet {
     /// `origin` is fixed for the wallet's lifetime, same as `public_key` —
     /// see `__check_auth`'s doc comment for why this can't be a
     /// `deploy()`-time caller parameter instead.
-    pub fn init(env: Env, public_key: BytesN<65>, origin: Bytes) -> Result<(), Error> {
+    ///
+    /// `rp_id_hash` is `sha256(rp_id)` — the value WebAuthn puts in the
+    /// first 32 bytes of `authenticator_data` — pinned here so
+    /// `__check_auth` can enforce WebAuthn §7.2's `rpIdHash` check. The
+    /// factory derives it from the same pinned origin it passes as
+    /// `origin`, so the two can never disagree.
+    pub fn init(
+        env: Env,
+        public_key: BytesN<65>,
+        origin: Bytes,
+        rp_id_hash: BytesN<32>,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&STORAGE_KEY_PK) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&STORAGE_KEY_PK, &public_key);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
+        env.storage()
+            .instance()
+            .set(&STORAGE_KEY_RP_ID_HASH, &rp_id_hash);
         touch(&env);
         Ok(())
     }
@@ -145,6 +176,13 @@ impl SmartWallet {
         env.storage()
             .instance()
             .get(&STORAGE_KEY_ORIGIN)
+            .ok_or(Error::NotInitialized)
+    }
+
+    pub fn get_rp_id_hash(env: Env) -> Result<BytesN<32>, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_RP_ID_HASH)
             .ok_or(Error::NotInitialized)
     }
 }
@@ -237,6 +275,30 @@ impl CustomAccountInterface for SmartWallet {
             .ok_or(Error::NotInitialized)?;
         if Bytes::from_slice(&env, client_data.origin.as_bytes()) != expected_origin {
             return Err(Error::OriginMismatch);
+        }
+
+        // WebAuthn §7.2 step 13: the first 32 bytes of `authenticator_data`
+        // are `sha256(rpId)` — set by the authenticator, covered by the
+        // signature, and therefore not something a relaying page can forge.
+        // Must equal the `sha256(rp_id)` pinned at `init`.
+        let expected_rp_id_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_KEY_RP_ID_HASH)
+            .ok_or(Error::NotInitialized)?;
+        if signature.authenticator_data.len() < 32 {
+            return Err(Error::RpIdMismatch);
+        }
+        let mut rp_id_hash = [0u8; 32];
+        rp_id_hash.copy_from_slice(
+            signature
+                .authenticator_data
+                .slice(0..32)
+                .to_buffer::<32>()
+                .as_slice(),
+        );
+        if BytesN::from_array(&env, &rp_id_hash) != expected_rp_id_hash {
+            return Err(Error::RpIdMismatch);
         }
 
         touch(&env);
