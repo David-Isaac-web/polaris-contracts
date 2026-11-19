@@ -109,16 +109,21 @@ fn deployed_wallet_is_bound_to_the_factorys_pinned_origin() {
 }
 
 #[test]
-fn same_public_key_cannot_deploy_twice() {
+fn deploy_is_idempotent_for_the_same_public_key() {
     let env = Env::default();
     let (factory_id, _) = setup(&env);
     let pk = sample_pk(&env, 3);
 
     let client = SmartWalletFactoryClient::new(&env, &factory_id);
-    client.deploy(&pk);
+    let first = client.deploy(&pk);
 
-    let result = client.try_deploy(&pk);
-    assert!(result.is_err(), "redeploying the same passkey must fail, not silently succeed");
+    let second = client.try_deploy(&pk);
+    assert_eq!(
+        second,
+        Ok(Ok(first.clone())),
+        "a second deploy for the same passkey must return the existing address"
+    );
+    assert_eq!(client.resolve(&pk), first);
 }
 
 #[test]

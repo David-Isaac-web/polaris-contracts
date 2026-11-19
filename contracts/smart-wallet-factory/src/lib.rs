@@ -20,9 +20,10 @@
 //! deploying anything — a caller (this system's own backend, or any third
 //! party embedding a market) can check whether a wallet already exists for
 //! a given passkey before prompting a "create wallet" flow. `deploy` itself
-//! is also naturally idempotent: a second call for the same key fails on
-//! the child's own `AlreadyInitialized` check rather than silently
-//! creating (or, worse, silently reusing) a duplicate.
+//! is idempotent: if a wallet already exists at that key's address, it
+//! probes the existing contract (via `get_public_key`) and returns that
+//! address unchanged instead of trapping in `deploy_v2` — so a second call
+//! for the same key is a safe no-op, never a duplicate or a hijack.
 //!
 //! Deliberately *not* reimplemented off-chain (in the backend or frontend):
 //! Soroban's exact deployer-address-plus-salt hash isn't something worth
@@ -122,6 +123,13 @@ impl SmartWalletFactory {
     /// why neither is a parameter here. Deliberately unauthenticated:
     /// anyone can pay to deploy anyone's wallet, which is what lets this
     /// system's backend onboard a user who holds zero XLM.
+    ///
+    /// Idempotent: if a contract already lives at `public_key`'s
+    /// deterministic address, this returns that address without deploying
+    /// or re-initializing anything. The probe is a `get_public_key` call on
+    /// the existing contract, so an address occupied by something that
+    /// isn't an initialized smart wallet still traps rather than being
+    /// silently handed back.
     pub fn deploy(env: Env, public_key: BytesN<65>) -> Result<Address, Error> {
         let wasm_hash: BytesN<32> = env
             .storage()
@@ -134,6 +142,18 @@ impl SmartWalletFactory {
             .get(&STORAGE_KEY_ORIGIN)
             .ok_or(Error::NotInitialized)?;
         let salt = env.crypto().sha256(&public_key.clone().into());
+        let address = env
+            .deployer()
+            .with_current_contract(salt.clone())
+            .deployed_address();
+        let existing: Result<Result<BytesN<65>, _>, _> =
+            env.try_invoke_contract(&address, &symbol_short!("get_pk"), vec![&env]);
+        if let Ok(Ok(existing_pk)) = existing {
+            if existing_pk == public_key {
+                touch(&env);
+                return Ok(address);
+            }
+        }
         let address = env
             .deployer()
             .with_current_contract(salt)
