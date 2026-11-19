@@ -21,9 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Reads the pinned channel/components/targets from rust-toolchain.toml,
+      # so CI and local builds use the same Rust version.
+      - uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32v1-none
+          toolchain: 1.91.0
       - uses: Swatinem/rust-cache@v2
       - name: Build polaris-market's wasm first
         # contracts/vault AND contracts/smart-wallet-factory both read
@@ -49,9 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32v1-none
+          toolchain: 1.91.0
       - uses: Swatinem/rust-cache@v2
       - name: Build polaris-market first
         # polaris-vault's `contractimport!` reads polaris-market's compiled
