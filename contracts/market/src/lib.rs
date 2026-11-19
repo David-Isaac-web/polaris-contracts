@@ -73,6 +73,13 @@ const MAX_FEE_BPS: u32 = 1_000;
 const MAX_TOLERANCE_BPS: u32 = 1_000;
 /// Settlement price must be timestamped within this many seconds of expiry.
 const PRICE_FRESHNESS_WINDOW_SECS: u64 = 300;
+/// Upper bound on `expiry` and on `grace_period`, so that
+/// `expiry + grace_period` can never overflow `u64` — otherwise `cancel()`,
+/// the permissionless liveness backstop, could trap forever and strand
+/// every holder's funds. Both are capped at `u64::MAX / 2`, which leaves
+/// their sum representable with room to spare.
+const MAX_EXPIRY: u64 = u64::MAX / 2;
+const MAX_GRACE_PERIOD: u64 = u64::MAX / 2;
 /// Instance/persistent storage TTL bump (ledgers), applied on every write.
 const BUMP_TO: u32 = 535_680; // ~31 days at 5s/ledger
 const BUMP_THRESHOLD: u32 = 500_000;
@@ -370,10 +377,10 @@ impl PolarisMarket {
         if strike_price <= 0 {
             return Err(Error::InvalidStrikePrice);
         }
-        if expiry <= env.ledger().timestamp() {
+        if expiry <= env.ledger().timestamp() || expiry > MAX_EXPIRY {
             return Err(Error::InvalidExpiry);
         }
-        if grace_period == 0 {
+        if grace_period == 0 || grace_period > MAX_GRACE_PERIOD {
             return Err(Error::InvalidGracePeriod);
         }
         if feed_id == 0 {
@@ -857,7 +864,10 @@ impl PolarisMarket {
             return Err(Error::AlreadyFinalized);
         }
         let now = env.ledger().timestamp();
-        if now < m.expiry + m.grace_period {
+        // Saturating: `initialize` already bounds both terms so this can't
+        // overflow, but the backstop must never trap even for a market
+        // stored before that bound existed.
+        if now < m.expiry.saturating_add(m.grace_period) {
             return Err(Error::GracePeriodNotElapsed);
         }
 
