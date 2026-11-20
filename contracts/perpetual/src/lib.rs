@@ -381,6 +381,11 @@ impl PolarisPerpetual {
             if !(2..=30).contains(&reflector_decimals_at_init) {
                 return Err(Error::ReflectorDecimalsInvalid);
             }
+            // Fail closed at init, not at first checkpoint: an oracle with
+            // no price for the configured asset can never be used.
+            if reflector_client.lastprice(oracle.reflector.asset.clone()).is_none() {
+                return Err(Error::ReflectorPriceUnavailable);
+            }
 
             let redstone_client = Sep40Client::new(&env, &oracle.redstone.contract);
             if oracle.redstone.max_staleness_secs < redstone_client.resolution() as u64 {
@@ -389,6 +394,9 @@ impl PolarisPerpetual {
             let redstone_decimals_at_init = redstone_client.decimals();
             if !(2..=30).contains(&redstone_decimals_at_init) {
                 return Err(Error::RedstoneDecimalsInvalid);
+            }
+            if redstone_client.lastprice(oracle.redstone.asset.clone()).is_none() {
+                return Err(Error::RedstonePriceUnavailable);
             }
 
             // Pinned live here, not trusted from the caller's own struct

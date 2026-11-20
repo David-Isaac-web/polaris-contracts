@@ -423,6 +423,11 @@ impl PolarisMarket {
         if !(2..=30).contains(&reflector_decimals_at_init) {
             return Err(Error::ReflectorDecimalsInvalid);
         }
+        // Fail closed at init, not at first settle: an oracle that has no
+        // price for the configured asset can never settle this market.
+        if reflector_client.lastprice(reflector.asset.clone()).is_none() {
+            return Err(Error::ReflectorPriceUnavailable);
+        }
 
         if let Some(cfg) = &redstone {
             let redstone_client = Sep40Client::new(&env, &cfg.contract);
@@ -430,6 +435,9 @@ impl PolarisMarket {
                 return Err(Error::InvalidRedstoneConfig);
             }
             let redstone_decimals_at_init = redstone_client.decimals();
+            if redstone_client.lastprice(cfg.asset.clone()).is_none() {
+                return Err(Error::RedstonePriceUnavailable);
+            }
             if !(2..=30).contains(&redstone_decimals_at_init) {
                 return Err(Error::RedstoneDecimalsInvalid);
             }
