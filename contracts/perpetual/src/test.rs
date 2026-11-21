@@ -677,3 +677,90 @@ fn set_fee_curve_rejected_once_terminated() {
     client.terminate(&h.admin);
     assert_eq!(client.try_set_fee_curve(&50, &10), Err(Ok(Error::MarketNotOpen)));
 }
+
+// ---------- full lifecycle acceptance test (#54) ----------
+
+/// initialize -> buy -> checkpoint -> terminate -> redeem, chained in one
+/// test with the solvency invariant asserted after every step, and with a
+/// configured price oracle. Each stage is already covered alone (see
+/// `buy_yes_moves_price_up`, `checkpoint_records_price_and_changes_nothing_else`,
+/// `terminate_needs_no_price_and_pays_every_holder_at_merge_parity`). This
+/// checks that they compose. Two directional buyers on opposite sides plus
+/// the treasury's seeded pool give `redeem` three holders with lopsided
+/// YES/NO balances, the case the 0.5-per-share formula has to keep solvent.
+#[test]
+fn full_lifecycle_initialize_buy_checkpoint_terminate_redeem_stays_solvent_throughout() {
+    let token = |h: &Harness| token::Client::new(&h.env, &h.token_id);
+
+    // 1. initialize, with Lazer + Reflector + RedStone all configured.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    assert!(client.get_price_oracle().is_some());
+    assert_eq!(client.get_market().status, PerpetualStatus::Open);
+    assert_solvent(&h);
+
+    // 2. buy: one bettor each side.
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    fund(&h, &alice, 5_000);
+    fund(&h, &bob, 5_000);
+    let alice_yes = client.buy(&alice, &Prediction::Yes, &2_000, &0);
+    assert_solvent(&h);
+    let bob_no = client.buy(&bob, &Prediction::No, &1_000, &0);
+    assert_solvent(&h);
+    assert_eq!(client.get_position(&alice), (alice_yes, 0));
+    assert_eq!(client.get_position(&bob), (0, bob_no));
+    let pre_checkpoint = client.get_market();
+    assert_eq!(pre_checkpoint.total_supply, 10_000 + 2_000 + 1_000);
+
+    // 3. checkpoint, some time later: a fresh, mutually agreeing price
+    // from all three oracles. Records the price and changes nothing else.
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 3_600);
+    let now = h.env.ledger().timestamp();
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
+    client.record_price_checkpoint(&Bytes::from_slice(&h.env, &payload));
+    let post_checkpoint = client.get_market();
+    assert_eq!((post_checkpoint.last_price_cents, post_checkpoint.last_price_at), (1_000_000, now));
+    assert_eq!(
+        (post_checkpoint.pool_yes, post_checkpoint.pool_no, post_checkpoint.total_supply),
+        (pre_checkpoint.pool_yes, pre_checkpoint.pool_no, pre_checkpoint.total_supply),
+        "a checkpoint has zero economic effect"
+    );
+    assert_eq!(client.get_position(&alice), (alice_yes, 0));
+    assert_eq!(client.get_position(&bob), (0, bob_no));
+    assert_solvent(&h);
+
+    // 4. terminate: pools swept to the treasury; supply and collateral untouched.
+    client.terminate(&h.admin);
+    let terminated = client.get_market();
+    assert_eq!(terminated.status, PerpetualStatus::Terminated);
+    assert_eq!((terminated.pool_yes, terminated.pool_no), (0, 0));
+    assert_eq!(terminated.total_supply, pre_checkpoint.total_supply);
+    assert_eq!(client.get_position(&h.treasury), (pre_checkpoint.pool_yes, pre_checkpoint.pool_no));
+    assert_solvent(&h);
+
+    // 5. redeem every holder, solvency after each one.
+    let mut paid = 0i128;
+    for holder in [&alice, &bob, &h.treasury] {
+        let (by, bn) = client.get_position(holder);
+        let before = token(&h).balance(holder);
+        let payout = client.redeem(holder);
+        assert_eq!(payout, (by + bn) / 2);
+        assert_eq!(token(&h).balance(holder) - before, payout);
+        assert_eq!(client.get_position(holder), (0, 0));
+        paid += payout;
+        assert_solvent(&h);
+    }
+
+    // Each side's shares sum to total_supply, so the three payouts add up to
+    // total_supply less per-holder floor-division dust (< 1 unit each).
+    let residual = client.get_market().total_supply;
+    assert_eq!(paid + residual, terminated.total_supply);
+    assert!((0..3).contains(&residual), "only rounding dust may remain, got {residual}");
+    assert_eq!(token(&h).balance(&h.market_id), residual);
+
+    // Nothing left for anyone to claim twice.
+    assert_eq!(client.try_redeem(&alice), Err(Ok(Error::NothingToRedeem)));
+}

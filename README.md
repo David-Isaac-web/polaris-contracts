@@ -648,6 +648,13 @@ just `sell()` at the current AMM-implied price, any time.
   YES+NO pair is worth 0.5 collateral each, the only per-holder formula
   guaranteed solvent regardless of trading history.
 
+The whole path — `initialize` (with Lazer + Reflector + RedStone
+configured) → `buy` on both sides → `record_price_checkpoint` → `terminate`
+→ `redeem` for every holder, treasury included — is also exercised as one
+chained test with the solvency invariant asserted after every step
+(`full_lifecycle_initialize_buy_checkpoint_terminate_redeem_stays_solvent_throughout`,
+[#54](https://github.com/PolarisQ-xyz/polaris-contracts/issues/54)).
+
 ## Engineering notes: soroban-sdk gotchas
 
 <details>
@@ -696,7 +703,7 @@ live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 130 across the whole workspace)
+# unit tests (native target; 131 across the whole workspace)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -713,13 +720,13 @@ shasum -a 256 target/wasm32v1-none/release/*.wasm
 | Crate | Unit tests |
 |---|---|
 | `polaris-market` | 61 |
-| `polaris-perpetual` | 29 |
+| `polaris-perpetual` | 30 |
 | `polaris-smart-wallet` | 11 |
 | `polaris-smart-wallet-factory` | 9 |
 | `polaris-vault` | 16 |
 | `polaris-mock-redstone` | 3 |
 | `polaris-mock-lazer` | 1 |
-| **Total** | **130** |
+| **Total** | **131** |
 
 Current build (regenerate after any contract change — `polaris-oracle`'s
 `MARKET_WASM_HASH`/`PERPETUAL_WASM_HASH` must track whatever hash is
