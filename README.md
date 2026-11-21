@@ -236,6 +236,19 @@ state.
 `pause_requires_admin_auth`, `redeem_still_works_while_paused`, in both
 `contracts/market/src/test.rs` and `contracts/perpetual/src/test.rs`.)
 
+The vault has its own, separate switch: `pause_deposits(admin)` /
+`unpause_deposits(admin)` halt `deposit` only, for a migration or
+admin-rotation window when new capital shouldn't land in an instance about
+to be retired. `withdraw`, `redeem_from_market`, and admin rotation keep
+working, so the admin can still move funds out while deposits are halted.
+The flag is stored under its own key (a missing key reads as "not paused",
+so existing instances need no migration), and it survives an admin rotation:
+only the *current* admin can lift it.
+([#41](https://github.com/PolarisQ-xyz/polaris-contracts/issues/41), tests:
+`pause_deposits_blocks_deposit_but_not_withdraw`,
+`pause_and_unpause_deposits_require_the_admin`,
+`deposit_pause_survives_admin_rotation_and_only_the_new_admin_can_lift_it`.)
+
 ## Instance-storage TTL
 
 `market` and `perpetual` have always called `extend_ttl` on every write —
@@ -317,6 +330,7 @@ protocol math. Topics are unchanged throughout. Data is a positional tuple
 | both | `paused` / `unpaused` | `()` |
 | vault | `init` | `(admin, collateral)` (new; `initialize` used to emit nothing) |
 | vault | `deposit, from` | `(amount, total_deposited)` |
+| vault | `dpaused` / `dunpaused` | `()` |
 | vault | `withdraw, to` / `mkt_rdm, market` / `propose` / `newadmin` | unchanged |
 
 `fee_bps` is the rate actually charged on that trade (the pre-trade value
@@ -470,6 +484,8 @@ independently collateralized as it already was.
   draws on), or an LP redemption.
 - `redeem_from_market(admin, market_id)` — collects the vault's own payout
   from a settled/cancelled market it was `treasury` for.
+- `pause_deposits(admin)` / `unpause_deposits(admin)` — halt new deposits
+  only, e.g. during a migration window; see [Emergency pause](#emergency-pause).
 
 **v1 is deliberately simple, stated up front**: single-admin-owned capital,
 not fractional LP shares. Multiple depositors can `deposit`, but there's no
@@ -680,7 +696,7 @@ live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 126 across the whole workspace)
+# unit tests (native target; 130 across the whole workspace)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -700,10 +716,10 @@ shasum -a 256 target/wasm32v1-none/release/*.wasm
 | `polaris-perpetual` | 29 |
 | `polaris-smart-wallet` | 11 |
 | `polaris-smart-wallet-factory` | 9 |
-| `polaris-vault` | 12 |
+| `polaris-vault` | 16 |
 | `polaris-mock-redstone` | 3 |
 | `polaris-mock-lazer` | 1 |
-| **Total** | **126** |
+| **Total** | **130** |
 
 Current build (regenerate after any contract change — `polaris-oracle`'s
 `MARKET_WASM_HASH`/`PERPETUAL_WASM_HASH` must track whatever hash is

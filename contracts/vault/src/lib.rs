@@ -77,6 +77,10 @@ const STORAGE_KEY_TOTAL_DEPOSITED: Symbol = symbol_short!("deposit");
 /// absent the rest of the time. See `propose_admin`'s doc comment for why
 /// this is two steps, not a single `set_admin`.
 const STORAGE_KEY_PENDING_ADMIN: Symbol = symbol_short!("pending");
+/// `true` while `deposit` is paused (#41). A missing key means "not
+/// paused", so instances deployed before this key existed read as
+/// unpaused with no migration.
+const STORAGE_KEY_DEPOSITS_PAUSED: Symbol = symbol_short!("dep_pause");
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -89,6 +93,9 @@ pub enum Error {
     /// `accept_admin` called with no `propose_admin` ever having been
     /// called (or one already consumed by a prior `accept_admin`).
     NoPendingAdmin = 5,
+    /// `deposit` called while the admin has paused deposits — see
+    /// `pause_deposits`.
+    DepositsPaused = 6,
 }
 
 #[contract]
@@ -119,12 +126,16 @@ impl Vault {
     /// track per-depositor shares, so depositing is currently a one-way,
     /// admin-trusted contribution, not a redeemable LP position. Stated
     /// plainly in the module doc; not hidden in the implementation.
+    /// Rejected with `DepositsPaused` while `pause_deposits` is in effect.
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), Error> {
         from.require_auth();
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
         let collateral = Self::require_collateral(&env)?;
+        if Self::is_deposits_paused(env.clone()) {
+            return Err(Error::DepositsPaused);
+        }
         token::Client::new(&env, &collateral).transfer(&from, &env.current_contract_address(), &amount);
 
         let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_DEPOSITED).unwrap_or(0);
@@ -152,6 +163,35 @@ impl Vault {
         touch(&env);
         env.events().publish((symbol_short!("withdraw"), to), amount);
         Ok(())
+    }
+
+    /// Admin-gated pause for `deposit` only (#41) — e.g. during a migration
+    /// or an admin-rotation window, when new capital shouldn't land in an
+    /// instance that's about to be retired. Deliberately independent of
+    /// `polaris-market`/`polaris-perpetual`'s `pause()` (#8), which gates
+    /// trading on those contracts, not capital flowing into this one.
+    /// `withdraw`, `redeem_from_market`, and admin rotation are never
+    /// blocked by this, so the admin can still move funds out while
+    /// deposits are halted. Idempotent: pausing an already-paused vault is a
+    /// no-op that still emits the event.
+    pub fn pause_deposits(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_DEPOSITS_PAUSED, &true);
+        touch(&env);
+        env.events().publish((symbol_short!("dpaused"),), ());
+        Ok(())
+    }
+
+    pub fn unpause_deposits(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_DEPOSITS_PAUSED, &false);
+        touch(&env);
+        env.events().publish((symbol_short!("dunpaused"),), ());
+        Ok(())
+    }
+
+    pub fn is_deposits_paused(env: Env) -> bool {
+        env.storage().instance().get(&STORAGE_KEY_DEPOSITS_PAUSED).unwrap_or(false)
     }
 
     /// Collects this vault's own payout from a settled/cancelled market it

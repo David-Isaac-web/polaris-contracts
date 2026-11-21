@@ -334,6 +334,84 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
     assert_eq!(vault_client.get_balance(), 10_000);
 }
 
+// ---------- deposit pause (#41) ----------
+
+#[test]
+fn pause_deposits_blocks_deposit_but_not_withdraw() {
+    let h = setup();
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 5_000);
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    client.deposit(&lp, &1_000);
+    assert!(!client.is_deposits_paused());
+
+    client.pause_deposits(&h.admin);
+    assert!(client.is_deposits_paused());
+    assert_eq!(client.try_deposit(&lp, &500), Err(Ok(Error::DepositsPaused)));
+    // Rejected means rejected: no collateral moved, no accounting changed.
+    assert_eq!(client.get_balance(), 1_000);
+    assert_eq!(client.get_total_deposited(), 1_000);
+    assert_eq!(token::Client::new(&h.env, &h.token_id).balance(&lp), 4_000);
+
+    // The admin can still move funds out during the pause; that's the point.
+    let recipient = Address::generate(&h.env);
+    client.withdraw(&h.admin, &recipient, &600);
+    assert_eq!(client.get_balance(), 400);
+
+    client.unpause_deposits(&h.admin);
+    assert!(!client.is_deposits_paused());
+    client.deposit(&lp, &500);
+    assert_eq!(client.get_balance(), 900);
+    assert_eq!(client.get_total_deposited(), 1_500);
+}
+
+#[test]
+fn pause_and_unpause_deposits_require_the_admin() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let not_admin = Address::generate(&h.env);
+
+    assert_eq!(client.try_pause_deposits(&not_admin), Err(Ok(Error::Unauthorized)));
+    assert!(!client.is_deposits_paused());
+
+    client.pause_deposits(&h.admin);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+
+    assert_eq!(client.try_unpause_deposits(&not_admin), Err(Ok(Error::Unauthorized)));
+    assert!(client.is_deposits_paused());
+}
+
+#[test]
+fn deposit_pause_survives_admin_rotation_and_only_the_new_admin_can_lift_it() {
+    // The motivating scenario: halt deposits, rotate admin, then the new
+    // admin decides when to reopen. The flag isn't tied to whoever set it.
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let new_admin = Address::generate(&h.env);
+
+    client.pause_deposits(&h.admin);
+    client.propose_admin(&h.admin, &new_admin);
+    client.accept_admin(&new_admin);
+    assert!(client.is_deposits_paused());
+
+    assert_eq!(client.try_unpause_deposits(&h.admin), Err(Ok(Error::Unauthorized)));
+    client.unpause_deposits(&new_admin);
+    assert!(!client.is_deposits_paused());
+}
+
+#[test]
+fn deposit_paused_check_does_not_mask_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let vault_id = env.register(Vault, ());
+    let client = VaultClient::new(&env, &vault_id);
+    let who = Address::generate(&env);
+    assert_eq!(client.try_deposit(&who, &100), Err(Ok(Error::NotInitialized)));
+    assert_eq!(client.try_pause_deposits(&who), Err(Ok(Error::NotInitialized)));
+}
+
 // ---------- event schema (#39) ----------
 
 #[test]
