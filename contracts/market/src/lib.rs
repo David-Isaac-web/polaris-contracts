@@ -146,6 +146,10 @@ pub enum Error {
     /// by this, only the AMM-math-dependent entrypoints a pause exists to
     /// protect against.
     Paused = 35,
+    /// `set_fee_curve` was asked to raise `base_fee_bps` or `min_fee_bps`
+    /// above its current value — the curve can only ever be lowered on a
+    /// live market. See `set_fee_curve`'s doc comment for why.
+    FeeIncreaseNotAllowed = 36,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -484,6 +488,48 @@ impl PolarisMarket {
 
     pub fn is_paused(env: Env) -> bool {
         is_paused(&env)
+    }
+
+    /// Admin-gated fee-curve adjustment for a live market (#42) —
+    /// **decrease-only**. Neither `base_fee_bps` nor `min_fee_bps` may rise
+    /// above its current value; either or both may fall, as long as
+    /// `min_fee_bps <= base_fee_bps` still holds.
+    ///
+    /// Why decrease-only rather than freely adjustable: an admin who can
+    /// raise fees on an already-live market could add a house edge after
+    /// people have bought in, which contradicts the "trustless, no house
+    /// edge" framing. Lowering both bounds is safe for traders because
+    /// `effective_fee_bps = floor(base * r + min * (1 - r))` with
+    /// `r = initial_liquidity / total_supply` in `(0, 1]` is non-decreasing
+    /// in both `base` and `min`. Every future trade, at every
+    /// `total_supply`, is charged at most what the old curve would have
+    /// charged. Past trades are already settled and unaffected. The cost of
+    /// a reduction falls only on the treasury, since fees stay in the pool
+    /// that is swept to it at settlement.
+    ///
+    /// Emits `fee_set` with both the old and new values, so the change is
+    /// visible on-chain rather than reconstructed from a `get_fee()` diff.
+    pub fn set_fee_curve(env: Env, base_fee_bps: u32, min_fee_bps: u32) -> Result<(), Error> {
+        let mut m = load_market(&env)?;
+        m.admin.require_auth();
+        if m.status != MarketStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        if min_fee_bps > base_fee_bps {
+            return Err(Error::InvalidFeeBps);
+        }
+        if base_fee_bps > m.base_fee_bps || min_fee_bps > m.min_fee_bps {
+            return Err(Error::FeeIncreaseNotAllowed);
+        }
+        let (old_base, old_min) = (m.base_fee_bps, m.min_fee_bps);
+        m.base_fee_bps = base_fee_bps;
+        m.min_fee_bps = min_fee_bps;
+        save_market(&env, &m);
+        env.events().publish(
+            (symbol_short!("fee_set"),),
+            (old_base, old_min, base_fee_bps, min_fee_bps),
+        );
+        Ok(())
     }
 
     /// Lock `amount` collateral, mint `amount` YES + `amount` NO to `user`.

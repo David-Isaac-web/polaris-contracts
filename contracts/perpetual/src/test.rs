@@ -647,3 +647,33 @@ fn trade_terminate_and_redeem_events_carry_post_call_state() {
     );
     assert_solvent(&h);
 }
+
+// ---------- set_fee_curve (#42): decrease-only ----------
+
+#[test]
+fn set_fee_curve_lowers_fee_and_rejects_any_increase() {
+    let h = setup(10_000, true); // base=100, min=20
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+
+    assert_eq!(client.try_set_fee_curve(&101, &20), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    assert_eq!(client.try_set_fee_curve(&100, &21), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    assert_eq!(client.try_set_fee_curve(&10, &15), Err(Ok(Error::InvalidFeeBps)));
+    assert_eq!(client.get_fee(), 100);
+
+    client.set_fee_curve(&40, &5);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("fee_set"));
+    assert_eq!(decode::<(u32, u32, u32, u32)>(&h, &data), (100, 20, 40, 5));
+    assert_eq!(client.get_fee(), 40);
+}
+
+#[test]
+fn set_fee_curve_rejected_once_terminated() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    client.terminate(&h.admin);
+    assert_eq!(client.try_set_fee_curve(&50, &10), Err(Ok(Error::MarketNotOpen)));
+}

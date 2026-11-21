@@ -143,6 +143,10 @@ pub enum Error {
     /// `pause()`'s doc comment, identical rationale to `polaris-market`'s
     /// `Error::Paused`.
     Paused = 31,
+    /// `set_fee_curve` was asked to raise `base_fee_bps` or `min_fee_bps` —
+    /// decrease-only, identical rule to `polaris-market`'s
+    /// `Error::FeeIncreaseNotAllowed`.
+    FeeIncreaseNotAllowed = 32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,6 +437,32 @@ impl PolarisPerpetual {
 
     pub fn is_paused(env: Env) -> bool {
         is_paused(&env)
+    }
+
+    /// Admin-gated, **decrease-only** fee-curve adjustment (#42). Same rule
+    /// and reasoning as `polaris-market`'s `set_fee_curve` (see its doc
+    /// comment for why lowering both bounds can never charge any future
+    /// trade more than before). A perpetual needs this more than a dated
+    /// market does: it has no expiry, so "wait for it to resolve" never
+    /// arrives as an alternative.
+    pub fn set_fee_curve(env: Env, base_fee_bps: u32, min_fee_bps: u32) -> Result<(), Error> {
+        let mut m = load_market(&env)?;
+        m.admin.require_auth();
+        if m.status != PerpetualStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        if min_fee_bps > base_fee_bps {
+            return Err(Error::InvalidFeeBps);
+        }
+        if base_fee_bps > m.base_fee_bps || min_fee_bps > m.min_fee_bps {
+            return Err(Error::FeeIncreaseNotAllowed);
+        }
+        let (old_base, old_min) = (m.base_fee_bps, m.min_fee_bps);
+        m.base_fee_bps = base_fee_bps;
+        m.min_fee_bps = min_fee_bps;
+        save_market(&env, &m);
+        env.events().publish((symbol_short!("fee_set"),), (old_base, old_min, base_fee_bps, min_fee_bps));
+        Ok(())
     }
 
     /// Lock `amount` collateral, mint `amount` YES + `amount` NO to `user`.

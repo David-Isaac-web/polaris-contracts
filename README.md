@@ -265,6 +265,25 @@ as `total_supply` grows (more collateral locked via `split`/`buy`), the fee
 compresses toward `min_fee_bps` automatically. Query the current value with
 `get_fee()` rather than recomputing it elsewhere.
 
+**Adjusting a live curve is decrease-only.** `set_fee_curve(base_fee_bps,
+min_fee_bps)` (admin-gated, `market` and `perpetual`, `Open` only) can
+lower either bound, but rejects any increase with `FeeIncreaseNotAllowed`.
+A freely adjustable fee would let an admin add a house edge after people
+had already traded, which contradicts the "no house edge" framing. A
+decrease-only change can't harm traders. With `r = initial_liquidity /
+total_supply` in `(0, 1]`, the curve is `floor(base·r + min·(1−r))`, which
+is non-decreasing in both bounds, so as long as neither bound rises, every
+future trade at every `total_supply` is charged at most what the old curve
+charged. The only cost of a reduction falls on the treasury, because fees
+stay in the pool that is swept to it at settlement. Each change emits
+`fee_set` with the old and new values. This matters more for `perpetual`,
+which has no expiry, so "wait for it to resolve" never comes.
+([#42](https://github.com/PolarisQ-xyz/polaris-contracts/issues/42), tests:
+`set_fee_curve_rejects_any_increase_and_leaves_the_curve_untouched`,
+`a_decrease_only_change_never_charges_more_at_any_total_supply`, which
+brute-forces the monotonicity claim, floor rounding included, against the
+shared curve.)
+
 ## Event schema
 
 Every event was audited against one question: could an indexer render a
@@ -294,6 +313,7 @@ protocol math. Topics are unchanged throughout. Data is a positional tuple
 | perpetual | `term` | `(treasury, swept_yes, swept_no)` |
 | perpetual | `chkpt` | `(price_cents, timestamp)` (unchanged; already complete) |
 | both | `redeem, user` | `(payout, yes_burned, no_burned, total_supply)` |
+| both | `fee_set` | `(old_base_bps, old_min_bps, new_base_bps, new_min_bps)` |
 | both | `paused` / `unpaused` | `()` |
 | vault | `init` | `(admin, collateral)` (new; `initialize` used to emit nothing) |
 | vault | `deposit, from` | `(amount, total_deposited)` |
@@ -660,7 +680,7 @@ live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 119 across the whole workspace)
+# unit tests (native target; 126 across the whole workspace)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -676,14 +696,14 @@ shasum -a 256 target/wasm32v1-none/release/*.wasm
 
 | Crate | Unit tests |
 |---|---|
-| `polaris-market` | 56 |
-| `polaris-perpetual` | 27 |
+| `polaris-market` | 61 |
+| `polaris-perpetual` | 29 |
 | `polaris-smart-wallet` | 11 |
 | `polaris-smart-wallet-factory` | 9 |
 | `polaris-vault` | 12 |
 | `polaris-mock-redstone` | 3 |
 | `polaris-mock-lazer` | 1 |
-| **Total** | **119** |
+| **Total** | **126** |
 
 Current build (regenerate after any contract change — `polaris-oracle`'s
 `MARKET_WASM_HASH`/`PERPETUAL_WASM_HASH` must track whatever hash is

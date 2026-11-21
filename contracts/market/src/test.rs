@@ -1554,3 +1554,96 @@ fn an_event_only_indexer_reconstructs_the_full_market_state_exactly() {
     assert!(s.fees_seen.iter().all(|f| (20..=100).contains(f)));
     assert_solvent(&h);
 }
+
+// ---------- set_fee_curve (#42): decrease-only ----------
+
+#[test]
+fn set_fee_curve_lowers_the_live_fee_and_emits_old_and_new_values() {
+    let h = setup(1_000_000, 10_000); // base=100, min=20
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    assert_eq!(client.get_fee(), 100);
+
+    client.set_fee_curve(&50, &10);
+    let (name, _, data) = last_market_event(&h);
+    assert_eq!(name, symbol_short!("fee_set"));
+    assert_eq!(decode::<(u32, u32, u32, u32)>(&h, &data), (100, 20, 50, 10));
+
+    let m = client.get_market();
+    assert_eq!((m.base_fee_bps, m.min_fee_bps), (50, 10));
+    assert_eq!(client.get_fee(), 50);
+
+    // The lowered curve is what buy actually charges.
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let (_, _, data) = last_market_event(&h);
+    let (_, _, fee_bps, _, _, _): (i128, i128, u32, i128, i128, i128) = decode(&h, &data);
+    assert_eq!(fee_bps, 50);
+    assert_solvent(&h);
+}
+
+#[test]
+fn set_fee_curve_rejects_any_increase_and_leaves_the_curve_untouched() {
+    let h = setup(1_000_000, 10_000); // base=100, min=20
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    assert_eq!(client.try_set_fee_curve(&101, &20), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    assert_eq!(client.try_set_fee_curve(&100, &21), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    // Lowering base while raising min still raises the low-volume end's floor.
+    assert_eq!(client.try_set_fee_curve(&80, &30), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    // Ordering invariant still enforced, same error as initialize.
+    assert_eq!(client.try_set_fee_curve(&10, &15), Err(Ok(Error::InvalidFeeBps)));
+
+    let m = client.get_market();
+    assert_eq!((m.base_fee_bps, m.min_fee_bps), (100, 20));
+
+    // A no-op (equal values) is allowed; lowering to zero fee is allowed.
+    client.set_fee_curve(&100, &20);
+    client.set_fee_curve(&0, &0);
+    assert_eq!(client.get_fee(), 0);
+}
+
+#[test]
+fn set_fee_curve_requires_admin_auth() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.set_fee_curve(&50, &10);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+}
+
+#[test]
+fn set_fee_curve_rejected_once_the_market_is_finalized() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+    assert_eq!(client.try_set_fee_curve(&50, &10), Err(Ok(Error::MarketNotOpen)));
+}
+
+/// The safety claim `set_fee_curve`'s doc comment rests on: if neither bound
+/// rises, the effective fee is never higher at *any* `total_supply`.
+/// Brute-forced over a grid against the shared curve both contracts use,
+/// so floor rounding is checked too, not just the continuous formula.
+#[test]
+fn a_decrease_only_change_never_charges_more_at_any_total_supply() {
+    let liq = 10_000i128;
+    let supplies = [liq, liq + 1, liq + 3, 13_333, 20_000, 99_999, 1_000_000, 123_456_789];
+    for old_base in (0..=1_000u32).step_by(50) {
+        for old_min in (0..=old_base).step_by(25) {
+            for new_base in (0..=old_base).step_by(35) {
+                for new_min in (0..=new_base.min(old_min)).step_by(15) {
+                    for ts in supplies {
+                        let old = polaris_ctf_math::effective_fee_bps(old_base, old_min, liq, ts);
+                        let new = polaris_ctf_math::effective_fee_bps(new_base, new_min, liq, ts);
+                        assert!(
+                            new <= old,
+                            "({old_base},{old_min}) -> ({new_base},{new_min}) at supply {ts}: {old} -> {new}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
