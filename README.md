@@ -194,6 +194,22 @@ this reason: it's the only per-holder formula that's *guaranteed* solvent
 regardless of trading history — without tracking anything beyond the
 balances that already exist.
 
+**Zero trades ever, then cancelled: the seed liquidity is fully
+recoverable, at par, by `treasury` alone.** A market that was only
+`initialize()`d — no `split`/`buy` from anyone — still holds its untouched
+AMM pool of `initial_liquidity` YES + `initial_liquidity` NO. `cancel()`
+credits that whole pool to `treasury` as an ordinary share position (the
+same thing `settle()` does with the pool), so `treasury`'s `redeem()` pays
+`(L + L) / 2 = L` — exactly the seed it put in, with no special case in the
+code. Nobody else holds a share, so nobody else can redeem
+(`NothingToRedeem`), and afterwards the market holds zero collateral and
+`total_supply == 0`. When `treasury` is the vault, the same recovery is one
+`redeem_from_market` call. ([#52](https://github.com/PolarisQ-xyz/polaris-contracts/issues/52),
+tests: `cancel_with_zero_trades_ever_returns_the_full_seed_liquidity_to_treasury`
+in `contracts/market`,
+`redeem_from_market_recovers_the_full_seed_after_a_zero_trade_cancel` in
+`contracts/vault`.)
+
 ## Pool-depth guard
 
 `buy`/`sell` reject a trade outright (`Error::PoolDepthExceeded`) if it
@@ -412,6 +428,16 @@ tests: `propose_then_accept_rotates_admin`,
 `accept_admin_rejects_a_different_address_than_the_one_proposed`,
 `a_bad_proposal_is_harmless_and_can_be_overwritten`.)
 
+**Authority switches at `accept_admin`, not at `propose_admin`.** While a
+rotation is pending, the current admin keeps full authority —
+`withdraw`, `redeem_from_market`, and re-proposing all work exactly as
+before — and the proposed address has none until it accepts. This is
+deliberate: blocking the old admin as soon as a rotation is proposed would
+freeze the vault whenever the proposed key never shows up, the same
+lock-out two-step rotation exists to prevent.
+([#53](https://github.com/PolarisQ-xyz/polaris-contracts/issues/53),
+test: `old_admin_keeps_full_authority_while_a_rotation_is_pending`.)
+
 Verified live on testnet, the full loop: deployed the vault above,
 deposited 20,000,000 stroops, withdrew 10,000,000 of it to seed a real
 market with the vault as `treasury`, settled that market, and called
@@ -592,15 +618,18 @@ be constructed from outside Rust source.
 
 ## Feed ID
 
-`feed_id` is an `initialize` parameter, not hardcoded. For this build it
-defaults to a testnet placeholder (`100`) — production deployment must
-look up Pyth's actual registered Lazer feed ID for XLM/USD before going
-live.
+`feed_id` is a required `initialize` parameter, with no default in the
+contract. Testnet deploys use a placeholder (`100`). That placeholder is
+also `polaris-oracle`'s `XLM_USD_FEED_ID`/`FEED_CATALOG` env default, which
+is why it's a mainnet blocker there (see
+[`docs/mainnet-env-audit.md`](./docs/mainnet-env-audit.md)). Before going
+live, production deployment must look up Pyth's actual registered Lazer
+feed ID for XLM/USD.
 
 ## Building & testing
 
 ```sh
-# unit tests (native target; 100 across the whole workspace)
+# unit tests (native target; 114 across the whole workspace)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -616,14 +645,14 @@ shasum -a 256 target/wasm32v1-none/release/*.wasm
 
 | Crate | Unit tests |
 |---|---|
-| `polaris-market` | 48 |
-| `polaris-perpetual` | 22 |
+| `polaris-market` | 52 |
+| `polaris-perpetual` | 25 |
 | `polaris-smart-wallet` | 11 |
 | `polaris-smart-wallet-factory` | 9 |
-| `polaris-vault` | 6 |
+| `polaris-vault` | 13 |
 | `polaris-mock-redstone` | 3 |
 | `polaris-mock-lazer` | 1 |
-| **Total** | **100** |
+| **Total** | **114** |
 
 Current build (regenerate after any contract change — `polaris-oracle`'s
 `MARKET_WASM_HASH`/`PERPETUAL_WASM_HASH` must track whatever hash is
@@ -643,19 +672,46 @@ actually uploaded):
 
 Needs the [Stellar CLI](https://developers.stellar.org/docs/tools/cli/install-cli).
 
+The contracts themselves have no env-var or code defaults: every
+network-specific value is an explicit `initialize()` argument. Each recipe
+below is complete for **one network only**. Don't mix values between them.
+See [`docs/mainnet-env-audit.md`](./docs/mainnet-env-audit.md) for the
+cross-repo audit of `polaris-oracle`'s and `polaris-frontend`'s env
+defaults, which still need fixing before mainnet
+([#47](https://github.com/PolarisQ-xyz/polaris-contracts/issues/47)).
+
+**Testnet**
+
 ```sh
 stellar contract deploy --wasm target/wasm32v1-none/release/polaris_market.wasm \
   --source deployer --network testnet
 stellar contract invoke --id <CONTRACT_ID> --source deployer --network testnet -- \
   initialize --admin <ADMIN> --collateral <XLM_SAC> --strike_price 1500000 \
-  --expiry <UNIX_TS> --grace_period 3600 --lazer_contract <LAZER_ID> \
+  --expiry <UNIX_TS> --grace_period 3600 --lazer_contract <LAZER_OR_MOCK_LAZER_ID> \
   --feed_id 100 --base_fee_bps 100 --min_fee_bps 20 \
   --treasury <TREASURY> --initial_liquidity 10000000000 \
   --reflector '{"contract":"CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63","asset":{"Other":"XLM"},"max_staleness_secs":600,"tolerance_bps":150}' \
   --redstone null
-# --redstone is optional (Option<OracleFeedConfig>) — omit/null on testnet,
-# where no RedStone contract exists yet. On mainnet, pass e.g.:
-#   --redstone '{"contract":"CBMGLKUQZVSAIL5CPDDAWSUY7MAKXISHMOZEVLMBUWBMFGHRJSR4WYRF","asset":{"Stellar":"<native XLM SAC>"},"max_staleness_secs":600,"tolerance_bps":150}'
+# Testnet only: feed_id 100 is an unverified placeholder, CCYOZ… is
+# Reflector's *testnet* oracle, and no RedStone contract exists on testnet.
+```
+
+**Mainnet.** Every `<…>` must be looked up for mainnet. None of the
+testnet values above carry over:
+
+```sh
+stellar contract deploy --wasm target/wasm32v1-none/release/polaris_market.wasm \
+  --source deployer --network mainnet
+stellar contract invoke --id <CONTRACT_ID> --source deployer --network mainnet -- \
+  initialize --admin <ADMIN> --collateral <MAINNET_NATIVE_XLM_SAC> --strike_price <CENTS> \
+  --expiry <UNIX_TS> --grace_period 3600 --lazer_contract <REAL_PYTH_LAZER_VERIFIER_ID> \
+  --feed_id <PYTH_LAZER_XLM_USD_FEED_ID> --base_fee_bps 100 --min_fee_bps 20 \
+  --treasury <TREASURY_OR_VAULT> --initial_liquidity <STROOPS> \
+  --reflector '{"contract":"<REFLECTOR_MAINNET_ORACLE_ID>","asset":{"Other":"XLM"},"max_staleness_secs":600,"tolerance_bps":150}' \
+  --redstone '{"contract":"CBMGLKUQZVSAIL5CPDDAWSUY7MAKXISHMOZEVLMBUWBMFGHRJSR4WYRF","asset":{"Stellar":"<MAINNET_NATIVE_XLM_SAC>"},"max_staleness_secs":600,"tolerance_bps":150}'
+# Never point lazer_contract at polaris-mock-lazer, or redstone at
+# polaris-mock-redstone, on mainnet. max_staleness_secs is re-validated
+# on-chain against each oracle's own resolution() at initialize().
 ```
 
 In practice, `polaris-oracle`'s `POST /markets/create` and

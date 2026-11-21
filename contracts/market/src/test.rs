@@ -1083,6 +1083,58 @@ fn cancel_after_grace_refunds_a_matched_pair_at_merge_parity() {
 }
 
 #[test]
+fn cancel_with_zero_trades_ever_returns_the_full_seed_liquidity_to_treasury() {
+    // #52: `initialize` only — no split/buy/anything from anyone, ever —
+    // then nobody settles and the market is cancelled after the grace
+    // period. Intended behavior, stated here because it wasn't anywhere
+    // else: the seed liquidity IS fully recoverable, at par, by `treasury`
+    // and only by `treasury`. `cancel` credits treasury the whole AMM pool
+    // (`pool_yes == pool_no == initial_liquidity` YES and NO shares — the
+    // pool is never touched with zero trades), and the cancelled-market
+    // `(by + bn) / 2` formula turns that matched pair back into exactly
+    // `initial_liquidity` collateral. No special-casing: the same path
+    // every other cancelled-market holder goes through.
+    let liquidity = 10_000;
+    let h = setup(1_000_000, liquidity);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let tok = token::Client::new(&h.env, &h.token_id);
+
+    // Sanity: genuinely zero positions minted beyond the seed itself.
+    let m = client.get_market();
+    assert_eq!(m.total_supply, liquidity);
+    assert_eq!(client.get_position(&h.treasury), (0, 0));
+    assert_eq!(tok.balance(&h.market_id), liquidity);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+
+    let m = client.get_market();
+    assert_eq!(m.status, MarketStatus::Cancelled);
+    assert_eq!((m.pool_yes, m.pool_no), (0, 0));
+    // The entire pool moved to treasury as an ordinary share position.
+    assert_eq!(client.get_position(&h.treasury), (liquidity, liquidity));
+    assert_solvent(&h);
+
+    // Nobody else holds anything — a random address can't claim the seed.
+    let stranger = Address::generate(&h.env);
+    assert_eq!(client.try_redeem(&stranger), Err(Ok(Error::NothingToRedeem)));
+
+    let before = tok.balance(&h.treasury);
+    let payout = client.redeem(&h.treasury);
+    assert_eq!(payout, liquidity, "zero trades: treasury gets back exactly the seed, at par");
+    assert_eq!(tok.balance(&h.treasury) - before, liquidity);
+
+    // Fully drained, nothing stranded, and invariant still holds at zero.
+    let m = client.get_market();
+    assert_eq!(m.total_supply, 0);
+    assert_eq!(tok.balance(&h.market_id), 0);
+    assert_solvent(&h);
+
+    // One-shot: the position was zeroed, a second redeem pays nothing.
+    assert_eq!(client.try_redeem(&h.treasury), Err(Ok(Error::NothingToRedeem)));
+}
+
+#[test]
 fn cancel_refunds_directional_bettor_half_value_no_counterparty_needed() {
     // The scenario the original parimutuel design special-cased ("empty
     // winning pool"): a single bettor takes a directional position and the
