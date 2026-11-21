@@ -580,3 +580,70 @@ fn fee_starts_at_base_and_decays_toward_min_as_volume_grows() {
     assert_eq!(client.get_fee(), 60);
     assert_solvent(&h);
 }
+
+// ---------- event schema (#39) ----------
+
+use soroban_sdk::testutils::Events as _;
+use soroban_sdk::{symbol_short, Symbol, TryFromVal, Val};
+
+/// See `polaris-market/src/test.rs`'s `last_market_event` — same helper.
+fn last_event(h: &Harness) -> (Symbol, std::vec::Vec<Val>, Val) {
+    let evs = h.env.events().all().filter_by_contract(&h.market_id);
+    let e = evs.events().last().expect("expected an event from the perpetual contract").clone();
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = e.body;
+    let topics: std::vec::Vec<Val> =
+        body.topics.iter().map(|t| Val::try_from_val(&h.env, t).unwrap()).collect();
+    let name = Symbol::try_from_val(&h.env, &topics[0]).unwrap();
+    let data = Val::try_from_val(&h.env, &body.data).unwrap();
+    (name, topics, data)
+}
+
+fn decode<T: TryFromVal<Env, Val>>(h: &Harness, v: &Val) -> T {
+    T::try_from_val(&h.env, v).unwrap_or_else(|_| panic!("event field did not decode as the documented type"))
+}
+
+#[test]
+fn init_event_carries_fee_curve_and_parties() {
+    let h = setup(10_000, true);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("init"));
+    let decoded: (i128, u32, u32, Address, Address, Address) = decode(&h, &data);
+    assert_eq!(decoded, (10_000, 100, 20, h.admin.clone(), h.treasury.clone(), h.token_id.clone()));
+}
+
+#[test]
+fn trade_terminate_and_redeem_events_carry_post_call_state() {
+    let h = setup(10_000, true);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+
+    client.split(&user, &500);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("split"));
+    assert_eq!(decode::<(i128, i128)>(&h, &data), (500, client.get_market().total_supply));
+
+    let fee = client.get_fee();
+    let total = client.buy(&user, &Prediction::No, &1_000, &0);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("buy"));
+    let (c, bonus, fee_bps, py, pn, ts): (i128, i128, u32, i128, i128, i128) = decode(&h, &data);
+    let m = client.get_market();
+    assert_eq!((c + bonus, fee_bps), (total, fee));
+    assert_eq!((py, pn, ts), (m.pool_yes, m.pool_no, m.total_supply));
+
+    client.terminate(&h.admin);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("term"));
+    assert_eq!(decode::<(Address, i128, i128)>(&h, &data), (h.treasury.clone(), m.pool_yes, m.pool_no));
+
+    let (by, bn) = client.get_position(&user);
+    let payout = client.redeem(&user);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("redeem"));
+    assert_eq!(
+        decode::<(i128, i128, i128, i128)>(&h, &data),
+        (payout, by, bn, client.get_market().total_supply)
+    );
+    assert_solvent(&h);
+}

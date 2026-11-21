@@ -110,6 +110,7 @@ impl Vault {
         env.storage().instance().set(&STORAGE_KEY_COLLATERAL, &collateral);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &0i128);
         touch(&env);
+        env.events().publish((symbol_short!("init"),), (admin, collateral));
         Ok(())
     }
 
@@ -127,9 +128,10 @@ impl Vault {
         token::Client::new(&env, &collateral).transfer(&from, &env.current_contract_address(), &amount);
 
         let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_DEPOSITED).unwrap_or(0);
-        env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &(total + amount));
+        let new_total = total + amount;
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &new_total);
         touch(&env);
-        env.events().publish((symbol_short!("deposit"), from), amount);
+        env.events().publish((symbol_short!("deposit"), from), (amount, new_total));
         Ok(())
     }
 

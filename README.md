@@ -44,6 +44,7 @@ app is at
 - [Pool-depth guard](#pool-depth-guard)
 - [Errors, not panics](#errors-not-panics)
 - [Cost-driven fee curve](#cost-driven-fee-curve)
+- [Event schema](#event-schema)
 - [Passkey smart wallets](#passkey-smart-wallets)
 - [The capital-efficiency vault](#the-capital-efficiency-vault)
 - [On-chain second-oracle: Reflector Network](#on-chain-second-oracle-reflector-network)
@@ -263,6 +264,65 @@ initial_liquidity / total_supply`. A fresh market charges `base_fee_bps`;
 as `total_supply` grows (more collateral locked via `split`/`buy`), the fee
 compresses toward `min_fee_bps` automatically. Query the current value with
 `get_fee()` rather than recomputing it elsewhere.
+
+## Event schema
+
+Every event was audited against one question: could an indexer render a
+correct trade-history page from events alone, with **zero** extra
+`get_market()` reads? Before #39 the answer was no. `buy`/`sell` didn't say
+what fee was charged or where the pools ended up, so a price chart needed
+polling. `settle`/`cancel`/`terminate` silently credited the treasury with
+the swept pool shares, and no event showed it. `redeem` zeroed both share
+balances but reported only the payout.
+
+The rule now: **every event that changes contract state carries the
+post-call value of each field it changed**, plus anything (like the fee rate
+actually charged) that a consumer would otherwise have to recompute with
+protocol math. Topics are unchanged throughout. Data is a positional tuple
+(`ScVec`).
+
+| Contract | Topics | Data |
+|---|---|---|
+| market | `init` | `(strike_price, expiry, grace_period, feed_id, base_fee_bps, min_fee_bps, initial_liquidity, admin, treasury, collateral)` |
+| perpetual | `init` | `(initial_liquidity, base_fee_bps, min_fee_bps, admin, treasury, collateral)` |
+| both | `split, user` / `merge, user` | `(amount, total_supply)` |
+| both | `buy, user, prediction` | `(collateral_in, bonus_shares, fee_bps, pool_yes, pool_no, total_supply)` — shares received = `collateral_in + bonus_shares` |
+| both | `sell, user, prediction` | `(shares_in, collateral_out, fee_bps, pool_yes, pool_no, total_supply)` |
+| both | `xfer, from, to, prediction` | `amount` (unchanged; no contract state besides the two balances) |
+| market | `settle` | `(status, final_price_cents, source, treasury, swept_yes, swept_no)` — `source` is `lazer` or `reflector` |
+| market | `cancel` | `(treasury, swept_yes, swept_no)` |
+| perpetual | `term` | `(treasury, swept_yes, swept_no)` |
+| perpetual | `chkpt` | `(price_cents, timestamp)` (unchanged; already complete) |
+| both | `redeem, user` | `(payout, yes_burned, no_burned, total_supply)` |
+| both | `paused` / `unpaused` | `()` |
+| vault | `init` | `(admin, collateral)` (new; `initialize` used to emit nothing) |
+| vault | `deposit, from` | `(amount, total_deposited)` |
+| vault | `withdraw, to` / `mkt_rdm, market` / `propose` / `newadmin` | unchanged |
+
+`fee_bps` is the rate actually charged on that trade (the pre-trade value
+of `get_fee()`). `pool_yes`/`pool_no`/`total_supply` are absolute
+post-trade values, so the implied price after any trade is
+`pool_no / (pool_yes + pool_no)` and an indexer can resync pool state from
+any single trade event. Per-holder share balances are still
+**delta-encoded** (each event says how a balance moved, not where it
+ended), so they need a replay from `init`. Stellar RPC only serves events
+for a bounded retention window, so an indexer that falls further behind
+than that window has to bootstrap positions with `get_position()` reads.
+
+**Compatibility.** Where the old payload was already a tuple (`buy`, `sell`,
+market `init`, `settle`), the original fields keep their positions and the
+new ones are appended. A positional decoder that only reads the leading
+fields keeps working. Events whose data used to be a bare scalar or `()`
+(`split`, `merge`, `redeem`, perpetual `init`, `cancel`, `term`, vault
+`deposit`) are now tuples, which is a breaking change for any consumer that
+decoded them as a bare `i128`. No indexer exists yet; this change should
+land before `polaris-oracle`'s trade-history indexer work begins, not after.
+([#39](https://github.com/PolarisQ-xyz/polaris-contracts/issues/39), tests:
+`an_event_only_indexer_reconstructs_the_full_market_state_exactly`, which
+folds only emitted events into a shadow ledger across a mixed
+buy/sell/split/merge/transfer/settle/redeem flow and asserts it matches
+`get_market()` and every holder's `get_position()` exactly, plus
+per-event payload tests in all three contracts.)
 
 ## Passkey smart wallets
 
@@ -600,7 +660,7 @@ live.
 ## Building & testing
 
 ```sh
-# unit tests (native target; 100 across the whole workspace)
+# unit tests (native target; 119 across the whole workspace)
 cargo test --workspace
 
 # release WASM (requires `rustup target add wasm32v1-none`)
@@ -616,14 +676,14 @@ shasum -a 256 target/wasm32v1-none/release/*.wasm
 
 | Crate | Unit tests |
 |---|---|
-| `polaris-market` | 48 |
-| `polaris-perpetual` | 22 |
+| `polaris-market` | 56 |
+| `polaris-perpetual` | 27 |
 | `polaris-smart-wallet` | 11 |
 | `polaris-smart-wallet-factory` | 9 |
-| `polaris-vault` | 6 |
+| `polaris-vault` | 12 |
 | `polaris-mock-redstone` | 3 |
 | `polaris-mock-lazer` | 1 |
-| **Total** | **100** |
+| **Total** | **119** |
 
 Current build (regenerate after any contract change — `polaris-oracle`'s
 `MARKET_WASM_HASH`/`PERPETUAL_WASM_HASH` must track whatever hash is

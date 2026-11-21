@@ -333,3 +333,28 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
     assert_eq!(payout, 10_000, "the vault gets back exactly the seed liquidity it funded, at par, no trading occurred");
     assert_eq!(vault_client.get_balance(), 10_000);
 }
+
+// ---------- event schema (#39) ----------
+
+#[test]
+fn deposit_event_carries_the_running_total() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{IntoVal, Val};
+
+    let h = setup();
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 5_000);
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    client.deposit(&lp, &1_000);
+    client.deposit(&lp, &250);
+
+    let expected: soroban_sdk::Vec<(Address, soroban_sdk::Vec<Val>, Val)> = soroban_sdk::vec![
+        &h.env,
+        (
+            h.vault_id.clone(),
+            (symbol_short!("deposit"), lp.clone()).into_val(&h.env),
+            (250i128, 1_250i128).into_val(&h.env),
+        ),
+    ];
+    assert_eq!(h.env.events().all().filter_by_contract(&h.vault_id), expected);
+}

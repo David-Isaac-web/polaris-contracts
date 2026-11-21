@@ -51,6 +51,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env,
+    Symbol,
 };
 
 use pyth_lazer_stellar_sdk::PythLazerClient;
@@ -431,9 +432,24 @@ impl PolarisMarket {
             initial_liquidity,
         };
         save_market(&env, &market);
+        // Every immutable parameter an indexer needs to interpret this
+        // market's later events, so it never has to call `get_market()` to
+        // bootstrap. Pools and `total_supply` all start at
+        // `initial_liquidity`. See the README's "Event schema" section.
         env.events().publish(
             (symbol_short!("init"),),
-            (market.strike_price, market.expiry),
+            (
+                market.strike_price,
+                market.expiry,
+                market.grace_period,
+                market.feed_id,
+                market.base_fee_bps,
+                market.min_fee_bps,
+                market.initial_liquidity,
+                market.admin,
+                market.treasury,
+                market.collateral,
+            ),
         );
         Ok(())
     }
@@ -491,7 +507,7 @@ impl PolarisMarket {
         m.total_supply += amount;
         save_market(&env, &m);
         env.events()
-            .publish((symbol_short!("split"), user), amount);
+            .publish((symbol_short!("split"), user), (amount, m.total_supply));
         Ok(())
     }
 
@@ -516,7 +532,7 @@ impl PolarisMarket {
         m.total_supply -= amount;
         save_market(&env, &m);
         env.events()
-            .publish((symbol_short!("merge"), user), amount);
+            .publish((symbol_short!("merge"), user), (amount, m.total_supply));
         Ok(())
     }
 
@@ -547,7 +563,8 @@ impl PolarisMarket {
 
         let unwanted = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, unwanted);
-        let effective_in = apply_fee(collateral_amount, effective_fee_bps(&m));
+        let fee_bps = effective_fee_bps(&m);
+        let effective_in = apply_fee(collateral_amount, fee_bps);
         let amount_out = cpmm_out(reserve_in, reserve_out, effective_in);
         // Cap single-trade impact to half the reserve being drawn from. Not
         // just a slippage nicety: cpmm_out's integer floor division lets a
@@ -578,9 +595,12 @@ impl PolarisMarket {
         credit(&env, prediction, &user, amount_out);
 
         save_market(&env, &m);
+        // Leading two fields unchanged, so older positional decoders still
+        // work. The appended fee rate and post-trade pools/supply let an
+        // indexer show the fee and price without reading `get_market()`.
         env.events().publish(
             (symbol_short!("buy"), user, prediction),
-            (collateral_amount, amount_out),
+            (collateral_amount, amount_out, fee_bps, m.pool_yes, m.pool_no, m.total_supply),
         );
         Ok(collateral_amount + amount_out)
     }
@@ -615,7 +635,8 @@ impl PolarisMarket {
 
         let opposite = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, prediction);
-        let effective_in = apply_fee(shares_in, effective_fee_bps(&m));
+        let fee_bps = effective_fee_bps(&m);
+        let effective_in = apply_fee(shares_in, fee_bps);
         let collateral_out = cpmm_sell_out(reserve_in, reserve_out, effective_in);
         // Same reserve-depth cap as `buy`, against the same reserve
         // (`reserve_out`, the opposite side's pool — the one this trade only
@@ -642,7 +663,7 @@ impl PolarisMarket {
         save_market(&env, &m);
         env.events().publish(
             (symbol_short!("sell"), user, prediction),
-            (shares_in, collateral_out),
+            (shares_in, collateral_out, fee_bps, m.pool_yes, m.pool_no, m.total_supply),
         );
         Ok(collateral_out)
     }
@@ -724,7 +745,7 @@ impl PolarisMarket {
                 .map_err(Self::map_redstone_error)?;
         }
 
-        Self::finalize_settlement(&env, &mut m, final_cents);
+        Self::finalize_settlement(&env, &mut m, final_cents, symbol_short!("lazer"));
         Ok(())
     }
 
@@ -786,7 +807,7 @@ impl PolarisMarket {
                 .map_err(Self::map_redstone_error)?;
         }
 
-        Self::finalize_settlement(&env, &mut m, final_cents);
+        Self::finalize_settlement(&env, &mut m, final_cents, symbol_short!("reflector"));
         Ok(())
     }
 
@@ -807,7 +828,9 @@ impl PolarisMarket {
     /// Shared tail of both settlement paths (`settle`/`settle_via_reflector`)
     /// — once a final price has cleared every configured oracle check,
     /// finalizing is identical regardless of which path produced it.
-    fn finalize_settlement(env: &Env, m: &mut Market, final_cents: i128) {
+    /// `source` (`lazer` or `reflector`) is recorded in the `settle` event
+    /// only — it never affects payout.
+    fn finalize_settlement(env: &Env, m: &mut Market, final_cents: i128, source: Symbol) {
         m.final_price = final_cents;
         m.status = if final_cents >= m.strike_price {
             MarketStatus::ResolvedYes
@@ -815,14 +838,20 @@ impl PolarisMarket {
             MarketStatus::ResolvedNo
         };
 
-        credit(env, Prediction::Yes, &m.treasury, m.pool_yes);
-        credit(env, Prediction::No, &m.treasury, m.pool_no);
+        let (swept_yes, swept_no) = (m.pool_yes, m.pool_no);
+        credit(env, Prediction::Yes, &m.treasury, swept_yes);
+        credit(env, Prediction::No, &m.treasury, swept_no);
         m.pool_yes = 0;
         m.pool_no = 0;
 
         save_market(env, m);
-        env.events()
-            .publish((symbol_short!("settle"),), (m.status, final_cents));
+        // The pool sweep credits `treasury` with shares that no `xfer` event
+        // would otherwise show; the amounts are here so an indexer's
+        // per-holder balances stay correct.
+        env.events().publish(
+            (symbol_short!("settle"),),
+            (m.status, final_cents, source, m.treasury.clone(), swept_yes, swept_no),
+        );
     }
 
     /// Permissionless liveness backstop: if nobody ever settles, anyone can
@@ -837,14 +866,16 @@ impl PolarisMarket {
             return Err(Error::GracePeriodNotElapsed);
         }
 
-        credit(&env, Prediction::Yes, &m.treasury, m.pool_yes);
-        credit(&env, Prediction::No, &m.treasury, m.pool_no);
+        let (swept_yes, swept_no) = (m.pool_yes, m.pool_no);
+        credit(&env, Prediction::Yes, &m.treasury, swept_yes);
+        credit(&env, Prediction::No, &m.treasury, swept_no);
         m.pool_yes = 0;
         m.pool_no = 0;
         m.status = MarketStatus::Cancelled;
 
         save_market(&env, &m);
-        env.events().publish((symbol_short!("cancel"),), ());
+        env.events()
+            .publish((symbol_short!("cancel"),), (m.treasury.clone(), swept_yes, swept_no));
         Ok(())
     }
 
@@ -853,19 +884,23 @@ impl PolarisMarket {
         user.require_auth();
         let mut m = load_market(&env)?;
 
+        // Every finalized branch below zeroes both balances, so record what
+        // is being burned first. The `redeem` event carries both, which lets an
+        // indexer show exactly which shares were redeemed.
+        let by = balance_of(&env, Prediction::Yes, &user);
+        let bn = balance_of(&env, Prediction::No, &user);
+
         let payout = match m.status {
             MarketStatus::Open => return Err(Error::NotFinalized),
             MarketStatus::ResolvedYes => {
-                let b = balance_of(&env, Prediction::Yes, &user);
                 set_balance(&env, Prediction::Yes, &user, 0);
                 set_balance(&env, Prediction::No, &user, 0);
-                b
+                by
             }
             MarketStatus::ResolvedNo => {
-                let b = balance_of(&env, Prediction::No, &user);
                 set_balance(&env, Prediction::Yes, &user, 0);
                 set_balance(&env, Prediction::No, &user, 0);
-                b
+                bn
             }
             MarketStatus::Cancelled => {
                 // NOT `by + bn`: `sum(all YES balances) == total_supply` and
@@ -885,8 +920,6 @@ impl PolarisMarket {
                 // history — a directional bettor's AMM-subsidized bonus
                 // shares are worth less than face value once nobody's
                 // collateral is "eligible" to originate from resolution.
-                let by = balance_of(&env, Prediction::Yes, &user);
-                let bn = balance_of(&env, Prediction::No, &user);
                 set_balance(&env, Prediction::Yes, &user, 0);
                 set_balance(&env, Prediction::No, &user, 0);
                 (by + bn) / 2
@@ -905,7 +938,7 @@ impl PolarisMarket {
         m.total_supply -= payout;
         save_market(&env, &m);
         env.events()
-            .publish((symbol_short!("redeem"), user), payout);
+            .publish((symbol_short!("redeem"), user), (payout, by, bn, m.total_supply));
         Ok(payout)
     }
 
