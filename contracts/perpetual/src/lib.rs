@@ -48,7 +48,8 @@
 //! at all. `record_price_checkpoint` gives a concrete, safe stand-in for
 //! "reference price" — it reuses the exact dual-oracle (Lazer + Reflector)
 //! verification `polaris-market`'s `settle` already uses, but has **zero**
-//! economic effect: it only records `last_price_cents`/`last_price_at` for
+//! economic effect: it only records `last_price_cents`/`last_price_at` (the
+//! latter being the feed's own timestamp, monotonic across checkpoints) for
 //! observability, never touches a pool, a balance, or `total_supply`.
 //!
 //! ## Winding down: `terminate`, not `settle`
@@ -65,6 +66,18 @@
 //! Because that treatment needs no price at all, `terminate` has **no**
 //! oracle dependency whatsoever — a pure administrative wind-down, which
 //! is a strictly safer shape than a price-dependent one for a safety valve.
+//!
+//! ## Collateral token requirements (see #79)
+//!
+//! Identical to `polaris-market`'s: `collateral` is not pinned to one
+//! hard-coded asset, but must be a standard SEP-41 token whose `transfer`
+//! moves exactly the requested amount, debits the sender, credits the
+//! recipient, and returns `()` — no fee-on-transfer, no rebasing, no
+//! re-entrant transfer hooks. `initialize` probes `decimals()` and rejects
+//! anything above 18 (`Error::InvalidCollateral`); the rest is the
+//! deployer's responsibility, since a non-conforming token breaks the
+//! `balance(contract) == total_supply` invariant, not this contract's
+//! arithmetic.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env};
 
@@ -73,11 +86,14 @@ use pyth_lazer_stellar_sdk::PythLazerClient;
 use polaris_ctf_math::{
     apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps,
     sep40::Sep40Client,
-    to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig,
+    to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig, MAX_STALENESS_SECS,
 };
 
 /// Protocol fee ceiling: 1000 bps = 10%. Same figure as `polaris-market`.
 const MAX_FEE_BPS: u32 = 1_000;
+/// Oracle corroboration tolerance ceiling: 1000 bps = 10%. Same figure and
+/// same reasoning as `polaris-market`'s `MAX_TOLERANCE_BPS`.
+const MAX_TOLERANCE_BPS: u32 = 1_000;
 /// A submitted checkpoint price must be timestamped within this many
 /// seconds of "now" — same figure and same reasoning as `polaris-market`'s
 /// `PRICE_FRESHNESS_WINDOW_SECS`, just checked against the call time
@@ -215,6 +231,8 @@ pub struct Perpetual {
     pub initial_liquidity: i128,
     /// Purely informational — see the module doc's "what perpetual means
     /// here" section. `0` until the first successful checkpoint.
+    /// `last_price_at` is the *feed's* own timestamp (seconds), not ledger
+    /// time, and is strictly increasing across successful checkpoints.
     pub last_price_cents: i128,
     pub last_price_at: u64,
 }
@@ -322,6 +340,56 @@ pub struct PolarisPerpetual;
 
 #[contractimpl]
 impl PolarisPerpetual {
+    /// One-time setup: fixes the fee curve, treasury and optional
+    /// checkpoint oracle for this instance's whole life and seeds the AMM.
+    /// Requires `admin`'s auth, and moves `initial_liquidity` of
+    /// `collateral` from `admin` into this contract (`pool_yes == pool_no
+    /// == total_supply == initial_liquidity`, status `Open`). There is no
+    /// re-initialize or reconfigure path: a second call returns
+    /// `AlreadyInitialized`, and a wrong parameter means deploying a fresh
+    /// instance. Unlike `polaris-market` there is no strike, expiry or
+    /// grace period: wind-down is the admin's `terminate`.
+    ///
+    /// Parameters:
+    /// - `admin` — funds the seed liquidity; the only address that can
+    ///   `pause`/`unpause`/`terminate`.
+    /// - `collateral` — the SEP-41 token every share is backed by 1:1.
+    /// - `base_fee_bps`, `min_fee_bps` — the fee curve's endpoints, same
+    ///   curve as `polaris-market` (see `get_fee`).
+    /// - `treasury` — receives the AMM pool's leftover shares at
+    ///   `terminate`.
+    /// - `initial_liquidity` — seed collateral, and the fixed reference
+    ///   scale for the fee curve.
+    /// - `price_oracle` — `None` disables `record_price_checkpoint`
+    ///   (`PriceOracleNotConfigured`). `Some` is all-or-nothing: Lazer
+    ///   feed, Reflector leg and RedStone leg together (see
+    ///   `PriceOracleConfig`). Its `*_decimals_at_init` fields are ignored
+    ///   and overwritten with each oracle's live `decimals()`, so pass `0`.
+    ///
+    /// Rejected combinations, checked in this order (the first failing
+    /// check is the error returned, and nothing is stored or transferred):
+    /// - `AlreadyInitialized` — this instance already holds a `Perpetual`.
+    /// - `InvalidFeeBps` — `base_fee_bps > MAX_FEE_BPS` (1000 bps = 10%),
+    ///   or `min_fee_bps > base_fee_bps` (the curve would rise with volume
+    ///   instead of decaying).
+    /// - `InvalidLiquidity` — `initial_liquidity <= 0`: an empty pool has
+    ///   no constant-product price at all.
+    /// - With `price_oracle` set:
+    ///   - `InvalidFeedId` — `feed_id == 0`, the zero value of an unset
+    ///     field rather than a real Lazer feed.
+    ///   - `InvalidReflectorConfig` / `InvalidRedstoneConfig` — that leg's
+    ///     `max_staleness_secs` is narrower than the oracle's own live
+    ///     `resolution()`, so every checkpoint would be stale.
+    ///   - `ReflectorDecimalsInvalid` / `RedstoneDecimalsInvalid` — that
+    ///     leg's live `decimals()` is outside `2..=30`. The value read
+    ///     here is pinned and re-checked on every checkpoint (see
+    ///     `ReflectorDecimalsChanged`/`RedstoneDecimalsChanged`).
+    ///
+    /// Not validated here, and failing as a trap rather than a typed
+    /// error: an oracle `contract` that doesn't implement SEP-40's
+    /// `resolution()`/`decimals()`, and an `admin` without
+    /// `initial_liquidity` of `collateral` to transfer. `tolerance_bps`,
+    /// `lazer_contract` and `treasury` are stored as given.
     #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
@@ -344,6 +412,11 @@ impl PolarisPerpetual {
         if initial_liquidity <= 0 {
             return Err(Error::InvalidLiquidity);
         }
+        // See the module doc's "Collateral token requirements" — same
+        // `decimals()` probe as `polaris-market`'s `initialize`.
+        if token::Client::new(&env, &collateral).decimals() > 18 {
+            return Err(Error::InvalidCollateral);
+        }
         if let Some(oracle) = &price_oracle {
             if oracle.feed_id == 0 {
                 return Err(Error::InvalidFeedId);
@@ -355,21 +428,45 @@ impl PolarisPerpetual {
             // comment), so both must validate for the whole thing to be
             // accepted.
             let reflector_client = Sep40Client::new(&env, &oracle.reflector.contract);
-            if oracle.reflector.max_staleness_secs < reflector_client.resolution() as u64 {
+            // ...and neither leg may exceed `MAX_STALENESS_SECS`: the
+            // staleness check adds it to an oracle-supplied timestamp, so an
+            // unbounded window could overflow `u64` and trap every settle.
+            if oracle.reflector.max_staleness_secs > MAX_STALENESS_SECS
+                || oracle.reflector.max_staleness_secs < reflector_client.resolution() as u64
+            {
+                return Err(Error::InvalidReflectorConfig);
+            }
+            // Same tolerance bound as polaris-market's initialize: 0 rejects
+            // every price, anything above `MAX_TOLERANCE_BPS` accepts any
+            // divergence — both disable corroboration.
+            if oracle.reflector.tolerance_bps == 0 || oracle.reflector.tolerance_bps > MAX_TOLERANCE_BPS {
                 return Err(Error::InvalidReflectorConfig);
             }
             let reflector_decimals_at_init = reflector_client.decimals();
             if !(2..=30).contains(&reflector_decimals_at_init) {
                 return Err(Error::ReflectorDecimalsInvalid);
             }
+            // Fail closed at init, not at first checkpoint: an oracle with
+            // no price for the configured asset can never be used.
+            if reflector_client.lastprice(oracle.reflector.asset.clone()).is_none() {
+                return Err(Error::ReflectorPriceUnavailable);
+            }
 
             let redstone_client = Sep40Client::new(&env, &oracle.redstone.contract);
-            if oracle.redstone.max_staleness_secs < redstone_client.resolution() as u64 {
+            if oracle.redstone.max_staleness_secs > MAX_STALENESS_SECS
+                || oracle.redstone.max_staleness_secs < redstone_client.resolution() as u64
+            {
+                return Err(Error::InvalidRedstoneConfig);
+            }
+            if oracle.redstone.tolerance_bps == 0 || oracle.redstone.tolerance_bps > MAX_TOLERANCE_BPS {
                 return Err(Error::InvalidRedstoneConfig);
             }
             let redstone_decimals_at_init = redstone_client.decimals();
             if !(2..=30).contains(&redstone_decimals_at_init) {
                 return Err(Error::RedstoneDecimalsInvalid);
+            }
+            if redstone_client.lastprice(oracle.redstone.asset.clone()).is_none() {
+                return Err(Error::RedstonePriceUnavailable);
             }
 
             // Pinned live here, not trusted from the caller's own struct
@@ -397,7 +494,19 @@ impl PolarisPerpetual {
             last_price_at: 0,
         };
         save_market(&env, &market);
-        env.events().publish((symbol_short!("init"),), initial_liquidity);
+        // Leading field unchanged. See `polaris-market`'s `init` event and the
+        // README's "Event schema" section.
+        env.events().publish(
+            (symbol_short!("init"),),
+            (
+                initial_liquidity,
+                market.base_fee_bps,
+                market.min_fee_bps,
+                market.admin,
+                market.treasury,
+                market.collateral,
+            ),
+        );
         Ok(())
     }
 
@@ -426,6 +535,32 @@ impl PolarisPerpetual {
         is_paused(&env)
     }
 
+    /// Admin-gated, **decrease-only** fee-curve adjustment (#42). Same rule
+    /// and reasoning as `polaris-market`'s `set_fee_curve` (see its doc
+    /// comment for why lowering both bounds can never charge any future
+    /// trade more than before). A perpetual needs this more than a dated
+    /// market does: it has no expiry, so "wait for it to resolve" never
+    /// arrives as an alternative.
+    pub fn set_fee_curve(env: Env, base_fee_bps: u32, min_fee_bps: u32) -> Result<(), Error> {
+        let mut m = load_market(&env)?;
+        m.admin.require_auth();
+        if m.status != PerpetualStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        if min_fee_bps > base_fee_bps {
+            return Err(Error::InvalidFeeBps);
+        }
+        if base_fee_bps > m.base_fee_bps || min_fee_bps > m.min_fee_bps {
+            return Err(Error::FeeIncreaseNotAllowed);
+        }
+        let (old_base, old_min) = (m.base_fee_bps, m.min_fee_bps);
+        m.base_fee_bps = base_fee_bps;
+        m.min_fee_bps = min_fee_bps;
+        save_market(&env, &m);
+        env.events().publish((symbol_short!("fee_set"),), (old_base, old_min, base_fee_bps, min_fee_bps));
+        Ok(())
+    }
+
     /// Lock `amount` collateral, mint `amount` YES + `amount` NO to `user`.
     /// Identical to `polaris-market`'s `split`.
     pub fn split(env: Env, user: Address, amount: i128) -> Result<(), Error> {
@@ -443,7 +578,7 @@ impl PolarisPerpetual {
         credit(&env, Prediction::No, &user, amount);
         m.total_supply += amount;
         save_market(&env, &m);
-        env.events().publish((symbol_short!("split"), user), amount);
+        env.events().publish((symbol_short!("split"), user), (amount, m.total_supply));
         Ok(())
     }
 
@@ -464,7 +599,7 @@ impl PolarisPerpetual {
         token::Client::new(&env, &m.collateral).transfer(&env.current_contract_address(), &user, &amount);
         m.total_supply -= amount;
         save_market(&env, &m);
-        env.events().publish((symbol_short!("merge"), user), amount);
+        env.events().publish((symbol_short!("merge"), user), (amount, m.total_supply));
         Ok(())
     }
 
@@ -493,7 +628,8 @@ impl PolarisPerpetual {
 
         let unwanted = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, unwanted);
-        let effective_in = apply_fee(collateral_amount, effective_fee_bps(&m));
+        let fee_bps = effective_fee_bps(&m);
+        let effective_in = apply_fee(collateral_amount, fee_bps);
         let amount_out = cpmm_out(reserve_in, reserve_out, effective_in);
         if amount_out * 2 >= reserve_out {
             return Err(Error::PoolDepthExceeded);
@@ -513,7 +649,10 @@ impl PolarisPerpetual {
         credit(&env, prediction, &user, amount_out);
 
         save_market(&env, &m);
-        env.events().publish((symbol_short!("buy"), user, prediction), (collateral_amount, amount_out));
+        env.events().publish(
+            (symbol_short!("buy"), user, prediction),
+            (collateral_amount, amount_out, fee_bps, m.pool_yes, m.pool_no, m.total_supply),
+        );
         Ok(collateral_amount + amount_out)
     }
 
@@ -543,7 +682,8 @@ impl PolarisPerpetual {
 
         let opposite = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, prediction);
-        let effective_in = apply_fee(shares_in, effective_fee_bps(&m));
+        let fee_bps = effective_fee_bps(&m);
+        let effective_in = apply_fee(shares_in, fee_bps);
         let collateral_out = cpmm_sell_out(reserve_in, reserve_out, effective_in);
         if collateral_out * 2 >= reserve_out {
             return Err(Error::PoolDepthExceeded);
@@ -560,7 +700,10 @@ impl PolarisPerpetual {
         m.total_supply -= collateral_out;
 
         save_market(&env, &m);
-        env.events().publish((symbol_short!("sell"), user, prediction), (shares_in, collateral_out));
+        env.events().publish(
+            (symbol_short!("sell"), user, prediction),
+            (shares_in, collateral_out, fee_bps, m.pool_yes, m.pool_no, m.total_supply),
+        );
         Ok(collateral_out)
     }
 
@@ -598,6 +741,9 @@ impl PolarisPerpetual {
     /// `total_supply` mutation, ever.
     pub fn record_price_checkpoint(env: Env, payload: Bytes) -> Result<(), Error> {
         let mut m = load_market(&env)?;
+        if m.status != PerpetualStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
         let oracle = load_price_oracle(&env).ok_or(Error::PriceOracleNotConfigured)?;
         let now = env.ledger().timestamp();
 
@@ -613,10 +759,10 @@ impl PolarisPerpetual {
         let feed_ts_micros = feed.feed_update_timestamp.unwrap_or(verified.timestamp);
         let feed_ts_secs = feed_ts_micros / 1_000_000;
 
-        if feed_ts_secs + PRICE_FRESHNESS_WINDOW_SECS < now {
+        if feed_ts_secs.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) < now {
             return Err(Error::StalePrice);
         }
-        if feed_ts_secs > now + PRICE_FRESHNESS_WINDOW_SECS {
+        if feed_ts_secs > now.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) {
             return Err(Error::FuturePrice);
         }
 
@@ -631,6 +777,7 @@ impl PolarisPerpetual {
                 OracleCheckError::Stale => Error::ReflectorPriceStale,
                 OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
                 OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::FutureDated => Error::ReflectorPriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             })?;
         verify_oracle_corroboration(&env, &oracle.redstone, oracle.redstone_decimals_at_init, now, final_cents)
@@ -639,13 +786,21 @@ impl PolarisPerpetual {
                 OracleCheckError::Stale => Error::RedstonePriceStale,
                 OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
                 OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+                OracleCheckError::FutureDated => Error::RedstonePriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             })?;
 
+        // Monotonicity: `last_price_at` holds the *feed's* timestamp, so a
+        // replay of an older payload (still inside the freshness window)
+        // must not roll the checkpoint backwards.
+        if m.last_price_at != 0 && feed_ts_secs <= m.last_price_at {
+            return Err(Error::StaleCheckpoint);
+        }
+
         m.last_price_cents = final_cents;
-        m.last_price_at = now;
+        m.last_price_at = feed_ts_secs;
         save_market(&env, &m);
-        env.events().publish((symbol_short!("chkpt"),), (final_cents, now));
+        env.events().publish((symbol_short!("chkpt"),), (final_cents, feed_ts_secs));
         Ok(())
     }
 
@@ -672,14 +827,17 @@ impl PolarisPerpetual {
             return Err(Error::AlreadyFinalized);
         }
 
-        credit(&env, Prediction::Yes, &m.treasury, m.pool_yes);
-        credit(&env, Prediction::No, &m.treasury, m.pool_no);
+        let (swept_yes, swept_no) = (m.pool_yes, m.pool_no);
+        credit(&env, Prediction::Yes, &m.treasury, swept_yes);
+        credit(&env, Prediction::No, &m.treasury, swept_no);
         m.pool_yes = 0;
         m.pool_no = 0;
         m.status = PerpetualStatus::Terminated;
 
         save_market(&env, &m);
-        env.events().publish((symbol_short!("term"),), ());
+        // Sweep amounts for the same reason as `polaris-market`'s `cancel`:
+        // the treasury credit isn't visible in any other event.
+        env.events().publish((symbol_short!("term"),), (m.treasury.clone(), swept_yes, swept_no));
         Ok(())
     }
 
@@ -712,7 +870,7 @@ impl PolarisPerpetual {
         token::Client::new(&env, &m.collateral).transfer(&env.current_contract_address(), &user, &payout);
         m.total_supply -= payout;
         save_market(&env, &m);
-        env.events().publish((symbol_short!("redeem"), user), payout);
+        env.events().publish((symbol_short!("redeem"), user), (payout, by, bn, m.total_supply));
         Ok(payout)
     }
 

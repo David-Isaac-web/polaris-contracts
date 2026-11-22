@@ -25,6 +25,22 @@
 //! - `redeem` pays out 1:1 collateral per winning share (or per share of
 //!   either side, if cancelled).
 //!
+//! ## Collateral token requirements (see #79)
+//!
+//! This build deliberately does **not** pin `collateral` to a single
+//! hard-coded asset (e.g. the native XLM SAC): the same contract is used
+//! for testnet assets and for any standard SEP-41 token an admin chooses.
+//! Instead the requirement is *documented and probed*: `collateral` must
+//! be a standard SEP-41 token whose `transfer` moves exactly the requested
+//! amount, debits the sender, credits the recipient, and returns `()`
+//! (no fee-on-transfer, no rebasing, no transfer hooks that re-enter this
+//! contract, no "returns the amount moved" variants). `initialize` calls
+//! `decimals()` on it and rejects anything that isn't a token with
+//! `0..=18` decimals (`Error::InvalidCollateral`); the rest of the
+//! requirement is not checkable on-chain and is the deployer's
+//! responsibility — a non-conforming token breaks the invariant below, not
+//! this contract's arithmetic.
+//!
 //! Invariant (see tests): `collateral_token.balance(contract) ==
 //! market.total_supply` holds after *every* successful call, for the whole
 //! lifecycle. Because every share is minted as a matched YES+NO pair, the
@@ -48,9 +64,21 @@
 //! cancels and refunds through the exact same well-tested path every other
 //! unresolvable market already uses, preserving the "nobody unilaterally
 //! decides" property even in the failure case.
+//!
+//! ## Deterministic settlement price
+//!
+//! `settle()` is permissionless and the caller supplies the signed Lazer
+//! payload, so *which* print is used must not be the caller's choice. The
+//! rule: the print must be timestamped at or before `expiry`, and no more
+//! than `PRICE_FRESHNESS_WINDOW_SECS` (300s) before it. Post-expiry prints
+//! are rejected (`FuturePrice`) even though they are fresher — accepting
+//! them would let the caller pick any print in `[expiry, expiry + 300s]`
+//! and settle on whichever side of the strike they hold. `settle_via_reflector`
+//! enforces the identical bound on Reflector's `lastprice` timestamp.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env,
+    Symbol,
 };
 
 use pyth_lazer_stellar_sdk::PythLazerClient;
@@ -63,12 +91,33 @@ use pyth_lazer_stellar_sdk::PythLazerClient;
 use polaris_ctf_math::{
     apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, reflector_price_to_cents,
     sep40::Sep40Client, to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig,
+    MAX_STALENESS_SECS,
 };
 
 /// Protocol fee ceiling: 1000 bps = 10%.
 const MAX_FEE_BPS: u32 = 1_000;
+/// Oracle corroboration tolerance ceiling: 1000 bps = 10%. A tolerance at or
+/// above 10_000 bps would accept any divergence at all, silently disabling
+/// the second-oracle cross-check; 0 would reject every price outright.
+const MAX_TOLERANCE_BPS: u32 = 1_000;
 /// Settlement price must be timestamped within this many seconds of expiry.
+///
+/// Asymmetric on purpose (see the README's settlement section): a print
+/// timestamped *before* expiry is still accepted within this window, but a
+/// print timestamped *after* expiry is rejected outright. The caller of
+/// `settle()` picks which signed update to submit, so accepting a
+/// post-expiry print would let them choose the settlement price from any
+/// print in `[expiry, expiry + 300s]` — a free option on the outcome.
+/// Pre-expiry prints are not a choice: the last print at or before expiry
+/// is the price the market was actually trading at when it closed.
 const PRICE_FRESHNESS_WINDOW_SECS: u64 = 300;
+/// Upper bound on `expiry` and on `grace_period`, so that
+/// `expiry + grace_period` can never overflow `u64` — otherwise `cancel()`,
+/// the permissionless liveness backstop, could trap forever and strand
+/// every holder's funds. Both are capped at `u64::MAX / 2`, which leaves
+/// their sum representable with room to spare.
+const MAX_EXPIRY: u64 = u64::MAX / 2;
+const MAX_GRACE_PERIOD: u64 = u64::MAX / 2;
 /// Instance/persistent storage TTL bump (ledgers), applied on every write.
 const BUMP_TO: u32 = 535_680; // ~31 days at 5s/ledger
 const BUMP_THRESHOLD: u32 = 500_000;
@@ -93,7 +142,12 @@ pub enum Error {
     ExpiryNotReached = 14,
     InvalidPayload = 15,
     FeedNotFound = 16,
+    /// Settlement print is more than `PRICE_FRESHNESS_WINDOW_SECS` before
+    /// `expiry` — too old to be the price the market closed at.
     StalePrice = 17,
+    /// Settlement print is timestamped *after* `expiry`. Rejected even
+    /// within the freshness window: the caller of `settle()` chooses the
+    /// payload, so a post-expiry print would let them pick the outcome.
     FuturePrice = 18,
     GracePeriodNotElapsed = 19,
     AlreadyFinalized = 20,
@@ -164,6 +218,16 @@ impl Prediction {
             Prediction::No => Prediction::Yes,
         }
     }
+}
+
+/// Which settlement path finalized the market — recorded in the `settle`
+/// event so indexers can tell a Lazer-verified settlement from a
+/// Reflector-promoted one without replaying the transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum SettlementSource {
+    Lazer,
+    Reflector,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +303,11 @@ pub enum DataKey {
     /// additive for old and new instances alike. See #4's identical
     /// reasoning for `vault`'s `PendingAdmin` key.
     Paused,
+    /// Set only between a `propose_admin` and the matching `accept_admin` —
+    /// absent the rest of the time. Own key, not a `Market` field, for the
+    /// same additive-only reason as `Paused` above; mirrors `polaris-vault`'s
+    /// `PendingAdmin` (#4, ported here by #86).
+    PendingAdmin,
 }
 
 fn touch(env: &Env) {
@@ -265,6 +334,18 @@ fn load_redstone_oracle(env: &Env) -> Option<RedstoneOracle> {
 
 fn is_paused(env: &Env) -> bool {
     env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+}
+
+/// Identity check first, then `require_auth` — same pattern as
+/// `polaris-vault`'s `require_admin`: a mismatched caller gets a clear typed
+/// error rather than an auth trap.
+fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    let m = load_market(env)?;
+    if m.admin != *admin {
+        return Err(Error::Unauthorized);
+    }
+    admin.require_auth();
+    Ok(())
 }
 
 fn balance_of(env: &Env, side: Prediction, addr: &Address) -> i128 {
@@ -331,6 +412,67 @@ pub struct PolarisMarket;
 
 #[contractimpl]
 impl PolarisMarket {
+    /// One-time setup: fixes every market parameter for this instance's
+    /// whole life and seeds the AMM. Requires `admin`'s auth, and moves
+    /// `initial_liquidity` of `collateral` from `admin` into this contract
+    /// (`pool_yes == pool_no == total_supply == initial_liquidity`, status
+    /// `Open`). There is no re-initialize or reconfigure path: a second
+    /// call returns `AlreadyInitialized`, and a wrong parameter means
+    /// deploying a fresh instance.
+    ///
+    /// Parameters:
+    /// - `admin` — funds the seed liquidity; the only address that can
+    ///   `pause`/`unpause`.
+    /// - `collateral` — the SEP-41 token every share is backed by 1:1
+    ///   (native XLM SAC in this build — see the module doc).
+    /// - `strike_price` — in cents; resolves `ResolvedYes` iff the settled
+    ///   price is `>= strike_price`.
+    /// - `expiry` — unix seconds; `buy`/`sell` close and `settle` opens here.
+    /// - `grace_period` — seconds after `expiry` before `cancel` (the
+    ///   permissionless liveness backstop) becomes callable.
+    /// - `lazer_contract`, `feed_id` — the Pyth Lazer verifier contract and
+    ///   the feed `settle` reads (see the README's "Feed ID" section).
+    /// - `base_fee_bps`, `min_fee_bps` — the fee curve's endpoints: a fresh
+    ///   market charges `base_fee_bps`, decaying toward `min_fee_bps` as
+    ///   `total_supply` grows (see `get_fee`).
+    /// - `treasury` — receives the AMM pool's leftover shares at
+    ///   settlement/cancellation (a `polaris-vault` address, in practice).
+    /// - `initial_liquidity` — seed collateral, and the fixed reference
+    ///   scale for the fee curve.
+    /// - `reflector` — the always-required SEP-40 corroboration leg.
+    /// - `redstone` — the optional second SEP-40 leg (`None` on testnet).
+    ///   When present, corroboration is unanimous, never 2-of-3.
+    ///
+    /// Rejected combinations, checked in this order (the first failing
+    /// check is the error returned, and nothing is stored or transferred):
+    /// - `AlreadyInitialized` — this instance already holds a `Market`.
+    /// - `InvalidStrikePrice` — `strike_price <= 0`: no real price could
+    ///   ever resolve below it, so the outcome would be fixed in advance.
+    /// - `InvalidExpiry` — `expiry` is not strictly in the future: the
+    ///   market would be settleable before anyone could trade it.
+    /// - `InvalidGracePeriod` — `grace_period == 0`: `cancel` would become
+    ///   callable the same instant `settle` does, letting anyone void the
+    ///   market in a race against the honest settlement.
+    /// - `InvalidFeedId` — `feed_id == 0`, the zero value of an unset
+    ///   field rather than a real Lazer feed.
+    /// - `InvalidFeeBps` — `base_fee_bps > MAX_FEE_BPS` (1000 bps = 10%),
+    ///   or `min_fee_bps > base_fee_bps` (the curve would rise with volume
+    ///   instead of decaying).
+    /// - `InvalidLiquidity` — `initial_liquidity <= 0`: an empty pool has
+    ///   no constant-product price at all.
+    /// - `InvalidReflectorConfig` / `InvalidRedstoneConfig` — that leg's
+    ///   `max_staleness_secs` is narrower than the oracle's own live
+    ///   `resolution()`, so every settle attempt would be stale.
+    /// - `ReflectorDecimalsInvalid` / `RedstoneDecimalsInvalid` — that
+    ///   leg's live `decimals()` is outside `2..=30`. The value read here
+    ///   is pinned and re-checked on every `settle` (see
+    ///   `ReflectorDecimalsChanged`/`RedstoneDecimalsChanged`).
+    ///
+    /// Not validated here, and failing as a trap rather than a typed
+    /// error: an oracle `contract` that doesn't implement SEP-40's
+    /// `resolution()`/`decimals()`, and an `admin` without
+    /// `initial_liquidity` of `collateral` to transfer. `tolerance_bps`,
+    /// `lazer_contract` and `treasury` are stored as given.
     #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
@@ -363,10 +505,10 @@ impl PolarisMarket {
         if strike_price <= 0 {
             return Err(Error::InvalidStrikePrice);
         }
-        if expiry <= env.ledger().timestamp() {
+        if expiry <= env.ledger().timestamp() || expiry > MAX_EXPIRY {
             return Err(Error::InvalidExpiry);
         }
-        if grace_period == 0 {
+        if grace_period == 0 || grace_period > MAX_GRACE_PERIOD {
             return Err(Error::InvalidGracePeriod);
         }
         if feed_id == 0 {
@@ -378,11 +520,32 @@ impl PolarisMarket {
         if initial_liquidity <= 0 {
             return Err(Error::InvalidLiquidity);
         }
+        // See the module doc's "Collateral token requirements": the
+        // solvency invariant assumes standard SEP-41 transfer semantics,
+        // which can't be fully verified on-chain — but a `decimals()` probe
+        // rejects the common non-conforming cases (a plain account, a
+        // contract with no token interface, absurd precision) before any
+        // liquidity is pulled.
+        let collateral_decimals = token::Client::new(&env, &collateral).decimals();
+        if collateral_decimals > 18 {
+            return Err(Error::InvalidCollateral);
+        }
         // An admin can't configure a staleness window narrower than
         // Reflector's own update cadence allows — that would reject every
         // settle attempt outright, not just unlucky ones.
+        // ...and can't exceed `MAX_STALENESS_SECS`: the staleness check adds
+        // this to an oracle-supplied timestamp, so an unbounded window could
+        // overflow `u64` and trap every settle.
         let reflector_client = Sep40Client::new(&env, &reflector.contract);
-        if reflector.max_staleness_secs < reflector_client.resolution() as u64 {
+        if reflector.max_staleness_secs > MAX_STALENESS_SECS
+            || reflector.max_staleness_secs < reflector_client.resolution() as u64
+        {
+            return Err(Error::InvalidReflectorConfig);
+        }
+        // A tolerance of 0 rejects every price, and one above
+        // `MAX_TOLERANCE_BPS` (or at/above 10_000 bps) accepts any
+        // divergence — either way the corroboration check is disabled.
+        if reflector.tolerance_bps == 0 || reflector.tolerance_bps > MAX_TOLERANCE_BPS {
             return Err(Error::InvalidReflectorConfig);
         }
         // Pinned once here, re-checked on every `settle()` call — see
@@ -391,13 +554,26 @@ impl PolarisMarket {
         if !(2..=30).contains(&reflector_decimals_at_init) {
             return Err(Error::ReflectorDecimalsInvalid);
         }
+        // Fail closed at init, not at first settle: an oracle that has no
+        // price for the configured asset can never settle this market.
+        if reflector_client.lastprice(reflector.asset.clone()).is_none() {
+            return Err(Error::ReflectorPriceUnavailable);
+        }
 
         if let Some(cfg) = &redstone {
             let redstone_client = Sep40Client::new(&env, &cfg.contract);
-            if cfg.max_staleness_secs < redstone_client.resolution() as u64 {
+            if cfg.max_staleness_secs > MAX_STALENESS_SECS
+                || cfg.max_staleness_secs < redstone_client.resolution() as u64
+            {
+                return Err(Error::InvalidRedstoneConfig);
+            }
+            if cfg.tolerance_bps == 0 || cfg.tolerance_bps > MAX_TOLERANCE_BPS {
                 return Err(Error::InvalidRedstoneConfig);
             }
             let redstone_decimals_at_init = redstone_client.decimals();
+            if redstone_client.lastprice(cfg.asset.clone()).is_none() {
+                return Err(Error::RedstonePriceUnavailable);
+            }
             if !(2..=30).contains(&redstone_decimals_at_init) {
                 return Err(Error::RedstoneDecimalsInvalid);
             }
@@ -434,9 +610,24 @@ impl PolarisMarket {
             initial_liquidity,
         };
         save_market(&env, &market);
+        // Every immutable parameter an indexer needs to interpret this
+        // market's later events, so it never has to call `get_market()` to
+        // bootstrap. Pools and `total_supply` all start at
+        // `initial_liquidity`. See the README's "Event schema" section.
         env.events().publish(
             (symbol_short!("init"),),
-            (market.strike_price, market.expiry),
+            (
+                market.strike_price,
+                market.expiry,
+                market.grace_period,
+                market.feed_id,
+                market.base_fee_bps,
+                market.min_fee_bps,
+                market.initial_liquidity,
+                market.admin,
+                market.treasury,
+                market.collateral,
+            ),
         );
         Ok(())
     }
@@ -453,7 +644,7 @@ impl PolarisMarket {
     /// waiting for natural expiry.
     pub fn pause(env: Env) -> Result<(), Error> {
         let m = load_market(&env)?;
-        m.admin.require_auth();
+        require_admin(&env, &m.admin)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         touch(&env);
         env.events().publish((symbol_short!("paused"),), ());
@@ -462,7 +653,7 @@ impl PolarisMarket {
 
     pub fn unpause(env: Env) -> Result<(), Error> {
         let m = load_market(&env)?;
-        m.admin.require_auth();
+        require_admin(&env, &m.admin)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         touch(&env);
         env.events().publish((symbol_short!("unpaused"),), ());
@@ -471,6 +662,53 @@ impl PolarisMarket {
 
     pub fn is_paused(env: Env) -> bool {
         is_paused(&env)
+    }
+
+    /// Step 1 of a two-step admin rotation — ported verbatim from
+    /// `polaris-vault` (#4, see #86). Deliberately not a single-call
+    /// `set_admin`: a typo'd/unreachable `proposed` address would
+    /// permanently brick the market out of its admin-gated entrypoints, so
+    /// the new admin has to actually show up and sign `accept_admin` with
+    /// its own key before the swap takes effect — a bad proposal is
+    /// harmless and reversible (just propose again).
+    pub fn propose_admin(env: Env, current_admin: Address, proposed: Address) -> Result<(), Error> {
+        require_admin(&env, &current_admin)?;
+        env.storage().instance().set(&DataKey::PendingAdmin, &proposed);
+        touch(&env);
+        env.events().publish((symbol_short!("propose"),), proposed.clone());
+        Ok(())
+    }
+
+    /// Step 2: the proposed admin confirms with their own signature. Only
+    /// the exact address `propose_admin` named can call this successfully —
+    /// not the current admin, not anyone else — which is what actually
+    /// proves the new key is live, held, and able to sign before it becomes
+    /// the only key that can pause/unpause.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+        if pending != new_admin {
+            return Err(Error::Unauthorized);
+        }
+        new_admin.require_auth();
+        let mut m = load_market(&env)?;
+        m.admin = new_admin.clone();
+        save_market(&env, &m);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        touch(&env);
+        env.events().publish((symbol_short!("newadmin"),), new_admin);
+        Ok(())
+    }
+
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        Ok(load_market(&env)?.admin)
     }
 
     /// Lock `amount` collateral, mint `amount` YES + `amount` NO to `user`.
@@ -494,7 +732,7 @@ impl PolarisMarket {
         m.total_supply += amount;
         save_market(&env, &m);
         env.events()
-            .publish((symbol_short!("split"), user), amount);
+            .publish((symbol_short!("split"), user), (amount, m.total_supply));
         Ok(())
     }
 
@@ -519,7 +757,7 @@ impl PolarisMarket {
         m.total_supply -= amount;
         save_market(&env, &m);
         env.events()
-            .publish((symbol_short!("merge"), user), amount);
+            .publish((symbol_short!("merge"), user), (amount, m.total_supply));
         Ok(())
     }
 
@@ -550,7 +788,8 @@ impl PolarisMarket {
 
         let unwanted = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, unwanted);
-        let effective_in = apply_fee(collateral_amount, effective_fee_bps(&m));
+        let fee_bps = effective_fee_bps(&m);
+        let effective_in = apply_fee(collateral_amount, fee_bps);
         let amount_out = cpmm_out(reserve_in, reserve_out, effective_in);
         // Cap single-trade impact to half the reserve being drawn from. Not
         // just a slippage nicety: cpmm_out's integer floor division lets a
@@ -581,9 +820,12 @@ impl PolarisMarket {
         credit(&env, prediction, &user, amount_out);
 
         save_market(&env, &m);
+        // Leading two fields unchanged, so older positional decoders still
+        // work. The appended fee rate and post-trade pools/supply let an
+        // indexer show the fee and price without reading `get_market()`.
         env.events().publish(
             (symbol_short!("buy"), user, prediction),
-            (collateral_amount, amount_out),
+            (collateral_amount, amount_out, fee_bps, m.pool_yes, m.pool_no, m.total_supply),
         );
         Ok(collateral_amount + amount_out)
     }
@@ -618,7 +860,8 @@ impl PolarisMarket {
 
         let opposite = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, prediction);
-        let effective_in = apply_fee(shares_in, effective_fee_bps(&m));
+        let fee_bps = effective_fee_bps(&m);
+        let effective_in = apply_fee(shares_in, fee_bps);
         let collateral_out = cpmm_sell_out(reserve_in, reserve_out, effective_in);
         // Same reserve-depth cap as `buy`, against the same reserve
         // (`reserve_out`, the opposite side's pool — the one this trade only
@@ -645,7 +888,7 @@ impl PolarisMarket {
         save_market(&env, &m);
         env.events().publish(
             (symbol_short!("sell"), user, prediction),
-            (shares_in, collateral_out),
+            (shares_in, collateral_out, fee_bps, m.pool_yes, m.pool_no, m.total_supply),
         );
         Ok(collateral_out)
     }
@@ -710,10 +953,10 @@ impl PolarisMarket {
         let feed_ts_micros = feed.feed_update_timestamp.unwrap_or(verified.timestamp);
         let feed_ts_secs = feed_ts_micros / 1_000_000;
 
-        if feed_ts_secs + PRICE_FRESHNESS_WINDOW_SECS < m.expiry {
+        if feed_ts_secs.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) < m.expiry {
             return Err(Error::StalePrice);
         }
-        if feed_ts_secs > m.expiry + PRICE_FRESHNESS_WINDOW_SECS {
+        if feed_ts_secs > m.expiry.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) {
             return Err(Error::FuturePrice);
         }
 
@@ -730,6 +973,7 @@ impl PolarisMarket {
                 OracleCheckError::Stale => Error::ReflectorPriceStale,
                 OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
                 OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::FutureDated => Error::ReflectorPriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             },
         )?;
@@ -738,7 +982,7 @@ impl PolarisMarket {
                 .map_err(Self::map_redstone_error)?;
         }
 
-        Self::finalize_settlement(&env, &mut m, final_cents);
+        Self::finalize_settlement(&env, &mut m, final_cents, SettlementSource::Lazer);
         Ok(())
     }
 
@@ -773,16 +1017,27 @@ impl PolarisMarket {
 
         let client = Sep40Client::new(&env, &m.reflector.contract);
         let price = client.lastprice(&m.reflector.asset).ok_or(Error::ReflectorPriceUnavailable)?;
-        if price.timestamp + m.reflector.max_staleness_secs < now {
+        // Saturating, not `+`: `price.timestamp` is oracle-supplied and can
+        // sit near `u64::MAX`, which would otherwise trap the whole call.
+        if price.timestamp.saturating_add(m.reflector.max_staleness_secs) < now {
             return Err(Error::ReflectorPriceStale);
+        }
+        if price.timestamp > now + polaris_ctf_math::MAX_FUTURE_SKEW_SECS {
+            return Err(Error::ReflectorPriceFutureDated);
         }
         // Same "timestamped near expiry, not just not-stale-right-now"
         // bound the Lazer path enforces via PRICE_FRESHNESS_WINDOW_SECS —
         // a price that's merely within max_staleness_secs of `now` could
         // still predate `expiry` by an unbounded amount if settle() is
         // called long after expiry on a stalled feed.
-        if price.timestamp + PRICE_FRESHNESS_WINDOW_SECS < m.expiry {
+        if price.timestamp.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) < m.expiry {
             return Err(Error::StalePrice);
+        }
+        // Upper bound mirroring the Lazer path exactly: a price timestamped
+        // after expiry is not a settlement price for this market, so reject
+        // it rather than settling on a post-expiry print the caller chose.
+        if price.timestamp > m.expiry {
+            return Err(Error::FuturePrice);
         }
         let decimals = client.decimals();
         if decimals != m.reflector_decimals_at_init {
@@ -800,7 +1055,7 @@ impl PolarisMarket {
                 .map_err(Self::map_redstone_error)?;
         }
 
-        Self::finalize_settlement(&env, &mut m, final_cents);
+        Self::finalize_settlement(&env, &mut m, final_cents, SettlementSource::Reflector);
         Ok(())
     }
 
@@ -814,6 +1069,7 @@ impl PolarisMarket {
             OracleCheckError::Stale => Error::RedstonePriceStale,
             OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
             OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+            OracleCheckError::FutureDated => Error::RedstonePriceFutureDated,
             OracleCheckError::Divergent => Error::OracleDivergence,
         }
     }
@@ -821,7 +1077,12 @@ impl PolarisMarket {
     /// Shared tail of both settlement paths (`settle`/`settle_via_reflector`)
     /// — once a final price has cleared every configured oracle check,
     /// finalizing is identical regardless of which path produced it.
-    fn finalize_settlement(env: &Env, m: &mut Market, final_cents: i128) {
+    fn finalize_settlement(
+        env: &Env,
+        m: &mut Market,
+        final_cents: i128,
+        source: SettlementSource,
+    ) {
         m.final_price = final_cents;
         m.status = if final_cents >= m.strike_price {
             MarketStatus::ResolvedYes
@@ -829,14 +1090,15 @@ impl PolarisMarket {
             MarketStatus::ResolvedNo
         };
 
-        credit(env, Prediction::Yes, &m.treasury, m.pool_yes);
-        credit(env, Prediction::No, &m.treasury, m.pool_no);
+        let (swept_yes, swept_no) = (m.pool_yes, m.pool_no);
+        credit(env, Prediction::Yes, &m.treasury, swept_yes);
+        credit(env, Prediction::No, &m.treasury, swept_no);
         m.pool_yes = 0;
         m.pool_no = 0;
 
         save_market(env, m);
         env.events()
-            .publish((symbol_short!("settle"),), (m.status, final_cents));
+            .publish((symbol_short!("settle"),), (m.status, final_cents, source));
     }
 
     /// Permissionless liveness backstop: if nobody ever settles, anyone can
@@ -847,18 +1109,23 @@ impl PolarisMarket {
             return Err(Error::AlreadyFinalized);
         }
         let now = env.ledger().timestamp();
-        if now < m.expiry + m.grace_period {
+        // Saturating: `initialize` already bounds both terms so this can't
+        // overflow, but the backstop must never trap even for a market
+        // stored before that bound existed.
+        if now < m.expiry.saturating_add(m.grace_period) {
             return Err(Error::GracePeriodNotElapsed);
         }
 
-        credit(&env, Prediction::Yes, &m.treasury, m.pool_yes);
-        credit(&env, Prediction::No, &m.treasury, m.pool_no);
+        let (swept_yes, swept_no) = (m.pool_yes, m.pool_no);
+        credit(&env, Prediction::Yes, &m.treasury, swept_yes);
+        credit(&env, Prediction::No, &m.treasury, swept_no);
         m.pool_yes = 0;
         m.pool_no = 0;
         m.status = MarketStatus::Cancelled;
 
         save_market(&env, &m);
-        env.events().publish((symbol_short!("cancel"),), ());
+        env.events()
+            .publish((symbol_short!("cancel"),), (m.treasury.clone(), swept_yes, swept_no));
         Ok(())
     }
 
@@ -867,19 +1134,23 @@ impl PolarisMarket {
         user.require_auth();
         let mut m = load_market(&env)?;
 
+        // Every finalized branch below zeroes both balances, so record what
+        // is being burned first. The `redeem` event carries both, which lets an
+        // indexer show exactly which shares were redeemed.
+        let by = balance_of(&env, Prediction::Yes, &user);
+        let bn = balance_of(&env, Prediction::No, &user);
+
         let payout = match m.status {
             MarketStatus::Open => return Err(Error::NotFinalized),
             MarketStatus::ResolvedYes => {
-                let b = balance_of(&env, Prediction::Yes, &user);
                 set_balance(&env, Prediction::Yes, &user, 0);
                 set_balance(&env, Prediction::No, &user, 0);
-                b
+                by
             }
             MarketStatus::ResolvedNo => {
-                let b = balance_of(&env, Prediction::No, &user);
                 set_balance(&env, Prediction::Yes, &user, 0);
                 set_balance(&env, Prediction::No, &user, 0);
-                b
+                bn
             }
             MarketStatus::Cancelled => {
                 // NOT `by + bn`: `sum(all YES balances) == total_supply` and
@@ -899,8 +1170,6 @@ impl PolarisMarket {
                 // history — a directional bettor's AMM-subsidized bonus
                 // shares are worth less than face value once nobody's
                 // collateral is "eligible" to originate from resolution.
-                let by = balance_of(&env, Prediction::Yes, &user);
-                let bn = balance_of(&env, Prediction::No, &user);
                 set_balance(&env, Prediction::Yes, &user, 0);
                 set_balance(&env, Prediction::No, &user, 0);
                 (by + bn) / 2
@@ -919,7 +1188,7 @@ impl PolarisMarket {
         m.total_supply -= payout;
         save_market(&env, &m);
         env.events()
-            .publish((symbol_short!("redeem"), user), payout);
+            .publish((symbol_short!("redeem"), user), (payout, by, bn, m.total_supply));
         Ok(payout)
     }
 

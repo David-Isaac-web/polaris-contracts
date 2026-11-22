@@ -4,7 +4,7 @@
 //!
 //! Additive, isolated, zero changes to `contracts/market`. What this
 //! actually fixes: today, every new market's `initial_liquidity` is wired
-//! from the admin's own keypair by hand at `initialize()` time, and that
+//! from the admin's own keypair by hand at construction time, and that
 //! seed capital sits siloed in that one market's own reserves for its
 //! entire life — recovered only at settlement, into a bare `treasury`
 //! wallet address with no accounting at all. Fragmented capital, manual
@@ -56,7 +56,7 @@ use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, token, Ad
 /// pulls its `#[contract]`-exported wasm symbols into *this* contract's own
 /// compiled output — confirmed the hard way: `cargo build --release
 /// --target wasm32v1-none` linked "successfully" but warned `function
-/// signature mismatch: initialize`, because both contracts export a
+/// signature mismatch: __constructor`, because both contracts export a
 /// same-named function and the linker was merging them into one binary.
 /// `contractimport!` reads the target wasm's embedded interface spec at
 /// compile time (the same spec `polaris-oracle`'s `contract.Spec.fromWasm`
@@ -82,22 +82,59 @@ mod market_contract {
 const BUMP_TO: u32 = 535_680;
 const BUMP_THRESHOLD: u32 = 500_000;
 
+/// Most markets one `redeem_from_markets` call accepts — measured, not
+/// assumed (#38). Each market redeemed adds a fixed set of ledger entries
+/// to the transaction's footprint (the market's instance, the vault's YES
+/// and NO balance entries in it, and the market's collateral balance) on
+/// top of a fixed base (vault, token, shared market code). Metered against
+/// real `polaris-market` wasm under soroban-sdk 26.1's
+/// `InvocationResourceLimits::mainnet()`:
+///
+/// | markets | footprint entries (max 100) | write entries (max 50) | CPU insns (max 600M) | memory (max 40 MiB) | event bytes (max 16 KiB) |
+/// |---|---|---|---|---|---|
+/// | 1  | 18  | 6  | 1.1M  | 1.3 MB  | 492   |
+/// | 10 | 90  | 42 | 11.9M | 13.6 MB | 4,920 |
+/// | 11 | 98  | 46 | 13.2M | 15.0 MB | 5,412 |
+/// | 12 | 106 | 50 | 14.5M | 16.4 MB | 5,904 |
+///
+/// The footprint limit is the one that binds, not CPU: 12 markets is
+/// rejected (106 > 100), 11 is the true ceiling. The cap sits one below
+/// that, leaving 8 entries of headroom for what a test can't see — e.g.
+/// markets running different wasm versions after an upgrade, each adding
+/// its own code entry. Re-measure with the `measure_redeem_batch_costs`
+/// test (see `test.rs`) after any change to `polaris-market`'s storage
+/// layout or this entrypoint, and if the network's limits change.
+pub const MAX_REDEEM_BATCH: u32 = 10;
+
 fn touch(env: &Env) {
     env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
 }
 
 const STORAGE_KEY_ADMIN: Symbol = symbol_short!("admin");
 const STORAGE_KEY_COLLATERAL: Symbol = symbol_short!("collat");
+/// Cumulative lifetime counter: every `deposit` ever made, never decremented
+/// by `withdraw`/`redeem_from_market`. Reconcile the live balance with
+/// `total_deposited - total_withdrawn + total_redeemed == get_balance()`.
 const STORAGE_KEY_TOTAL_DEPOSITED: Symbol = symbol_short!("deposit");
+/// Cumulative lifetime counter: every `withdraw` ever made.
+const STORAGE_KEY_TOTAL_WITHDRAWN: Symbol = symbol_short!("withdrawn");
+/// Cumulative lifetime counter: every payout ever collected from a market
+/// via `redeem_from_market`.
+const STORAGE_KEY_TOTAL_REDEEMED: Symbol = symbol_short!("redeemed");
 /// Set only between a `propose_admin` and the matching `accept_admin` —
 /// absent the rest of the time. See `propose_admin`'s doc comment for why
 /// this is two steps, not a single `set_admin`.
 const STORAGE_KEY_PENDING_ADMIN: Symbol = symbol_short!("pending");
+/// `market_id -> ()` for every market this vault has seeded via
+/// `seed_market` — the on-chain record of what capital is deployed where.
+const STORAGE_KEY_MARKETS: Symbol = symbol_short!("markets");
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 #[repr(u32)]
 pub enum Error {
+    /// Retained for ABI stability; the constructor (#95) can no longer
+    /// report it — a second deploy at the same address fails in the host.
     AlreadyInitialized = 1,
     NotInitialized = 2,
     InvalidAmount = 3,
@@ -105,6 +142,8 @@ pub enum Error {
     /// `accept_admin` called with no `propose_admin` ever having been
     /// called (or one already consumed by a prior `accept_admin`).
     NoPendingAdmin = 5,
+    /// `seed_market` called with a `market_id` this vault already seeded.
+    MarketAlreadySeeded = 6,
 }
 
 #[contract]
@@ -117,16 +156,20 @@ impl Vault {
     /// `contracts/market` — see its "Why native XLM" section) — fixed once,
     /// not re-specified per call, so a `deposit`/`withdraw` can never be
     /// pointed at the wrong asset by mistake.
-    pub fn initialize(env: Env, admin: Address, collateral: Address) -> Result<(), Error> {
+    ///
+    /// A `__constructor` (#95), not a separate `initialize` entrypoint:
+    /// deploy + initialize as two transactions left a window where the
+    /// vault existed with no admin and no collateral, and anyone could race
+    /// the legitimate setup. The constructor runs atomically inside the
+    /// deploy invocation, so the vault is never observable unconfigured.
+    pub fn __constructor(env: Env, admin: Address, collateral: Address) {
         admin.require_auth();
-        if env.storage().instance().has(&STORAGE_KEY_ADMIN) {
-            return Err(Error::AlreadyInitialized);
-        }
         env.storage().instance().set(&STORAGE_KEY_ADMIN, &admin);
         env.storage().instance().set(&STORAGE_KEY_COLLATERAL, &collateral);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &0i128);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_WITHDRAWN, &0i128);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_REDEEMED, &0i128);
         touch(&env);
-        Ok(())
     }
 
     /// LP capital in. Anyone can deposit (permissionless funding, same
@@ -134,25 +177,30 @@ impl Vault {
     /// track per-depositor shares, so depositing is currently a one-way,
     /// admin-trusted contribution, not a redeemable LP position. Stated
     /// plainly in the module doc; not hidden in the implementation.
+    /// Rejected with `DepositsPaused` while `pause_deposits` is in effect.
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), Error> {
         from.require_auth();
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
         let collateral = Self::require_collateral(&env)?;
+        if Self::is_deposits_paused(env.clone()) {
+            return Err(Error::DepositsPaused);
+        }
         token::Client::new(&env, &collateral).transfer(&from, &env.current_contract_address(), &amount);
 
         let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_DEPOSITED).unwrap_or(0);
-        env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &(total + amount));
+        let new_total = total + amount;
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &new_total);
         touch(&env);
-        env.events().publish((symbol_short!("deposit"), from), amount);
+        env.events().publish((symbol_short!("deposit"), from), (amount, new_total));
         Ok(())
     }
 
     /// Admin-gated capital out — funds a new market's seed liquidity, or an
     /// LP redemption. Fails closed the same way every other admin-gated
     /// entrypoint in this system does (`AdminGuard`, `AuthRelayService`,
-    /// the wallet factory's `initialize`): wrong signer, no transfer. If
+    /// the wallet factory's constructor): wrong signer, no transfer. If
     /// `amount` exceeds what's actually here, the token transfer itself
     /// fails the whole call — no separate balance check needed, same as
     /// every other transfer in this system.
@@ -163,9 +211,41 @@ impl Vault {
         }
         let collateral = Self::require_collateral(&env)?;
         token::Client::new(&env, &collateral).transfer(&env.current_contract_address(), &to, &amount);
+
+        let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_WITHDRAWN).unwrap_or(0);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_WITHDRAWN, &(total + amount));
         touch(&env);
         env.events().publish((symbol_short!("withdraw"), to), amount);
         Ok(())
+    }
+
+    /// Admin-gated pause for `deposit` only (#41) — e.g. during a migration
+    /// or an admin-rotation window, when new capital shouldn't land in an
+    /// instance that's about to be retired. Deliberately independent of
+    /// `polaris-market`/`polaris-perpetual`'s `pause()` (#8), which gates
+    /// trading on those contracts, not capital flowing into this one.
+    /// `withdraw`, `redeem_from_market`, and admin rotation are never
+    /// blocked by this, so the admin can still move funds out while
+    /// deposits are halted. Idempotent: pausing an already-paused vault is a
+    /// no-op that still emits the event.
+    pub fn pause_deposits(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_DEPOSITS_PAUSED, &true);
+        touch(&env);
+        env.events().publish((symbol_short!("dpaused"),), ());
+        Ok(())
+    }
+
+    pub fn unpause_deposits(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_DEPOSITS_PAUSED, &false);
+        touch(&env);
+        env.events().publish((symbol_short!("dunpaused"),), ());
+        Ok(())
+    }
+
+    pub fn is_deposits_paused(env: Env) -> bool {
+        env.storage().instance().get(&STORAGE_KEY_DEPOSITS_PAUSED).unwrap_or(false)
     }
 
     /// Collects this vault's own payout from a settled/cancelled market it
@@ -179,9 +259,113 @@ impl Vault {
         Self::require_admin(&env, &admin)?;
         let market = market_contract::Client::new(&env, &market_id);
         let payout = market.redeem(&env.current_contract_address());
+
+        let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_REDEEMED).unwrap_or(0);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_REDEEMED, &(total + payout));
         touch(&env);
         env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
         Ok(payout)
+    }
+
+    /// Seeds a brand-new market directly from this vault's own balance —
+    /// no admin EOA in the middle. Calls the market's existing
+    /// `initialize` with `admin` and `treasury` both set to this vault's
+    /// address, and authorizes the market's own `transfer(admin, market,
+    /// initial_liquidity)` from the vault via
+    /// `authorize_as_current_contract`, so the seed capital moves
+    /// vault → market inside the same call. If `initialize` rejects
+    /// anything (bad expiry, bad fee bps, bad oracle config, …) the whole
+    /// call reverts and the vault's balance is untouched.
+    ///
+    /// `admin` is the vault's own admin, gated exactly like `withdraw` —
+    /// seeding is a capital deployment, not a permissionless action.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_market(
+        env: Env,
+        admin: Address,
+        market_id: Address,
+        collateral: Address,
+        strike_price: i128,
+        expiry: u64,
+        grace_period: u64,
+        lazer_contract: Address,
+        feed_id: u32,
+        base_fee_bps: u32,
+        min_fee_bps: u32,
+        initial_liquidity: i128,
+        reflector: market_contract::OracleFeedConfig,
+        redstone: Option<market_contract::OracleFeedConfig>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if initial_liquidity <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let vault = env.current_contract_address();
+        let mut seeded: soroban_sdk::Vec<Address> =
+            env.storage().instance().get(&STORAGE_KEY_MARKETS).unwrap_or(soroban_sdk::Vec::new(&env));
+        if seeded.contains(&market_id) {
+            return Err(Error::MarketAlreadySeeded);
+        }
+
+        // The market's `initialize` calls `collateral.transfer(admin, …)`
+        // with `admin` = this vault, so the SAC requires this contract's
+        // own authorization for that transfer. Authorize exactly that one
+        // invocation — not a blanket grant — and only for the duration of
+        // the `initialize` call below.
+        let token_client = token::Client::new(&env, &collateral);
+        env.authorize_as_current_contract(soroban_sdk::vec![
+            &env,
+            soroban_sdk::auth::InvokerContractAuthEntry::Contract(
+                soroban_sdk::auth::SubContractInvocation {
+                    context: soroban_sdk::auth::ContractContext {
+                        contract: collateral.clone(),
+                        fn_name: Symbol::new(&env, "transfer"),
+                        args: soroban_sdk::vec![
+                            &env,
+                            vault.to_val(),
+                            market_id.to_val(),
+                            initial_liquidity.into_val(&env),
+                        ],
+                    },
+                    sub_invocations: soroban_sdk::vec![&env],
+                },
+            ),
+        ]);
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+
+        let market = market_contract::Client::new(&env, &market_id);
+        market.initialize(
+            &vault, // admin = this vault
+            &collateral,
+            &strike_price,
+            &expiry,
+            &grace_period,
+            &lazer_contract,
+            &feed_id,
+            &base_fee_bps,
+            &min_fee_bps,
+            &vault, // treasury = this vault
+            &initial_liquidity,
+            &reflector,
+            &redstone,
+        );
+
+        seeded.push_back(market_id.clone());
+        env.storage().instance().set(&STORAGE_KEY_MARKETS, &seeded);
+        touch(&env);
+        env.events().publish((symbol_short!("mkt_seed"), market_id), initial_liquidity);
+        Ok(())
+    }
+
+    /// Every market this vault has seeded via `seed_market`.
+    pub fn get_seeded_markets(env: Env) -> soroban_sdk::Vec<Address> {
+        env.storage().instance().get(&STORAGE_KEY_MARKETS).unwrap_or(soroban_sdk::Vec::new(&env))
     }
 
     /// Step 1 of a two-step admin rotation. Deliberately not a single-call
@@ -239,6 +423,22 @@ impl Vault {
         env.storage()
             .instance()
             .get(&STORAGE_KEY_TOTAL_DEPOSITED)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Cumulative lifetime total ever withdrawn via `withdraw`.
+    pub fn get_total_withdrawn(env: Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_TOTAL_WITHDRAWN)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Cumulative lifetime total ever collected via `redeem_from_market`.
+    pub fn get_total_redeemed(env: Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_TOTAL_REDEEMED)
             .ok_or(Error::NotInitialized)
     }
 

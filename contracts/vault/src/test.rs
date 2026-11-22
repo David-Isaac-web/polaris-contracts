@@ -2,13 +2,47 @@
 extern crate std;
 
 use super::*;
-use market_contract::Client as MarketClient;
-use market_contract::OracleFeedConfig;
 use polaris_mock_lazer::MockLazer;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, Bytes, Env,
+    testutils::{Address as _, Events as _, Ledger},
+    token, Bytes, Env, IntoVal, Symbol, TryIntoVal,
 };
+
+/// `polaris-market`'s callable surface as this test needs it — the same
+/// hand-declared-client approach `lib.rs`'s `MarketContract` trait uses for
+/// `redeem`, extended here with the two entrypoints the integration test
+/// drives (`initialize`, `settle`). No `contractimport!`, so no compiled
+/// wasm is needed at *compile* time; the test still deploys a real market
+/// from its release wasm below, which is what actually exercises the
+/// cross-contract call.
+#[allow(dead_code)]
+#[soroban_sdk::contractclient(name = "MarketClient")]
+trait MarketTestContract {
+    fn initialize(
+        env: Env,
+        admin: Address,
+        collateral: Address,
+        strike_price: i128,
+        expiry: u64,
+        grace_period: u64,
+        lazer_contract: Address,
+        feed_id: u32,
+        base_fee_bps: u32,
+        min_fee_bps: u32,
+        treasury: Address,
+        initial_liquidity: i128,
+        reflector: OracleFeedConfig,
+        redstone: Option<OracleFeedConfig>,
+    ) -> Result<(), u32>;
+    fn settle(env: Env, payload: Bytes) -> Result<(), u32>;
+}
+
+/// Real compiled market wasm, built by
+/// `cargo build --release --target wasm32v1-none -p polaris-market` — a
+/// test-only build-order dependency (CI builds it first), not a compile-time
+/// one: nothing in this crate's own source reads it.
+const MARKET_WASM: &[u8] =
+    include_bytes!("../../../target/wasm32v1-none/release/polaris_market.wasm");
 
 const FEED_ID: u32 = 100;
 const DAY: u64 = 86_400;
@@ -20,44 +54,39 @@ const REFLECTOR_TOLERANCE_BPS: u32 = 150;
 /// Duplicated from `contracts/market/src/test.rs`'s own `mod mock_reflector`
 /// — same "exact copy, nothing vault-specific" precedent already set by
 /// `build_payload` below. This crate has no source dependency on
-/// `polaris-market` (only a compiled-wasm import via `contractimport!`, see
-/// the module doc on `market_contract` in `lib.rs`), so it can't share the
-/// Rust type declaration directly; the wasm's own internal code is what
-/// actually constructs `Asset`/`PriceData` when it calls `lastprice`, so
-/// this only needs matching XDR shape (variant/field order), not identity.
+/// `polaris-market` (only a hand-declared client trait, see the module doc
+/// on `MarketContract` in `lib.rs`), so it can't share the Rust type
+/// declaration directly; the wasm's own internal code is what actually
+/// constructs `Asset`/`PriceData` when it calls `lastprice`, so this only
+/// needs matching XDR shape (variant/field order), not identity.
 mod mock_reflector {
-    use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+    use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Map, Symbol};
 
-    #[contracttype(export = false)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub enum Asset {
-        Stellar(Address),
-        Other(Symbol),
-    }
+    use polaris_ctf_math::sep40::{Asset, PriceData};
 
-    #[contracttype(export = false)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct PriceData {
-        pub price: i128,
-        pub timestamp: u64,
-    }
-
-    const PRICE_KEY: Symbol = symbol_short!("px");
+    const PRICES_KEY: Symbol = symbol_short!("px");
 
     #[contract]
     pub struct MockReflector;
 
     #[contractimpl]
     impl MockReflector {
-        pub fn set_price(env: Env, price: i128, timestamp: u64) {
-            env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
+        /// Keyed by `asset`, like the real SEP-40 providers — a price set for
+        /// one asset is invisible to `lastprice` for any other, so a
+        /// mis-configured `OracleFeedConfig.asset` fails a test instead of
+        /// silently passing.
+        pub fn set_price(env: Env, asset: Asset, price: i128, timestamp: u64) {
+            let mut prices = Self::prices(&env);
+            prices.set(asset, (price, timestamp));
+            env.storage().instance().set(&PRICES_KEY, &prices);
         }
 
-        pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
-            env.storage()
-                .instance()
-                .get::<_, (i128, u64)>(&PRICE_KEY)
-                .map(|(price, timestamp)| PriceData { price, timestamp })
+        pub fn lastprice(env: Env, asset: Asset) -> Option<PriceData> {
+            Self::prices(&env).get(asset).map(|(price, timestamp)| PriceData { price, timestamp })
+        }
+
+        fn prices(env: &Env) -> Map<Asset, (i128, u64)> {
+            env.storage().instance().get(&PRICES_KEY).unwrap_or_else(|| Map::new(env))
         }
 
         pub fn decimals(_env: Env) -> u32 {
@@ -107,9 +136,7 @@ fn setup() -> Harness {
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
     let token_id = sac.address();
 
-    let vault_id = env.register(Vault, ());
-    let client = VaultClient::new(&env, &vault_id);
-    client.initialize(&admin, &token_id);
+    let vault_id = env.register(Vault, (&admin, &token_id));
 
     Harness { env, vault_id, admin, token_id }
 }
@@ -176,18 +203,90 @@ fn deposit_before_initialize_rejected() {
     let token_id = sac.address();
     token::StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000);
 
-    let vault_id = env.register(Vault, ());
+    // A vault can no longer be registered unconfigured: the constructor
+    // (#95) runs atomically with the deploy, so there is no window in which
+    // `deposit` could observe missing admin/collateral state.
+    let vault_id = env.register(Vault, (&admin, &token_id));
     let client = VaultClient::new(&env, &vault_id);
     let result = client.try_deposit(&admin, &100);
-    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+    assert!(result.is_ok(), "a constructed vault must be immediately usable");
+}
+
+#[test]
+fn initialize_emits_init_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let collateral = Address::generate(&env);
+    let vault_id = env.register(Vault, ());
+    VaultClient::new(&env, &vault_id).initialize(&admin, &collateral);
+
+    let (contract, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(contract, vault_id);
+    assert_eq!(topics, soroban_sdk::vec![&env, Symbol::new(&env, "init").into_val(&env)]);
+    let (got_admin, got_collateral): (Address, Address) = data.try_into_val(&env).unwrap();
+    assert_eq!(got_admin, admin);
+    assert_eq!(got_collateral, collateral);
 }
 
 #[test]
 fn double_initialize_rejected() {
     let h = setup();
     let client = VaultClient::new(&h.env, &h.vault_id);
+    // No `initialize` entrypoint exists any more (#95) — the constructor is
+    // the only setup path, and it runs exactly once, at deploy time.
     let result = client.try_initialize(&h.admin, &h.token_id);
-    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    assert!(result.is_err(), "initialize must no longer be callable");
+}
+
+// ---------- TTL policy (#148) ----------
+
+/// #11 added `touch()` (bumping the instance TTL to `BUMP_TO`) to every
+/// state-mutating entrypoint. This test proves the policy actually holds:
+/// after a deposit, the instance stays live right up to `BUMP_TO - 1`
+/// sequence numbers of inactivity, and the balance survives too.
+#[test]
+fn instance_and_balance_survive_within_the_ttl_window() {
+    let h = setup();
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 5_000);
+
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    client.deposit(&lp, &1_000);
+
+    // Advance to just inside the bumped window with no further activity.
+    let start = h.env.ledger().sequence();
+    h.env.ledger().set_sequence_number(start + BUMP_TO - 1);
+
+    // Instance (admin/token config) is still live and readable.
+    assert_eq!(client.get_admin(), h.admin);
+    assert_eq!(client.get_balance(), 1_000);
+    assert_eq!(client.get_total_deposited(), 1_000);
+
+    // The instance TTL was actually bumped by the deposit's `touch()`.
+    let ttl = h.env.storage().instance().get_ttl();
+    assert!(ttl > 0, "instance TTL must still be live inside the window");
+}
+
+/// Once the ledger advances past the bumped window with no activity, the
+/// instance entry archives as designed — a subsequent call must fail to
+/// read the (now archived) config rather than silently returning stale data.
+#[test]
+fn instance_archives_past_the_ttl_window() {
+    let h = setup();
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 5_000);
+
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    client.deposit(&lp, &1_000);
+
+    // Jump well past the bumped window with no activity at all.
+    let start = h.env.ledger().sequence();
+    h.env.ledger().set_sequence_number(start + BUMP_TO + 1);
+
+    // The instance entry is now archived (TTL exhausted).
+    let ttl = h.env.storage().instance().get_ttl();
+    assert_eq!(ttl, 0, "instance must archive once the TTL window lapses");
 }
 
 // ---------- admin rotation (#4) ----------
