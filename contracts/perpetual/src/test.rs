@@ -631,3 +631,187 @@ fn fee_starts_at_base_and_decays_toward_min_as_volume_grows() {
     assert_eq!(client.get_fee(), 60);
     assert_solvent(&h);
 }
+
+// ---------- event schema (#39) ----------
+
+use soroban_sdk::testutils::Events as _;
+use soroban_sdk::{symbol_short, Symbol, TryFromVal, Val};
+
+/// See `polaris-market/src/test.rs`'s `last_market_event` — same helper.
+fn last_event(h: &Harness) -> (Symbol, std::vec::Vec<Val>, Val) {
+    let evs = h.env.events().all().filter_by_contract(&h.market_id);
+    let e = evs.events().last().expect("expected an event from the perpetual contract").clone();
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = e.body;
+    let topics: std::vec::Vec<Val> =
+        body.topics.iter().map(|t| Val::try_from_val(&h.env, t).unwrap()).collect();
+    let name = Symbol::try_from_val(&h.env, &topics[0]).unwrap();
+    let data = Val::try_from_val(&h.env, &body.data).unwrap();
+    (name, topics, data)
+}
+
+fn decode<T: TryFromVal<Env, Val>>(h: &Harness, v: &Val) -> T {
+    T::try_from_val(&h.env, v).unwrap_or_else(|_| panic!("event field did not decode as the documented type"))
+}
+
+#[test]
+fn init_event_carries_fee_curve_and_parties() {
+    let h = setup(10_000, true);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("init"));
+    let decoded: (i128, u32, u32, Address, Address, Address) = decode(&h, &data);
+    assert_eq!(decoded, (10_000, 100, 20, h.admin.clone(), h.treasury.clone(), h.token_id.clone()));
+}
+
+#[test]
+fn trade_terminate_and_redeem_events_carry_post_call_state() {
+    let h = setup(10_000, true);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+
+    client.split(&user, &500);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("split"));
+    assert_eq!(decode::<(i128, i128)>(&h, &data), (500, client.get_market().total_supply));
+
+    let fee = client.get_fee();
+    let total = client.buy(&user, &Prediction::No, &1_000, &0);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("buy"));
+    let (c, bonus, fee_bps, py, pn, ts): (i128, i128, u32, i128, i128, i128) = decode(&h, &data);
+    let m = client.get_market();
+    assert_eq!((c + bonus, fee_bps), (total, fee));
+    assert_eq!((py, pn, ts), (m.pool_yes, m.pool_no, m.total_supply));
+
+    client.terminate(&h.admin);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("term"));
+    assert_eq!(decode::<(Address, i128, i128)>(&h, &data), (h.treasury.clone(), m.pool_yes, m.pool_no));
+
+    let (by, bn) = client.get_position(&user);
+    let payout = client.redeem(&user);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("redeem"));
+    assert_eq!(
+        decode::<(i128, i128, i128, i128)>(&h, &data),
+        (payout, by, bn, client.get_market().total_supply)
+    );
+    assert_solvent(&h);
+}
+
+// ---------- set_fee_curve (#42): decrease-only ----------
+
+#[test]
+fn set_fee_curve_lowers_fee_and_rejects_any_increase() {
+    let h = setup(10_000, true); // base=100, min=20
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+
+    assert_eq!(client.try_set_fee_curve(&101, &20), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    assert_eq!(client.try_set_fee_curve(&100, &21), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    assert_eq!(client.try_set_fee_curve(&10, &15), Err(Ok(Error::InvalidFeeBps)));
+    assert_eq!(client.get_fee(), 100);
+
+    client.set_fee_curve(&40, &5);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+    let (name, _, data) = last_event(&h);
+    assert_eq!(name, symbol_short!("fee_set"));
+    assert_eq!(decode::<(u32, u32, u32, u32)>(&h, &data), (100, 20, 40, 5));
+    assert_eq!(client.get_fee(), 40);
+}
+
+#[test]
+fn set_fee_curve_rejected_once_terminated() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    client.terminate(&h.admin);
+    assert_eq!(client.try_set_fee_curve(&50, &10), Err(Ok(Error::MarketNotOpen)));
+}
+
+// ---------- full lifecycle acceptance test (#54) ----------
+
+/// initialize -> buy -> checkpoint -> terminate -> redeem, chained in one
+/// test with the solvency invariant asserted after every step, and with a
+/// configured price oracle. Each stage is already covered alone (see
+/// `buy_yes_moves_price_up`, `checkpoint_records_price_and_changes_nothing_else`,
+/// `terminate_needs_no_price_and_pays_every_holder_at_merge_parity`). This
+/// checks that they compose. Two directional buyers on opposite sides plus
+/// the treasury's seeded pool give `redeem` three holders with lopsided
+/// YES/NO balances, the case the 0.5-per-share formula has to keep solvent.
+#[test]
+fn full_lifecycle_initialize_buy_checkpoint_terminate_redeem_stays_solvent_throughout() {
+    let token = |h: &Harness| token::Client::new(&h.env, &h.token_id);
+
+    // 1. initialize, with Lazer + Reflector + RedStone all configured.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    assert!(client.get_price_oracle().is_some());
+    assert_eq!(client.get_market().status, PerpetualStatus::Open);
+    assert_solvent(&h);
+
+    // 2. buy: one bettor each side.
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    fund(&h, &alice, 5_000);
+    fund(&h, &bob, 5_000);
+    let alice_yes = client.buy(&alice, &Prediction::Yes, &2_000, &0);
+    assert_solvent(&h);
+    let bob_no = client.buy(&bob, &Prediction::No, &1_000, &0);
+    assert_solvent(&h);
+    assert_eq!(client.get_position(&alice), (alice_yes, 0));
+    assert_eq!(client.get_position(&bob), (0, bob_no));
+    let pre_checkpoint = client.get_market();
+    assert_eq!(pre_checkpoint.total_supply, 10_000 + 2_000 + 1_000);
+
+    // 3. checkpoint, some time later: a fresh, mutually agreeing price
+    // from all three oracles. Records the price and changes nothing else.
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 3_600);
+    let now = h.env.ledger().timestamp();
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
+    client.record_price_checkpoint(&Bytes::from_slice(&h.env, &payload));
+    let post_checkpoint = client.get_market();
+    assert_eq!((post_checkpoint.last_price_cents, post_checkpoint.last_price_at), (1_000_000, now));
+    assert_eq!(
+        (post_checkpoint.pool_yes, post_checkpoint.pool_no, post_checkpoint.total_supply),
+        (pre_checkpoint.pool_yes, pre_checkpoint.pool_no, pre_checkpoint.total_supply),
+        "a checkpoint has zero economic effect"
+    );
+    assert_eq!(client.get_position(&alice), (alice_yes, 0));
+    assert_eq!(client.get_position(&bob), (0, bob_no));
+    assert_solvent(&h);
+
+    // 4. terminate: pools swept to the treasury; supply and collateral untouched.
+    client.terminate(&h.admin);
+    let terminated = client.get_market();
+    assert_eq!(terminated.status, PerpetualStatus::Terminated);
+    assert_eq!((terminated.pool_yes, terminated.pool_no), (0, 0));
+    assert_eq!(terminated.total_supply, pre_checkpoint.total_supply);
+    assert_eq!(client.get_position(&h.treasury), (pre_checkpoint.pool_yes, pre_checkpoint.pool_no));
+    assert_solvent(&h);
+
+    // 5. redeem every holder, solvency after each one.
+    let mut paid = 0i128;
+    for holder in [&alice, &bob, &h.treasury] {
+        let (by, bn) = client.get_position(holder);
+        let before = token(&h).balance(holder);
+        let payout = client.redeem(holder);
+        assert_eq!(payout, (by + bn) / 2);
+        assert_eq!(token(&h).balance(holder) - before, payout);
+        assert_eq!(client.get_position(holder), (0, 0));
+        paid += payout;
+        assert_solvent(&h);
+    }
+
+    // Each side's shares sum to total_supply, so the three payouts add up to
+    // total_supply less per-holder floor-division dust (< 1 unit each).
+    let residual = client.get_market().total_supply;
+    assert_eq!(paid + residual, terminated.total_supply);
+    assert!((0..3).contains(&residual), "only rounding dust may remain, got {residual}");
+    assert_eq!(token(&h).balance(&h.market_id), residual);
+
+    // Nothing left for anyone to claim twice.
+    assert_eq!(client.try_redeem(&alice), Err(Ok(Error::NothingToRedeem)));
+}

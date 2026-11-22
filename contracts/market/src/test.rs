@@ -1139,6 +1139,58 @@ fn cancel_after_grace_refunds_a_matched_pair_at_merge_parity() {
 }
 
 #[test]
+fn cancel_with_zero_trades_ever_returns_the_full_seed_liquidity_to_treasury() {
+    // #52: `initialize` only — no split/buy/anything from anyone, ever —
+    // then nobody settles and the market is cancelled after the grace
+    // period. Intended behavior, stated here because it wasn't anywhere
+    // else: the seed liquidity IS fully recoverable, at par, by `treasury`
+    // and only by `treasury`. `cancel` credits treasury the whole AMM pool
+    // (`pool_yes == pool_no == initial_liquidity` YES and NO shares — the
+    // pool is never touched with zero trades), and the cancelled-market
+    // `(by + bn) / 2` formula turns that matched pair back into exactly
+    // `initial_liquidity` collateral. No special-casing: the same path
+    // every other cancelled-market holder goes through.
+    let liquidity = 10_000;
+    let h = setup(1_000_000, liquidity);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let tok = token::Client::new(&h.env, &h.token_id);
+
+    // Sanity: genuinely zero positions minted beyond the seed itself.
+    let m = client.get_market();
+    assert_eq!(m.total_supply, liquidity);
+    assert_eq!(client.get_position(&h.treasury), (0, 0));
+    assert_eq!(tok.balance(&h.market_id), liquidity);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+
+    let m = client.get_market();
+    assert_eq!(m.status, MarketStatus::Cancelled);
+    assert_eq!((m.pool_yes, m.pool_no), (0, 0));
+    // The entire pool moved to treasury as an ordinary share position.
+    assert_eq!(client.get_position(&h.treasury), (liquidity, liquidity));
+    assert_solvent(&h);
+
+    // Nobody else holds anything — a random address can't claim the seed.
+    let stranger = Address::generate(&h.env);
+    assert_eq!(client.try_redeem(&stranger), Err(Ok(Error::NothingToRedeem)));
+
+    let before = tok.balance(&h.treasury);
+    let payout = client.redeem(&h.treasury);
+    assert_eq!(payout, liquidity, "zero trades: treasury gets back exactly the seed, at par");
+    assert_eq!(tok.balance(&h.treasury) - before, liquidity);
+
+    // Fully drained, nothing stranded, and invariant still holds at zero.
+    let m = client.get_market();
+    assert_eq!(m.total_supply, 0);
+    assert_eq!(tok.balance(&h.market_id), 0);
+    assert_solvent(&h);
+
+    // One-shot: the position was zeroed, a second redeem pays nothing.
+    assert_eq!(client.try_redeem(&h.treasury), Err(Ok(Error::NothingToRedeem)));
+}
+
+#[test]
 fn cancel_refunds_directional_bettor_half_value_no_counterparty_needed() {
     // The scenario the original parimutuel design special-cased ("empty
     // winning pool"): a single bettor takes a directional position and the
@@ -1335,4 +1387,371 @@ fn cancel_redeem_stays_solvent_for_every_holder_including_treasury() {
 
     assert_eq!(user_payout + treasury_payout, 11_000); // == total_supply at cancellation, exactly
     assert_solvent(&h);
+}
+
+// ---------- event schema (#39): enough state to rebuild history with no polling ----------
+
+use soroban_sdk::testutils::Events as _;
+use soroban_sdk::{TryFromVal, Val};
+
+/// The most recent event this market contract emitted, decoded from XDR.
+/// `events().all()` only covers the last top-level invocation, and token
+/// transfer events come from the SAC's address, so filtering by
+/// `market_id` leaves exactly the one event the call under test published.
+fn last_market_event(h: &Harness) -> (Symbol, std::vec::Vec<Val>, Val) {
+    let evs = h.env.events().all().filter_by_contract(&h.market_id);
+    let e = evs.events().last().expect("expected an event from the market contract").clone();
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = e.body;
+    let topics: std::vec::Vec<Val> =
+        body.topics.iter().map(|t| Val::try_from_val(&h.env, t).unwrap()).collect();
+    let name = Symbol::try_from_val(&h.env, &topics[0]).unwrap();
+    let data = Val::try_from_val(&h.env, &body.data).unwrap();
+    (name, topics, data)
+}
+
+fn decode<T: TryFromVal<Env, Val>>(h: &Harness, v: &Val) -> T {
+    T::try_from_val(&h.env, v).unwrap_or_else(|_| panic!("event field did not decode as the documented type"))
+}
+
+#[test]
+fn init_event_carries_every_parameter_an_indexer_needs_to_bootstrap() {
+    let h = setup(1_000_000, 10_000);
+    let (name, _, data) = last_market_event(&h);
+    assert_eq!(name, symbol_short!("init"));
+    let (strike, expiry, grace, feed_id, base, min, liq, admin, treasury, collateral): (
+        i128, u64, u64, u32, u32, u32, i128, Address, Address, Address,
+    ) = decode(&h, &data);
+    assert_eq!((strike, expiry, grace, feed_id), (1_000_000, h.expiry, h.grace, FEED_ID));
+    assert_eq!((base, min, liq), (100, 20, 10_000));
+    assert_eq!((admin, treasury, collateral), (h.admin.clone(), h.treasury.clone(), h.token_id.clone()));
+}
+
+#[test]
+fn buy_and_sell_events_carry_fee_rate_and_post_trade_pool_state() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    let fee_before_buy = client.get_fee();
+    let total_yes = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let (name, topics, data) = last_market_event(&h);
+    assert_eq!(name, symbol_short!("buy"));
+    assert_eq!(decode::<Address>(&h, &topics[1]), user);
+    assert_eq!(decode::<Prediction>(&h, &topics[2]), Prediction::Yes);
+    let (collateral_in, bonus, fee_bps, pool_yes, pool_no, total_supply): (i128, i128, u32, i128, i128, i128) =
+        decode(&h, &data);
+    let m = client.get_market();
+    assert_eq!(collateral_in, 1_000);
+    assert_eq!(collateral_in + bonus, total_yes, "leading fields keep their original meaning");
+    assert_eq!(fee_bps, fee_before_buy, "the fee actually charged, i.e. the pre-trade rate");
+    assert_eq!((pool_yes, pool_no, total_supply), (m.pool_yes, m.pool_no, m.total_supply));
+
+    let fee_before_sell = client.get_fee();
+    let collateral_out = client.sell(&user, &Prediction::Yes, &500, &0);
+    let (name, _, data) = last_market_event(&h);
+    assert_eq!(name, symbol_short!("sell"));
+    let (shares_in, out, fee_bps, pool_yes, pool_no, total_supply): (i128, i128, u32, i128, i128, i128) =
+        decode(&h, &data);
+    let m = client.get_market();
+    assert_eq!((shares_in, out, fee_bps), (500, collateral_out, fee_before_sell));
+    assert_eq!((pool_yes, pool_no, total_supply), (m.pool_yes, m.pool_no, m.total_supply));
+    assert_solvent(&h);
+}
+
+#[test]
+fn settle_event_records_source_and_the_treasury_pool_sweep() {
+    for via_reflector in [false, true] {
+        let h = setup(1_000_000, 10_000);
+        let user = Address::generate(&h.env);
+        fund(&h, &user, 5_000);
+        let client = PolarisMarketClient::new(&h.env, &h.market_id);
+        client.buy(&user, &Prediction::Yes, &1_000, &0);
+        let pre = client.get_market();
+
+        h.env.ledger().set_timestamp(h.expiry);
+        set_reflector_price_cents(&h, 1_000_000);
+        if via_reflector {
+            client.settle_via_reflector();
+        } else {
+            let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+            client.settle(&Bytes::from_slice(&h.env, &payload));
+        }
+
+        let (name, _, data) = last_market_event(&h);
+        assert_eq!(name, symbol_short!("settle"));
+        let (status, final_cents, source, treasury, swept_yes, swept_no): (
+            MarketStatus, i128, Symbol, Address, i128, i128,
+        ) = decode(&h, &data);
+        assert_eq!((status, final_cents), (MarketStatus::ResolvedYes, 1_000_000));
+        let expected_source = if via_reflector { symbol_short!("reflector") } else { symbol_short!("lazer") };
+        assert_eq!(source, expected_source);
+        assert_eq!(treasury, h.treasury);
+        assert_eq!((swept_yes, swept_no), (pre.pool_yes, pre.pool_no));
+        assert_eq!(client.get_position(&h.treasury), (pre.pool_yes, pre.pool_no));
+    }
+}
+
+#[test]
+fn cancel_and_redeem_events_carry_sweep_and_burned_balances() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.buy(&user, &Prediction::No, &1_000, &0);
+    let pre = client.get_market();
+    let (by, bn) = client.get_position(&user);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+    let (name, _, data) = last_market_event(&h);
+    assert_eq!(name, symbol_short!("cancel"));
+    let (treasury, swept_yes, swept_no): (Address, i128, i128) = decode(&h, &data);
+    assert_eq!((treasury, swept_yes, swept_no), (h.treasury.clone(), pre.pool_yes, pre.pool_no));
+
+    let payout = client.redeem(&user);
+    let (name, topics, data) = last_market_event(&h);
+    assert_eq!(name, symbol_short!("redeem"));
+    assert_eq!(decode::<Address>(&h, &topics[1]), user);
+    let (p, burned_yes, burned_no, total_supply): (i128, i128, i128, i128) = decode(&h, &data);
+    assert_eq!((p, burned_yes, burned_no), (payout, by, bn));
+    assert_eq!(total_supply, client.get_market().total_supply);
+    assert_solvent(&h);
+}
+
+/// What an indexer would actually do: hold a shadow copy of the market,
+/// updated only by folding each emitted event, never by calling
+/// `get_market()` or `get_position()`. After a full mixed-flow lifecycle,
+/// the shadow must match on-chain state exactly, which proves the schema
+/// carries enough to rebuild history without polling.
+#[test]
+fn an_event_only_indexer_reconstructs_the_full_market_state_exactly() {
+    #[derive(Default)]
+    struct Shadow {
+        pool_yes: i128,
+        pool_no: i128,
+        total_supply: i128,
+        status: Option<MarketStatus>,
+        treasury: Option<Address>,
+        fees_seen: std::vec::Vec<u32>,
+        holders: std::vec::Vec<(Address, i128, i128)>,
+    }
+    impl Shadow {
+        fn bal(&mut self, a: &Address) -> &mut (Address, i128, i128) {
+            if let Some(i) = self.holders.iter().position(|(x, _, _)| x == a) {
+                return &mut self.holders[i];
+            }
+            self.holders.push((a.clone(), 0, 0));
+            self.holders.last_mut().unwrap()
+        }
+        fn add(&mut self, a: &Address, side: Prediction, delta: i128) {
+            let b = self.bal(a);
+            match side {
+                Prediction::Yes => b.1 += delta,
+                Prediction::No => b.2 += delta,
+            }
+        }
+    }
+
+    fn fold(h: &Harness, s: &mut Shadow) {
+        let (name, topics, data) = last_market_event(h);
+        let topic_addr = |i: usize| decode::<Address>(h, &topics[i]);
+        if name == symbol_short!("init") {
+            let (_, _, _, _, _, _, liq, _, treasury, _): (
+                i128, u64, u64, u32, u32, u32, i128, Address, Address, Address,
+            ) = decode(h, &data);
+            s.pool_yes = liq;
+            s.pool_no = liq;
+            s.total_supply = liq;
+            s.treasury = Some(treasury);
+            s.status = Some(MarketStatus::Open);
+        } else if name == symbol_short!("split") || name == symbol_short!("merge") {
+            let (amount, ts): (i128, i128) = decode(h, &data);
+            let sign = if name == symbol_short!("split") { 1 } else { -1 };
+            let u = topic_addr(1);
+            s.add(&u, Prediction::Yes, sign * amount);
+            s.add(&u, Prediction::No, sign * amount);
+            s.total_supply = ts;
+        } else if name == symbol_short!("buy") {
+            let (c, bonus, fee, py, pn, ts): (i128, i128, u32, i128, i128, i128) = decode(h, &data);
+            let side = decode::<Prediction>(h, &topics[2]);
+            s.add(&topic_addr(1), side, c + bonus); // the opposite side nets to zero
+            (s.pool_yes, s.pool_no, s.total_supply) = (py, pn, ts);
+            s.fees_seen.push(fee);
+        } else if name == symbol_short!("sell") {
+            let (shares_in, _, fee, py, pn, ts): (i128, i128, u32, i128, i128, i128) = decode(h, &data);
+            let side = decode::<Prediction>(h, &topics[2]);
+            s.add(&topic_addr(1), side, -shares_in);
+            (s.pool_yes, s.pool_no, s.total_supply) = (py, pn, ts);
+            s.fees_seen.push(fee);
+        } else if name == symbol_short!("xfer") {
+            let amount: i128 = decode(h, &data);
+            let side = decode::<Prediction>(h, &topics[3]);
+            s.add(&topic_addr(1), side, -amount);
+            s.add(&topic_addr(2), side, amount);
+        } else if name == symbol_short!("settle") {
+            let (status, _, _, treasury, sy, sn): (MarketStatus, i128, Symbol, Address, i128, i128) =
+                decode(h, &data);
+            s.add(&treasury, Prediction::Yes, sy);
+            s.add(&treasury, Prediction::No, sn);
+            (s.pool_yes, s.pool_no) = (0, 0);
+            s.status = Some(status);
+        } else if name == symbol_short!("redeem") {
+            let (_, by, bn, ts): (i128, i128, i128, i128) = decode(h, &data);
+            let b = s.bal(&topic_addr(1));
+            assert_eq!((b.1, b.2), (by, bn), "indexer's balances must match what redeem burned");
+            (b.1, b.2) = (0, 0);
+            s.total_supply = ts;
+        } else {
+            panic!("unexpected event in this flow");
+        }
+    }
+
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let mut s = Shadow::default();
+    fold(&h, &mut s); // init
+
+    let (a, b, c) = (Address::generate(&h.env), Address::generate(&h.env), Address::generate(&h.env));
+    for u in [&a, &b] {
+        fund(&h, u, 50_000);
+    }
+    client.buy(&a, &Prediction::Yes, &2_000, &0);
+    fold(&h, &mut s);
+    client.buy(&b, &Prediction::No, &1_500, &0);
+    fold(&h, &mut s);
+    client.split(&b, &3_000);
+    fold(&h, &mut s);
+    client.sell(&a, &Prediction::Yes, &700, &0);
+    fold(&h, &mut s);
+    client.transfer(&a, &c, &Prediction::Yes, &400);
+    fold(&h, &mut s);
+    client.merge(&b, &1_000);
+    fold(&h, &mut s);
+
+    // Mid-flow: pools/supply and every holder's position already match.
+    let m = client.get_market();
+    assert_eq!((s.pool_yes, s.pool_no, s.total_supply), (m.pool_yes, m.pool_no, m.total_supply));
+
+    h.env.ledger().set_timestamp(h.expiry);
+    set_reflector_price_cents(&h, 900_000); // $9,000 < $10,000 strike
+    let payload = build_payload(FEED_ID, 9_000_00000000, -8, h.expiry * 1_000_000);
+    client.settle(&Bytes::from_slice(&h.env, &payload));
+    fold(&h, &mut s);
+    assert_eq!(s.status, Some(MarketStatus::ResolvedNo));
+
+    for u in [&a, &b, &c] {
+        let (by, bn) = client.get_position(u);
+        let sh = s.bal(u).clone();
+        assert_eq!((sh.1, sh.2), (by, bn), "pre-redeem position must match for every holder");
+    }
+    let treasury = s.treasury.clone().unwrap();
+    for u in [&b, &c, &treasury] {
+        if client.get_position(u).1 > 0 {
+            client.redeem(u);
+            fold(&h, &mut s);
+        }
+    }
+
+    let m = client.get_market();
+    assert_eq!((s.pool_yes, s.pool_no, s.total_supply), (m.pool_yes, m.pool_no, m.total_supply));
+    assert_eq!(s.status, Some(m.status));
+    for (addr, y, n) in s.holders.clone() {
+        assert_eq!(client.get_position(&addr), (y, n), "every holder's position must match");
+    }
+    assert!(s.fees_seen.iter().all(|f| (20..=100).contains(f)));
+    assert_solvent(&h);
+}
+
+// ---------- set_fee_curve (#42): decrease-only ----------
+
+#[test]
+fn set_fee_curve_lowers_the_live_fee_and_emits_old_and_new_values() {
+    let h = setup(1_000_000, 10_000); // base=100, min=20
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    assert_eq!(client.get_fee(), 100);
+
+    client.set_fee_curve(&50, &10);
+    let (name, _, data) = last_market_event(&h);
+    assert_eq!(name, symbol_short!("fee_set"));
+    assert_eq!(decode::<(u32, u32, u32, u32)>(&h, &data), (100, 20, 50, 10));
+
+    let m = client.get_market();
+    assert_eq!((m.base_fee_bps, m.min_fee_bps), (50, 10));
+    assert_eq!(client.get_fee(), 50);
+
+    // The lowered curve is what buy actually charges.
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let (_, _, data) = last_market_event(&h);
+    let (_, _, fee_bps, _, _, _): (i128, i128, u32, i128, i128, i128) = decode(&h, &data);
+    assert_eq!(fee_bps, 50);
+    assert_solvent(&h);
+}
+
+#[test]
+fn set_fee_curve_rejects_any_increase_and_leaves_the_curve_untouched() {
+    let h = setup(1_000_000, 10_000); // base=100, min=20
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+
+    assert_eq!(client.try_set_fee_curve(&101, &20), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    assert_eq!(client.try_set_fee_curve(&100, &21), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    // Lowering base while raising min still raises the low-volume end's floor.
+    assert_eq!(client.try_set_fee_curve(&80, &30), Err(Ok(Error::FeeIncreaseNotAllowed)));
+    // Ordering invariant still enforced, same error as initialize.
+    assert_eq!(client.try_set_fee_curve(&10, &15), Err(Ok(Error::InvalidFeeBps)));
+
+    let m = client.get_market();
+    assert_eq!((m.base_fee_bps, m.min_fee_bps), (100, 20));
+
+    // A no-op (equal values) is allowed; lowering to zero fee is allowed.
+    client.set_fee_curve(&100, &20);
+    client.set_fee_curve(&0, &0);
+    assert_eq!(client.get_fee(), 0);
+}
+
+#[test]
+fn set_fee_curve_requires_admin_auth() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.set_fee_curve(&50, &10);
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+}
+
+#[test]
+fn set_fee_curve_rejected_once_the_market_is_finalized() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+    assert_eq!(client.try_set_fee_curve(&50, &10), Err(Ok(Error::MarketNotOpen)));
+}
+
+/// The safety claim `set_fee_curve`'s doc comment rests on: if neither bound
+/// rises, the effective fee is never higher at *any* `total_supply`.
+/// Brute-forced over a grid against the shared curve both contracts use,
+/// so floor rounding is checked too, not just the continuous formula.
+#[test]
+fn a_decrease_only_change_never_charges_more_at_any_total_supply() {
+    let liq = 10_000i128;
+    let supplies = [liq, liq + 1, liq + 3, 13_333, 20_000, 99_999, 1_000_000, 123_456_789];
+    for old_base in (0..=1_000u32).step_by(50) {
+        for old_min in (0..=old_base).step_by(25) {
+            for new_base in (0..=old_base).step_by(35) {
+                for new_min in (0..=new_base.min(old_min)).step_by(15) {
+                    for ts in supplies {
+                        let old = polaris_ctf_math::effective_fee_bps(old_base, old_min, liq, ts);
+                        let new = polaris_ctf_math::effective_fee_bps(new_base, new_min, liq, ts);
+                        assert!(
+                            new <= old,
+                            "({old_base},{old_min}) -> ({new_base},{new_min}) at supply {ts}: {old} -> {new}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
