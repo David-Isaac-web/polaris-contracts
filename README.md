@@ -1131,14 +1131,8 @@ that applies to fund-safety-critical code.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-138 -->
-- #138: ctf-math: staleness boundary (price.timestamp + max_staleness == now) is untested
+<!-- handsoff-issue-154 -->
+- #154: README says assert_solvent() runs after every test; only about 18 of 48 market tests call it
 
-<!-- handsoff-issue-139 -->
-- #139: contracts/perpetual: no permissionless wind-down backstop; terminate() is admin-only forever
-
-<!-- handsoff-issue-140 -->
-- #140: contracts/market+perpetual: initialize() accepts treasury == the contract's own address, permanently stranding the seed liquidity
-
-<!-- handsoff-issue-141 -->
-- #141: contracts/market+perpetual: pause()/unpause() aren't idempotent; repeated calls emit duplicate events
+<!-- handsoff-issue-157 -->
+- #157: contracts/market: no aggregate read; clients need three or more RPC calls (get_market, is_paused, get_redstone_oracle, get_fee, get_price) per market
