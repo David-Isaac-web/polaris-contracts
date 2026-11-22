@@ -4,7 +4,7 @@
 //!
 //! Additive, isolated, zero changes to `contracts/market`. What this
 //! actually fixes: today, every new market's `initial_liquidity` is wired
-//! from the admin's own keypair by hand at `initialize()` time, and that
+//! from the admin's own keypair by hand at construction time, and that
 //! seed capital sits siloed in that one market's own reserves for its
 //! entire life — recovered only at settlement, into a bare `treasury`
 //! wallet address with no accounting at all. Fragmented capital, manual
@@ -32,33 +32,30 @@
 //! product would need share accounting before this is safe to open past a
 //! single trusted operator.
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, InvokeError, Symbol, Vec,
-};
+use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, token, Address, Env, Symbol};
 
-use polaris_ctf_math::OracleFeedConfig;
-
-/// `polaris-market`'s callable surface, hand-declared rather than imported
-/// from its compiled wasm. Deliberately not a source dependency on the
-/// `polaris-market` crate: depending on it directly (for its generated
-/// `PolarisMarketClient`) pulls its `#[contract]`-exported wasm symbols into
-/// *this* contract's own compiled output — confirmed the hard way: `cargo
-/// build --release --target wasm32v1-none` linked "successfully" but warned
-/// `function signature mismatch: initialize`, because both contracts export
-/// a same-named function and the linker was merging them into one binary.
-/// This used to be a `contractimport!` of the market's release wasm, which
-/// worked but made `cargo test -p polaris-vault` depend on a prior
-/// `cargo build -p polaris-market` — a build-order dependency invisible to
-/// Cargo's own graph. A hand-declared `#[contractclient]` trait generates
-/// the same byte-correct client (Soroban's wire encoding is structural, not
-/// identity-based) with no wasm file involved at all. Only the entrypoints
-/// this vault actually calls are declared; `try_redeem` is the generated
-/// `Result`-returning variant, so a market-side error surfaces as `Err`
-/// instead of trapping.
-#[allow(dead_code)]
-#[soroban_sdk::contractclient(name = "MarketClient")]
-pub trait MarketContract {
-    fn redeem(env: Env, user: Address) -> Result<i128, u32>;
+/// Imports `polaris-market`'s client from its *compiled wasm's own spec* —
+/// deliberately not a source dependency on the `polaris-market` crate.
+/// Depending on that crate directly (for its generated `PolarisMarketClient`)
+/// pulls its `#[contract]`-exported wasm symbols into *this* contract's own
+/// compiled output — confirmed the hard way: `cargo build --release
+/// --target wasm32v1-none` linked "successfully" but warned `function
+/// signature mismatch: __constructor`, because both contracts export a
+/// same-named function and the linker was merging them into one binary.
+/// `contractimport!` reads the target wasm's embedded interface spec at
+/// compile time (the same spec `polaris-oracle`'s `contract.Spec.fromWasm`
+/// reads at runtime) to generate a byte-correct client — including the
+/// right `Result<T, Error>` unwrapping for `redeem` — without linking in
+/// any of that wasm's actual executable code. Path is relative to this
+/// crate's own directory (`contracts/vault/`), confirmed empirically —
+/// the SDK's own doc comment on `contractimport!` claims "relative to the
+/// workspace root," which did not hold for this soroban-sdk version.
+/// Requires `polaris-market`'s release wasm already built (`cargo build
+/// --release --target wasm32v1-none -p polaris-market`), same build-order
+/// dependency the top-level README already documents for wiring the
+/// compiled wasm into `polaris-oracle`.
+mod market_contract {
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/polaris_market.wasm");
 }
 
 /// Same TTL bump market/perpetual already use (~31 days at 5s/ledger) —
@@ -120,6 +117,8 @@ const STORAGE_KEY_MARKETS: Symbol = symbol_short!("markets");
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 #[repr(u32)]
 pub enum Error {
+    /// Retained for ABI stability; the constructor (#95) can no longer
+    /// report it — a second deploy at the same address fails in the host.
     AlreadyInitialized = 1,
     NotInitialized = 2,
     InvalidAmount = 3,
@@ -141,19 +140,20 @@ impl Vault {
     /// `contracts/market` — see its "Why native XLM" section) — fixed once,
     /// not re-specified per call, so a `deposit`/`withdraw` can never be
     /// pointed at the wrong asset by mistake.
-    pub fn initialize(env: Env, admin: Address, collateral: Address) -> Result<(), Error> {
+    ///
+    /// A `__constructor` (#95), not a separate `initialize` entrypoint:
+    /// deploy + initialize as two transactions left a window where the
+    /// vault existed with no admin and no collateral, and anyone could race
+    /// the legitimate setup. The constructor runs atomically inside the
+    /// deploy invocation, so the vault is never observable unconfigured.
+    pub fn __constructor(env: Env, admin: Address, collateral: Address) {
         admin.require_auth();
-        if env.storage().instance().has(&STORAGE_KEY_ADMIN) {
-            return Err(Error::AlreadyInitialized);
-        }
         env.storage().instance().set(&STORAGE_KEY_ADMIN, &admin);
         env.storage().instance().set(&STORAGE_KEY_COLLATERAL, &collateral);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &0i128);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_WITHDRAWN, &0i128);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_REDEEMED, &0i128);
         touch(&env);
-        env.events().publish((symbol_short!("init"),), (admin, collateral));
-        Ok(())
     }
 
     /// LP capital in. Anyone can deposit (permissionless funding, same
@@ -184,7 +184,7 @@ impl Vault {
     /// Admin-gated capital out — funds a new market's seed liquidity, or an
     /// LP redemption. Fails closed the same way every other admin-gated
     /// entrypoint in this system does (`AdminGuard`, `AuthRelayService`,
-    /// the wallet factory's `initialize`): wrong signer, no transfer. If
+    /// the wallet factory's constructor): wrong signer, no transfer. If
     /// `amount` exceeds what's actually here, the token transfer itself
     /// fails the whole call — no separate balance check needed, same as
     /// every other transfer in this system.
