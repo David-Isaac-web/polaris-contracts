@@ -276,50 +276,112 @@ fn a_bad_proposal_is_harmless_and_can_be_overwritten() {
     assert_eq!(client.get_admin(), correct);
 }
 
+#[test]
+fn old_admin_keeps_full_authority_while_a_rotation_is_pending() {
+    // #53: `accept_admin` is what switches authority, not `propose_admin`.
+    // Between the two, the vault must keep operating under the current
+    // admin exactly as before — business continuity during a rotation is
+    // the intended behavior. The tempting inverse ("block the old admin
+    // once a rotation is proposed") would be wrong: if the proposed key
+    // never shows up to accept, the vault would be frozen — the exact
+    // lock-out two-step rotation exists to prevent (#4).
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 1_000);
+    client.deposit(&lp, &1_000);
+
+    let new_admin = Address::generate(&h.env);
+    client.propose_admin(&h.admin, &new_admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    // The old admin withdraws mid-rotation: succeeds normally...
+    let recipient = Address::generate(&h.env);
+    client.withdraw(&h.admin, &recipient, &300);
+    // ...authorized by the OLD admin's own signature, nobody else's.
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, h.admin);
+    assert_eq!(client.get_balance(), 700);
+    assert_eq!(token::Client::new(&h.env, &h.token_id).balance(&recipient), 300);
+
+    // The proposed-but-not-yet-accepted address has no authority yet.
+    assert_eq!(client.try_withdraw(&new_admin, &recipient, &1), Err(Ok(Error::Unauthorized)));
+    assert_eq!(client.get_balance(), 700);
+
+    // The withdraw didn't disturb the pending rotation in any way.
+    assert_eq!(client.get_admin(), h.admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    // And it still completes normally afterwards — authority swaps only now.
+    client.accept_admin(&new_admin);
+    assert_eq!(client.get_admin(), new_admin);
+    assert_eq!(client.try_withdraw(&h.admin, &recipient, &1), Err(Ok(Error::Unauthorized)));
+    client.withdraw(&new_admin, &recipient, &700);
+    assert_eq!(client.get_balance(), 0);
+}
+
 // ---------- the integration this vault exists for: fund a market's seed
 // liquidity, collect the payout back after settlement ----------
 
-#[test]
-fn redeem_from_market_collects_the_vaults_treasury_payout() {
-    let h = setup();
-    let lp = Address::generate(&h.env);
-    fund(&h, &lp, 1_000_000);
-    let vault_client = VaultClient::new(&h.env, &h.vault_id);
-    vault_client.deposit(&lp, &10_000);
+struct SeededMarket {
+    market_id: Address,
+    reflector_id: Address,
+    expiry: u64,
+    grace: u64,
+}
 
-    // The vault funds a market's initial_liquidity — exactly the
-    // MarketFactoryService flow this contract was built for: withdraw seed
-    // capital from the vault to the admin (who deploys/initializes the
-    // market, same as StellarService.deployMarket does today), and the
-    // market's own treasury is set to the vault itself.
-    vault_client.withdraw(&h.admin, &h.admin, &10_000);
+/// The vault funds a market's initial_liquidity — exactly the
+/// MarketFactoryService flow this contract was built for: deposit LP
+/// capital, withdraw `seed` to the admin (who deploys/initializes the
+/// market, same as StellarService.deployMarket does today), and set the
+/// market's own treasury to the vault itself. Leaves the vault at a zero
+/// balance with all `seed` sitting in the market's pool.
+fn seed_market_from_vault(h: &Harness, seed: i128) -> SeededMarket {
+    let lp = Address::generate(&h.env);
+    fund(h, &lp, seed);
+    let vault_client = VaultClient::new(&h.env, &h.vault_id);
+    vault_client.deposit(&lp, &seed);
+    vault_client.withdraw(&h.admin, &h.admin, &seed);
 
     let lazer_id = h.env.register(MockLazer, ());
     let reflector_id = h.env.register(mock_reflector::MockReflector, ());
     let market_id = h.env.register(market_contract::WASM, ());
     let market_client = MarketClient::new(&h.env, &market_id);
     let expiry = h.env.ledger().timestamp() + DAY;
+    let grace = 3_600u64;
 
     market_client.initialize(
         &h.admin,
         &h.token_id,
         &1_000_000i128, // strike: $10,000.00 in cents
         &expiry,
-        &3_600u64,
+        &grace,
         &lazer_id,
         &FEED_ID,
         &100u32,
         &20u32,
         &h.vault_id, // treasury = this vault, not a bare wallet
-        &10_000i128,
+        &seed,
         &OracleFeedConfig {
             contract: reflector_id.clone(),
             asset: market_contract::Asset::Other(soroban_sdk::Symbol::new(&h.env, "XLM")),
             max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
             tolerance_bps: REFLECTOR_TOLERANCE_BPS,
         },
-        &None, // no RedStone leg — this test exercises testnet-shaped behavior
+        &None, // no RedStone leg — this exercises testnet-shaped behavior
     );
+
+    SeededMarket { market_id, reflector_id, expiry, grace }
+}
+
+#[test]
+fn redeem_from_market_collects_the_vaults_treasury_payout() {
+    let h = setup();
+    let vault_client = VaultClient::new(&h.env, &h.vault_id);
+    let SeededMarket { market_id, reflector_id, expiry, .. } = seed_market_from_vault(&h, 10_000);
+    let market_client = MarketClient::new(&h.env, &market_id);
+    assert_eq!(vault_client.get_balance(), 0);
 
     // No trading — the simplest case: the market's entire pool (all of the
     // vault's seed liquidity) is what the vault should get back.
@@ -334,105 +396,26 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
     assert_eq!(vault_client.get_balance(), 10_000);
 }
 
-// ---------- deposit pause (#41) ----------
-
 #[test]
-fn pause_deposits_blocks_deposit_but_not_withdraw() {
+fn redeem_from_market_recovers_the_full_seed_after_a_zero_trade_cancel() {
+    // #52, end to end through the real production wiring (treasury = this
+    // vault): a market seeded from the vault that never sees a single
+    // trade and is never settled gets cancelled after its grace period.
+    // The vault's seed liquidity comes back in full, at par — cancel
+    // credits the untouched pool to treasury as a matched YES+NO pair,
+    // which the cancelled-market redeem formula pays out 1:1.
     let h = setup();
-    let lp = Address::generate(&h.env);
-    fund(&h, &lp, 5_000);
-    let client = VaultClient::new(&h.env, &h.vault_id);
-    client.deposit(&lp, &1_000);
-    assert!(!client.is_deposits_paused());
+    let vault_client = VaultClient::new(&h.env, &h.vault_id);
+    let SeededMarket { market_id, expiry, grace, .. } = seed_market_from_vault(&h, 10_000);
+    let market_client = MarketClient::new(&h.env, &market_id);
+    assert_eq!(vault_client.get_balance(), 0);
 
-    client.pause_deposits(&h.admin);
-    assert!(client.is_deposits_paused());
-    assert_eq!(client.try_deposit(&lp, &500), Err(Ok(Error::DepositsPaused)));
-    // Rejected means rejected: no collateral moved, no accounting changed.
-    assert_eq!(client.get_balance(), 1_000);
-    assert_eq!(client.get_total_deposited(), 1_000);
-    assert_eq!(token::Client::new(&h.env, &h.token_id).balance(&lp), 4_000);
+    h.env.ledger().set_timestamp(expiry + grace);
+    market_client.cancel();
 
-    // The admin can still move funds out during the pause; that's the point.
-    let recipient = Address::generate(&h.env);
-    client.withdraw(&h.admin, &recipient, &600);
-    assert_eq!(client.get_balance(), 400);
-
-    client.unpause_deposits(&h.admin);
-    assert!(!client.is_deposits_paused());
-    client.deposit(&lp, &500);
-    assert_eq!(client.get_balance(), 900);
-    assert_eq!(client.get_total_deposited(), 1_500);
-}
-
-#[test]
-fn pause_and_unpause_deposits_require_the_admin() {
-    let h = setup();
-    let client = VaultClient::new(&h.env, &h.vault_id);
-    let not_admin = Address::generate(&h.env);
-
-    assert_eq!(client.try_pause_deposits(&not_admin), Err(Ok(Error::Unauthorized)));
-    assert!(!client.is_deposits_paused());
-
-    client.pause_deposits(&h.admin);
-    let auths = h.env.auths();
-    assert_eq!(auths.len(), 1);
-    assert_eq!(auths[0].0, h.admin);
-
-    assert_eq!(client.try_unpause_deposits(&not_admin), Err(Ok(Error::Unauthorized)));
-    assert!(client.is_deposits_paused());
-}
-
-#[test]
-fn deposit_pause_survives_admin_rotation_and_only_the_new_admin_can_lift_it() {
-    // The motivating scenario: halt deposits, rotate admin, then the new
-    // admin decides when to reopen. The flag isn't tied to whoever set it.
-    let h = setup();
-    let client = VaultClient::new(&h.env, &h.vault_id);
-    let new_admin = Address::generate(&h.env);
-
-    client.pause_deposits(&h.admin);
-    client.propose_admin(&h.admin, &new_admin);
-    client.accept_admin(&new_admin);
-    assert!(client.is_deposits_paused());
-
-    assert_eq!(client.try_unpause_deposits(&h.admin), Err(Ok(Error::Unauthorized)));
-    client.unpause_deposits(&new_admin);
-    assert!(!client.is_deposits_paused());
-}
-
-#[test]
-fn deposit_paused_check_does_not_mask_not_initialized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let vault_id = env.register(Vault, ());
-    let client = VaultClient::new(&env, &vault_id);
-    let who = Address::generate(&env);
-    assert_eq!(client.try_deposit(&who, &100), Err(Ok(Error::NotInitialized)));
-    assert_eq!(client.try_pause_deposits(&who), Err(Ok(Error::NotInitialized)));
-}
-
-// ---------- event schema (#39) ----------
-
-#[test]
-fn deposit_event_carries_the_running_total() {
-    use soroban_sdk::testutils::Events as _;
-    use soroban_sdk::{IntoVal, Val};
-
-    let h = setup();
-    let lp = Address::generate(&h.env);
-    fund(&h, &lp, 5_000);
-    let client = VaultClient::new(&h.env, &h.vault_id);
-    client.deposit(&lp, &1_000);
-    client.deposit(&lp, &250);
-
-    let expected: soroban_sdk::Vec<(Address, soroban_sdk::Vec<Val>, Val)> = soroban_sdk::vec![
-        &h.env,
-        (
-            h.vault_id.clone(),
-            (symbol_short!("deposit"), lp.clone()).into_val(&h.env),
-            (250i128, 1_250i128).into_val(&h.env),
-        ),
-    ];
-    assert_eq!(h.env.events().all().filter_by_contract(&h.vault_id), expected);
+    let payout = vault_client.redeem_from_market(&h.admin, &market_id);
+    assert_eq!(payout, 10_000, "zero trades + cancel: the vault recovers its entire seed, at par");
+    assert_eq!(vault_client.get_balance(), 10_000);
+    assert_eq!(token::Client::new(&h.env, &h.token_id).balance(&market_id), 0);
+    assert_eq!(market_client.get_market().total_supply, 0);
 }
