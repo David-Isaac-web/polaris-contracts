@@ -114,27 +114,56 @@ pub fn apply_fee(amount: i128, fee_bps: u32) -> i128 {
 /// state structs — can share this one implementation.
 ///
 /// `effective = min + (base - min) * initial_liquidity / total_supply`.
-/// Well-defined and bounded to `[min_fee_bps, base_fee_bps]` as long as the
-/// caller's own invariant `total_supply >= initial_liquidity` holds while
-/// open (true in both contracts: every `merge`/`sell`/`redeem` can only
-/// unwind collateral that `split`/`buy` actually locked; seed liquidity is
-/// never itself withdrawable pre-resolution/pre-termination).
+///
+/// The result is clamped to `[min_fee_bps, base_fee_bps]` and the final
+/// `i128 -> u32` conversion is checked, so this stays well-defined even if
+/// the caller's own invariant `total_supply >= initial_liquidity` (true in
+/// both contracts while open: every `merge`/`sell`/`redeem` can only unwind
+/// collateral that `split`/`buy` actually locked; seed liquidity is never
+/// itself withdrawable pre-resolution/pre-termination) is ever violated:
+/// `total_supply <= 0` returns `base_fee_bps`, a supply below the seed
+/// saturates at `base_fee_bps`, and a huge supply saturates at
+/// `min_fee_bps`. `min_fee_bps > base_fee_bps` is treated as the empty
+/// range `[base, base]`.
 pub fn effective_fee_bps(base_fee_bps: u32, min_fee_bps: u32, initial_liquidity: i128, total_supply: i128) -> u32 {
+    if total_supply <= 0 {
+        return base_fee_bps;
+    }
     let base = base_fee_bps as i128;
     let min = min_fee_bps as i128;
     let scaled = min + (base - min) * initial_liquidity / total_supply;
-    scaled as u32
+    let clamped = if scaled < min {
+        min
+    } else if scaled > base {
+        base
+    } else {
+        scaled
+    };
+    u32::try_from(clamped).unwrap_or(base_fee_bps)
 }
 
 /// Converts a Pyth raw price (`price * 10^exponent` = USD) into integer
 /// cents (`USD * 100`), staying in integer math throughout.
+///
+/// Rounds half away from zero (not truncation) so this agrees with
+/// `reflector_price_to_cents` at the strike boundary: the resolution check
+/// is `final_cents >= strike_price`, so a truncating conversion here would
+/// resolve a price in the half-cent band below a strike differently than
+/// the Reflector path would for the same economic price. Both conversions
+/// must share one rounding rule.
 pub fn to_cents(price: i64, exponent: i16) -> i128 {
     let p = price as i128;
     let e = exponent as i32 + 2;
     if e >= 0 {
         p * 10i128.pow(e as u32)
     } else {
-        p / 10i128.pow((-e) as u32)
+        let divisor = 10i128.pow((-e) as u32);
+        let half = divisor / 2;
+        if p >= 0 {
+            (p + half) / divisor
+        } else {
+            -((-p + half) / divisor)
+        }
     }
 }
 
