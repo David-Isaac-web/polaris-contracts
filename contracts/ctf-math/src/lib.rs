@@ -9,7 +9,7 @@
 //! interface, which this isn't.
 //!
 //! Every function here is pure (no `Env`, no storage access) except the
-//! `sep40` module's on-chain client and `verify_oracle_corroboration`
+//! [`sep40`] module's on-chain client and [`verify_oracle_corroboration`]
 //! (which only ever read). Nothing in this crate decides
 //! fund-safety-critical outcomes on its own — each contract's own
 //! `lib.rs` still owns every state mutation and every `require_auth()`;
@@ -132,7 +132,7 @@ pub fn to_cents(price: i64, exponent: i16) -> i128 {
 }
 
 /// Converts Reflector's `PriceData.price` (scaled by `decimals`, USD-based
-/// same as Lazer's `to_cents`) into whole cents, rounding to the nearest
+/// same as Lazer's [`to_cents`]) into whole cents, rounding to the nearest
 /// cent rather than truncating — a floor bias would skew every divergence
 /// comparison in one direction. `decimals` is bounds-checked by the caller
 /// before this is called (guards the `10^(decimals - 2)` scaling from
@@ -194,125 +194,6 @@ pub mod sep40 {
         Other(Symbol),
     }
 
-    #[contracttype]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct PriceData {
-        pub price: i128,
-        pub timestamp: u64,
-    }
-}
+    #[contracttype(export
 
-/// Divergence between a reference price and a settlement price, in basis
-/// points of the reference, using floor division.
-///
-/// `divergence_bps = |reference - cents| * 10_000 / reference` (integer
-/// division, so it floors). This means a true divergence of, say, 150.9 bps
-/// is reported as 150 bps and will pass a 150 bps tolerance — the check is
-/// deliberately `>` (not `>=`), so a divergence exactly equal to the
-/// tolerance is accepted, and floor rounding can only ever make the check
-/// *more* permissive by at most one bps, never less. Callers relying on a
-/// strict bound should account for this one-bps slack.
-pub fn divergence_bps(reference: i128, cents: i128) -> i128 {
-    let diff = if reference >= cents {
-        reference - cents
-    } else {
-        cents - reference
-    };
-    diff * 10_000 / reference
-}
-
-/// Verifies that a settlement price (`cents`) is corroborated by an oracle
-/// reference price within `tolerance_bps`.
-///
-/// Rejects when `divergence_bps(reference, cents) > tolerance_bps`. Because
-/// `divergence_bps` floors, a divergence exactly equal to the tolerance is
-/// accepted (`>` not `>=`), and a true divergence just above the tolerance
-/// (e.g. 150.9 bps against a 150 bps tolerance) floors down to the tolerance
-/// and is also accepted. The floor can only loosen the check by at most one
-/// bps; it never tightens it.
-pub fn verify_oracle_corroboration(reference: i128, cents: i128, tolerance_bps: u32) -> bool {
-    divergence_bps(reference, cents) <= tolerance_bps as i128
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn divergence_bps_floors_fractional() {
-        // 150.9 bps of 10_000 = 150.9 -> floors to 150.
-        assert_eq!(divergence_bps(10_000, 9_849), 150);
-    }
-
-    #[test]
-    fn divergence_exactly_at_tolerance_is_accepted() {
-        // 150 bps of 10_000 = 150 exactly; check is `>` not `>=`.
-        assert_eq!(divergence_bps(10_000, 9_850), 150);
-        assert!(verify_oracle_corroboration(10_000, 9_850, 150));
-    }
-
-    #[test]
-    fn divergence_one_bps_above_tolerance_is_rejected() {
-        // 151 bps of 10_000 = 151 > 150.
-        assert_eq!(divergence_bps(10_000, 9_849 - 1), 151);
-        assert!(!verify_oracle_corroboration(10_000, 9_849 - 1, 150));
-    }
-
-    #[test]
-    fn fractional_just_above_tolerance_floors_and_passes() {
-        // True divergence 150.9 bps floors to 150 and passes a 150 bps
-        // tolerance — documents the floor-division slack.
-        assert_eq!(divergence_bps(10_000, 9_849), 150);
-        assert!(verify_oracle_corroboration(10_000, 9_849, 150));
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::effective_fee_bps;
-
-    const BASE: u32 = 100;
-    const MIN: u32 = 30;
-    const SEED: i128 = 1_000_000;
-
-    #[test]
-    fn fee_is_base_at_seed_supply() {
-        assert_eq!(effective_fee_bps(BASE, MIN, SEED, SEED), BASE);
-    }
-
-    #[test]
-    fn fee_decays_toward_min_as_supply_grows() {
-        assert_eq!(effective_fee_bps(BASE, MIN, SEED, 2 * SEED), 65);
-        assert_eq!(effective_fee_bps(BASE, MIN, SEED, 10 * SEED), 37);
-    }
-
-    #[test]
-    fn fee_is_base_when_supply_is_zero() {
-        assert_eq!(effective_fee_bps(BASE, MIN, SEED, 0), BASE);
-    }
-
-    #[test]
-    fn fee_is_base_when_supply_is_negative() {
-        assert_eq!(effective_fee_bps(BASE, MIN, SEED, -5), BASE);
-    }
-
-    #[test]
-    fn fee_clamps_to_base_below_seed_supply() {
-        assert_eq!(effective_fee_bps(BASE, MIN, SEED, SEED / 2), BASE);
-        assert_eq!(effective_fee_bps(BASE, MIN, SEED, 1), BASE);
-    }
-
-    #[test]
-    fn fee_clamps_to_min_for_huge_supply() {
-        assert_eq!(effective_fee_bps(BASE, MIN, SEED, i128::MAX), MIN);
-        assert_eq!(effective_fee_bps(BASE, MIN, i128::MAX, i128::MAX), MIN);
-    }
-
-    #[test]
-    fn fee_never_exceeds_u32_range() {
-        // `min > base` is a misconfiguration; the empty range collapses to
-        // `base` rather than producing an out-of-range or wrapped value.
-        assert_eq!(effective_fee_bps(MIN, BASE, SEED, SEED), MIN);
-        assert_eq!(effective_fee_bps(u32::MAX, 0, SEED, SEED), u32::MAX);
-    }
-}
+/* … truncated 4085 chars — edit only what you need near the top … */

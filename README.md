@@ -1131,8 +1131,5 @@ that applies to fund-safety-critical code.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-134 -->
-- #134: contracts/market: every trade rewrites the whole Market struct, including immutable config, to instance storage
-
-<!-- handsoff-issue-135 -->
-- #135: contracts/market+perpetual: buy() succeeds with amount_out == 0, unlike sell(), which rejects a zero output
+<!-- handsoff-issue-122 -->
+- #122: README's per-crate test table claims 100 tests; the workspace has 111 #[test] functions
