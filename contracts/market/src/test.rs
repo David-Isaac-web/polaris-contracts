@@ -10,9 +10,23 @@ use soroban_sdk::{token, Address, Env, Symbol};
 /// num_props(1) + properties...]. We only encode price(0), exponent(4), and
 /// feed_update_timestamp(12) — the three properties `settle` reads.
 fn build_payload(feed_id: u32, price: i64, exponent: i16, feed_ts_micros: u64) -> std::vec::Vec<u8> {
+    build_payload_with_feed_ts(feed_id, price, exponent, feed_ts_micros, Some(feed_ts_micros))
+}
+
+/// Same as `build_payload`, but lets the feed's own `feed_update_timestamp`
+/// property be omitted (`None`) while the payload-level timestamp stays
+/// `payload_ts_micros` — the shape that drives `settle`'s
+/// `unwrap_or(verified.timestamp)` fallback.
+fn build_payload_with_feed_ts(
+    feed_id: u32,
+    price: i64,
+    exponent: i16,
+    payload_ts_micros: u64,
+    feed_ts_micros: Option<u64>,
+) -> std::vec::Vec<u8> {
     let mut b = std::vec::Vec::new();
     b.extend_from_slice(&2_479_346_549u32.to_le_bytes()); // magic
-    b.extend_from_slice(&feed_ts_micros.to_le_bytes()); // top-level timestamp
+    b.extend_from_slice(&payload_ts_micros.to_le_bytes()); // top-level timestamp
     b.push(3); // channel = FixedRate200ms
     b.push(1); // num_feeds
     b.extend_from_slice(&feed_id.to_le_bytes());
@@ -22,8 +36,13 @@ fn build_payload(feed_id: u32, price: i64, exponent: i16, feed_ts_micros: u64) -
     b.push(4); // property: exponent
     b.extend_from_slice(&(exponent as u16).to_le_bytes());
     b.push(12); // property: feed_update_timestamp
-    b.push(1); // exists = true
-    b.extend_from_slice(&feed_ts_micros.to_le_bytes());
+    match feed_ts_micros {
+        Some(ts) => {
+            b.push(1); // exists = true
+            b.extend_from_slice(&ts.to_le_bytes());
+        }
+        None => b.push(0), // exists = false
+    }
     b
 }
 
@@ -73,6 +92,12 @@ fn default_redstone_config(env: &Env, redstone_id: &Address) -> OracleFeedConfig
 }
 
 fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
+    setup_with_fees(strike_cents, initial_liquidity, 100, 20)
+}
+
+/// `setup` with an explicit fee curve — for the degenerate configs
+/// (`min == base`, and `base == 0`) that `initialize` also accepts.
+fn setup_with_fees(strike_cents: i128, initial_liquidity: i128, base_fee_bps: u32, min_fee_bps: u32) -> Harness {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(1_000_000);
@@ -93,6 +118,11 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
 
     token_admin.mint(&admin, &(initial_liquidity * 1000));
 
+    // `initialize` now rejects an oracle with no price for the configured
+    // asset, so seed one before it runs.
+    mock_sep40::MockSep40Client::new(&env, &reflector_id)
+        .set_price(&(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &env.ledger().timestamp());
+
     let client = PolarisMarketClient::new(&env, &market_id);
     client.initialize(
         &admin,
@@ -102,8 +132,8 @@ fn setup(strike_cents: i128, initial_liquidity: i128) -> Harness {
         &grace,
         &lazer_id,
         &FEED_ID,
-        &100u32, // base fee: 1%
-        &20u32,  // min fee: 0.2%
+        &base_fee_bps,
+        &min_fee_bps,
         &treasury,
         &initial_liquidity,
         &default_reflector_config(&env, &reflector_id),
@@ -150,6 +180,13 @@ fn setup_with_redstone(strike_cents: i128, initial_liquidity: i128) -> (Harness,
     let grace = 3_600u64;
 
     token_admin.mint(&admin, &(initial_liquidity * 1000));
+
+    // Both legs must have a price for the configured asset before
+    // `initialize` accepts them.
+    mock_sep40::MockSep40Client::new(&env, &reflector_id)
+        .set_price(&(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &env.ledger().timestamp());
+    mock_sep40::MockSep40Client::new(&env, &redstone_id)
+        .set_price(&(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &env.ledger().timestamp());
 
     let client = PolarisMarketClient::new(&env, &market_id);
     client.initialize(
@@ -350,6 +387,50 @@ fn init_rejects_bad_params() {
         ),
         Err(Ok(Error::InvalidRedstoneConfig)),
         "same staleness-vs-resolution validation applies to an optionally-configured RedStone leg"
+    );
+}
+
+#[test]
+fn init_rejects_oracle_with_no_price_for_the_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_id = sac.address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000_000);
+    let lazer_id = env.register(mock_lazer::MockLazer, ());
+    let reflector_id = env.register(mock_sep40::MockSep40, ());
+    let redstone_id = env.register(mock_sep40::MockSep40, ());
+    let expiry = env.ledger().timestamp() + DAY;
+    let price = 1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2);
+    let ts = env.ledger().timestamp();
+
+    // Reflector leg has no price at all.
+    let no_reflector_price = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &no_reflector_price);
+    assert_eq!(
+        c.try_initialize(
+            &admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32,
+            &treasury, &1000i128, &default_reflector_config(&env, &reflector_id), &None,
+        ),
+        Err(Ok(Error::ReflectorPriceUnavailable)),
+        "an oracle with no price for the configured asset must be rejected at init"
+    );
+
+    // Reflector priced, but the configured RedStone leg has no price.
+    mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(&price, &ts);
+    let no_redstone_price = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &no_redstone_price);
+    assert_eq!(
+        c.try_initialize(
+            &admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32,
+            &treasury, &1000i128, &default_reflector_config(&env, &reflector_id),
+            &Some(default_redstone_config(&env, &redstone_id)),
+        ),
+        Err(Ok(Error::RedstonePriceUnavailable)),
+        "same check applies to an optionally-configured RedStone leg"
     );
 }
 
@@ -708,6 +789,39 @@ fn settle_rejects_stale_price() {
 }
 
 #[test]
+fn settle_accepts_fresh_payload_level_timestamp_when_feed_omits_its_own() {
+    // Fallback branch: the feed carries no `feed_update_timestamp`, so
+    // `settle` must trust the payload-level `verified.timestamp` instead.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload_with_feed_ts(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000, None);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle(&bytes);
+
+    let m = client.get_market();
+    assert_eq!(m.status, MarketStatus::ResolvedYes);
+    assert_eq!(m.final_price, 1_000_000);
+    assert_solvent(&h);
+}
+
+#[test]
+fn settle_rejects_stale_payload_level_timestamp_when_feed_omits_its_own() {
+    // Same fallback branch, stale outcome: the payload-level timestamp is
+    // what gets freshness-checked, so an old one must reject.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let stale_ts = (h.expiry - 1_000) * 1_000_000; // > 5 min before expiry
+    let payload = build_payload_with_feed_ts(FEED_ID, 10_000_00000000, -8, stale_ts, None);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::StalePrice)));
+    assert_eq!(client.get_market().status, MarketStatus::Open);
+}
+
+#[test]
 fn settle_rejects_wrong_feed_id() {
     let h = setup(1_000_000, 10_000);
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
@@ -853,6 +967,48 @@ fn settle_via_reflector_no_wins_below_strike() {
     assert_solvent(&h);
 }
 
+/// The `settle` event's third data field is the path discriminator, so an
+/// indexer can tell the two settlement paths apart from the event alone.
+#[test]
+fn settle_event_records_settlement_source() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::TryFromVal;
+
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+
+    // Lazer path.
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle(&bytes);
+
+    let events = h.env.events().all();
+    let (_, _, data) = events.last().unwrap();
+    let (status, cents, source): (MarketStatus, i128, SettlementSource) =
+        <(MarketStatus, i128, SettlementSource)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(status, MarketStatus::ResolvedYes);
+    assert_eq!(cents, 1_000_000);
+    assert_eq!(source, SettlementSource::Lazer);
+
+    // Reflector path, on a fresh market.
+    let h2 = setup(1_000_000, 10_000);
+    let client2 = PolarisMarketClient::new(&h2.env, &h2.market_id);
+    h2.env.ledger().set_timestamp(h2.expiry);
+    set_reflector_price_cents(&h2, 1_000_000);
+    client2.settle_via_reflector();
+
+    let events2 = h2.env.events().all();
+    let (_, _, data2) = events2.last().unwrap();
+    let (status2, cents2, source2): (MarketStatus, i128, SettlementSource) =
+        <(MarketStatus, i128, SettlementSource)>::try_from_val(&h2.env, &data2).unwrap();
+    assert_eq!(status2, MarketStatus::ResolvedYes);
+    assert_eq!(cents2, 1_000_000);
+    assert_eq!(source2, SettlementSource::Reflector);
+    assert_ne!(source, source2);
+}
+
 #[test]
 fn settle_via_reflector_rejects_before_expiry() {
     let h = setup(1_000_000, 10_000);
@@ -899,6 +1055,36 @@ fn settle_via_reflector_rejects_a_price_that_predates_expiry_by_more_than_the_fr
     h.env.ledger().set_timestamp(h.expiry);
     let res = client.try_settle_via_reflector();
     assert_eq!(res, Err(Ok(Error::StalePrice)));
+}
+
+#[test]
+fn settle_via_reflector_rejects_a_price_timestamped_after_the_freshness_window() {
+    // Upper bound mirroring the Lazer path: a price timestamped more than
+    // PRICE_FRESHNESS_WINDOW_SECS *after expiry* must not settle the market,
+    // otherwise a caller could pick any post-expiry print during the grace
+    // window.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let future_ts = h.expiry + PRICE_FRESHNESS_WINDOW_SECS + 1;
+    let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
+    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &future_ts);
+    h.env.ledger().set_timestamp(future_ts);
+    let res = client.try_settle_via_reflector();
+    assert_eq!(res, Err(Ok(Error::FuturePrice)));
+    assert_eq!(client.get_market().status, MarketStatus::Open);
+}
+
+#[test]
+fn settle_via_reflector_accepts_a_price_at_the_freshness_window_edge() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let edge_ts = h.expiry + PRICE_FRESHNESS_WINDOW_SECS;
+    let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
+    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &edge_ts);
+    h.env.ledger().set_timestamp(edge_ts);
+    client.settle_via_reflector();
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+    assert_solvent(&h);
 }
 
 #[test]
@@ -1120,6 +1306,58 @@ fn cancel_after_grace_refunds_a_matched_pair_at_merge_parity() {
 }
 
 #[test]
+fn cancel_with_zero_trades_ever_returns_the_full_seed_liquidity_to_treasury() {
+    // #52: `initialize` only — no split/buy/anything from anyone, ever —
+    // then nobody settles and the market is cancelled after the grace
+    // period. Intended behavior, stated here because it wasn't anywhere
+    // else: the seed liquidity IS fully recoverable, at par, by `treasury`
+    // and only by `treasury`. `cancel` credits treasury the whole AMM pool
+    // (`pool_yes == pool_no == initial_liquidity` YES and NO shares — the
+    // pool is never touched with zero trades), and the cancelled-market
+    // `(by + bn) / 2` formula turns that matched pair back into exactly
+    // `initial_liquidity` collateral. No special-casing: the same path
+    // every other cancelled-market holder goes through.
+    let liquidity = 10_000;
+    let h = setup(1_000_000, liquidity);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let tok = token::Client::new(&h.env, &h.token_id);
+
+    // Sanity: genuinely zero positions minted beyond the seed itself.
+    let m = client.get_market();
+    assert_eq!(m.total_supply, liquidity);
+    assert_eq!(client.get_position(&h.treasury), (0, 0));
+    assert_eq!(tok.balance(&h.market_id), liquidity);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+
+    let m = client.get_market();
+    assert_eq!(m.status, MarketStatus::Cancelled);
+    assert_eq!((m.pool_yes, m.pool_no), (0, 0));
+    // The entire pool moved to treasury as an ordinary share position.
+    assert_eq!(client.get_position(&h.treasury), (liquidity, liquidity));
+    assert_solvent(&h);
+
+    // Nobody else holds anything — a random address can't claim the seed.
+    let stranger = Address::generate(&h.env);
+    assert_eq!(client.try_redeem(&stranger), Err(Ok(Error::NothingToRedeem)));
+
+    let before = tok.balance(&h.treasury);
+    let payout = client.redeem(&h.treasury);
+    assert_eq!(payout, liquidity, "zero trades: treasury gets back exactly the seed, at par");
+    assert_eq!(tok.balance(&h.treasury) - before, liquidity);
+
+    // Fully drained, nothing stranded, and invariant still holds at zero.
+    let m = client.get_market();
+    assert_eq!(m.total_supply, 0);
+    assert_eq!(tok.balance(&h.market_id), 0);
+    assert_solvent(&h);
+
+    // One-shot: the position was zeroed, a second redeem pays nothing.
+    assert_eq!(client.try_redeem(&h.treasury), Err(Ok(Error::NothingToRedeem)));
+}
+
+#[test]
 fn cancel_refunds_directional_bettor_half_value_no_counterparty_needed() {
     // The scenario the original parimutuel design special-cased ("empty
     // winning pool"): a single bettor takes a directional position and the
@@ -1209,6 +1447,53 @@ fn fee_never_exceeds_base_even_if_total_supply_dips_back_toward_seed() {
     assert_solvent(&h);
 }
 
+#[test]
+fn flat_fee_curve_keeps_fee_constant_across_volume_growth() {
+    // min == base is a legal config: the (base - min) == 0 arm of the curve.
+    let h = setup_with_fees(1_000_000, 10_000, 50, 50);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000);
+
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &10_000); // total_supply: 10_000 -> 20_000
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &30_000); // total_supply: 20_000 -> 50_000
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &950_000); // total_supply: 50_000 -> 1_000_000
+    assert_eq!(client.get_fee(), 50);
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn zero_fee_config_charges_nothing_and_round_trip_loses_only_slippage() {
+    // base == 0 forces min == 0: the all-zero arm of the curve, and
+    // apply_fee(amount, 0) must be a true no-op.
+    let h = setup_with_fees(1_000_000, 10_000, 0, 0);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000);
+
+    assert_eq!(client.get_fee(), 0);
+    client.split(&user, &40_000); // total_supply: 10_000 -> 50_000
+    assert_eq!(client.get_fee(), 0);
+
+    let before = token::Client::new(&h.env, &h.token_id).balance(&user);
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let back = client.sell(&user, &Prediction::Yes, &shares, &0);
+    let after = token::Client::new(&h.env, &h.token_id).balance(&user);
+
+    // Round trip is a loss (CPMM slippage) but never a fee: with zero fee the
+    // pool's k is unchanged by the pair of trades, so the loss is bounded by
+    // slippage alone and strictly less than any 1-bps fee would cost.
+    assert!(back < 1_000, "round trip must lose slippage, got {back}");
+    assert_eq!(after, before - 1_000 + back);
+    assert!(1_000 - back < 100, "loss must be slippage-only, got {}", 1_000 - back);
+
+    assert_solvent(&h);
+}
+
 // ---------- global solvency invariant ----------
 
 fn assert_solvent(h: &Harness) {
@@ -1262,6 +1547,73 @@ fn sell_large_enough_to_exhaust_a_reserve_is_rejected() {
 
     let res = client.try_sell(&user, &Prediction::Yes, &101_000_000, &0);
     assert_eq!(res, Err(Ok(Error::PoolDepthExceeded)));
+    assert_solvent(&h);
+}
+
+/// Smallest `collateral_amount` whose post-fee `cpmm_out` against
+/// `(reserve_in, reserve_out)` lands exactly on `target_out`. `cpmm_out` is
+/// monotonic in `effective_in`, so a binary search finds the boundary trade
+/// without hardcoding fee-curve internals.
+fn collateral_for_amount_out(
+    h: &Harness,
+    reserve_in: i128,
+    reserve_out: i128,
+    target_out: i128,
+) -> i128 {
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let fee_bps = client.get_fee();
+    let out_at = |collateral: i128| {
+        cpmm_out(reserve_in, reserve_out, apply_fee(collateral, fee_bps))
+    };
+    let mut lo = 1i128;
+    let mut hi = reserve_out * 1_000;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if out_at(mid) >= target_out {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    assert_eq!(out_at(lo), target_out, "no collateral amount hits target_out");
+    lo
+}
+
+#[test]
+fn buy_at_exactly_half_the_reserve_is_rejected() {
+    // Boundary equality: `amount_out * 2 == reserve_out` must be rejected.
+    // The guard is `>=`, so the exact-equality trade is on the rejected side.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000_000);
+
+    let collateral = collateral_for_amount_out(&h, 10_000, 10_000, 5_000);
+    let res = client.try_buy(&user, &Prediction::Yes, &collateral, &0);
+    assert_eq!(res, Err(Ok(Error::PoolDepthExceeded)));
+
+    let m = client.get_market();
+    assert_eq!(m.pool_yes, 10_000);
+    assert_eq!(m.pool_no, 10_000);
+    assert_solvent(&h);
+}
+
+#[test]
+fn buy_one_stroop_under_half_the_reserve_is_accepted() {
+    // Adjacent case: `amount_out * 2 == reserve_out - 1` must be accepted,
+    // and the pool must stay solvent afterwards.
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000_000);
+
+    let collateral = collateral_for_amount_out(&h, 10_000, 10_000, 4_999);
+    let total = client.buy(&user, &Prediction::Yes, &collateral, &0);
+    assert_eq!(total, collateral + 4_999);
+
+    let m = client.get_market();
+    assert_eq!(m.pool_yes, 10_000 - 4_999);
+    assert_eq!(m.pool_no, 10_000 + collateral);
     assert_solvent(&h);
 }
 
