@@ -337,6 +337,20 @@ pub mod sep40 {
     // `lastprice`), where suppressing its own top-level spec entry seemed
     // right. It's since become a genuine field of `OracleFeedConfig`,
     // which *is* part of this contract's own public interface (an
-    // `i
+    // `initialize` parameter) — `export = false` was found, live, to drop
+    // the type's spec entry from the compiled wasm entirely, not just hide
+    // it from "reachable from the public API" discovery, which broke every
+    // spec-driven encoder (the `stellar` CLI's JSON arg parser, and
+    // `@stellar/stellar-sdk`'s `contract.Spec.funcArgsToScVals` used by
+    // `polaris-oracle`) with "Missing Entry Asset" the moment anything
+    // tried to construct an `OracleFeedConfig` from outside Rust source.
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    pub enum Asset {
+        Stellar(Address),
+        Other(Symbol),
+    }
 
-/* … truncated 688 chars — edit only what you need near the top … */
+    #[contracttype(export
+
+/* … truncated 4085 chars — edit only what you need near the top … */
