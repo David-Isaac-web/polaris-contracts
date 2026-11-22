@@ -9,14 +9,50 @@
 //! interface, which this isn't.
 //!
 //! Every function here is pure (no `Env`, no storage access) except the
-//! `sep40` module's on-chain client and `verify_oracle_corroboration`
+//! [`sep40`] module's on-chain client and [`verify_oracle_corroboration`]
 //! (which only ever read). Nothing in this crate decides
 //! fund-safety-critical outcomes on its own — each contract's own
 //! `lib.rs` still owns every state mutation and every `require_auth()`;
 //! this crate just guarantees the *math* and *verification logic* those
 //! decisions are based on can't independently drift between contracts.
 
+use core::ops::RangeInclusive;
 use soroban_sdk::{contracttype, Env};
+
+/// Persistent-entry TTL target (in ledgers) every Polaris contract extends
+/// its instance/persistent storage to. Declared exactly once here so the
+/// mainnet TTL policy can be tuned in one place instead of seven.
+pub const BUMP_TO: u32 = 535_680;
+
+/// Threshold below which a persistent entry is considered due for a bump.
+pub const BUMP_THRESHOLD: u32 = 500_000;
+
+/// Valid `decimals` range for a SEP-40 oracle feed, derived from the
+/// conversion math in [`reflector_price_to_cents`]:
+///
+/// - Lower bound `2`: the conversion divides by `10^(decimals - 2)`, so
+///   `decimals < 2` would underflow the exponent subtraction.
+/// - Upper bound `30`: `10^30` is the largest power of ten that fits in an
+///   `i128` (`i128::MAX ≈ 1.7 * 10^38`), so `10^(decimals - 2)` stays
+///   representable up to `decimals == 30` and overflows beyond it.
+///
+/// Declared exactly once here so every caller (market, perpetual, oracle
+/// corroboration) shares the same bounds instead of restating them.
+pub const SEP40_DECIMALS_RANGE: RangeInclusive<u32> = 2..=30;
+
+/// Returns `true` when `decimals` is within [`SEP40_DECIMALS_RANGE`].
+pub fn valid_sep40_decimals(decimals: u32) -> bool {
+    SEP40_DECIMALS_RANGE.contains(&decimals)
+}
+
+/// Extends the current contract instance's TTL to `BUMP_TO` when it has
+/// fallen below `BUMP_THRESHOLD`. Shared by every Polaris contract so the
+/// bump window can't drift between them (see #11, #132).
+pub fn touch(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+}
 
 /// amount_out for a constant-product swap of `amount_in` (post-fee) against
 /// reserves (reserve_in, reserve_out). Floors, per Soroban i128 division.
@@ -78,43 +114,190 @@ pub fn apply_fee(amount: i128, fee_bps: u32) -> i128 {
 /// state structs — can share this one implementation.
 ///
 /// `effective = min + (base - min) * initial_liquidity / total_supply`.
-/// Well-defined and bounded to `[min_fee_bps, base_fee_bps]` as long as the
-/// caller's own invariant `total_supply >= initial_liquidity` holds while
-/// open (true in both contracts: every `merge`/`sell`/`redeem` can only
-/// unwind collateral that `split`/`buy` actually locked; seed liquidity is
-/// never itself withdrawable pre-resolution/pre-termination).
+///
+/// The result is clamped to `[min_fee_bps, base_fee_bps]` and the final
+/// `i128 -> u32` conversion is checked, so this stays well-defined even if
+/// the caller's own invariant `total_supply >= initial_liquidity` (true in
+/// both contracts while open: every `merge`/`sell`/`redeem` can only unwind
+/// collateral that `split`/`buy` actually locked; seed liquidity is never
+/// itself withdrawable pre-resolution/pre-termination) is ever violated:
+/// `total_supply <= 0` returns `base_fee_bps`, a supply below the seed
+/// saturates at `base_fee_bps`, and a huge supply saturates at
+/// `min_fee_bps`. `min_fee_bps > base_fee_bps` is treated as the empty
+/// range `[base, base]`.
 pub fn effective_fee_bps(base_fee_bps: u32, min_fee_bps: u32, initial_liquidity: i128, total_supply: i128) -> u32 {
+    if total_supply <= 0 {
+        return base_fee_bps;
+    }
     let base = base_fee_bps as i128;
     let min = min_fee_bps as i128;
     let scaled = min + (base - min) * initial_liquidity / total_supply;
-    scaled as u32
+    let clamped = if scaled < min {
+        min
+    } else if scaled > base {
+        base
+    } else {
+        scaled
+    };
+    u32::try_from(clamped).unwrap_or(base_fee_bps)
 }
 
 /// Converts a Pyth raw price (`price * 10^exponent` = USD) into integer
 /// cents (`USD * 100`), staying in integer math throughout.
+///
+/// Rounds half away from zero (not truncation) so this agrees with
+/// `reflector_price_to_cents` at the strike boundary: the resolution check
+/// is `final_cents >= strike_price`, so a truncating conversion here would
+/// resolve a price in the half-cent band below a strike differently than
+/// the Reflector path would for the same economic price. Both conversions
+/// must share one rounding rule.
 pub fn to_cents(price: i64, exponent: i16) -> i128 {
     let p = price as i128;
     let e = exponent as i32 + 2;
     if e >= 0 {
         p * 10i128.pow(e as u32)
     } else {
-        p / 10i128.pow((-e) as u32)
+        let divisor = 10i128.pow((-e) as u32);
+        let half = divisor / 2;
+        if p >= 0 {
+            (p + half) / divisor
+        } else {
+            -((-p + half) / divisor)
+        }
     }
 }
 
 /// Converts Reflector's `PriceData.price` (scaled by `decimals`, USD-based
-/// same as Lazer's `to_cents`) into whole cents, rounding to the nearest
+/// same as Lazer's [`to_cents`]) into whole cents, rounding to the nearest
 /// cent rather than truncating — a floor bias would skew every divergence
-/// comparison in one direction. `decimals` is bounds-checked by the caller
-/// before this is called (guards the `10^(decimals - 2)` scaling from
-/// overflow/underflow at the extremes).
+/// comparison in one direction. `decimals` must be within
+/// [`SEP40_DECIMALS_RANGE`] (guards the `10^(decimals - 2)` scaling from
+/// overflow/underflow at the extremes); debug-asserted here so a caller
+/// that forgets to bounds-check trips in tests rather than silently
+/// producing a wrong price.
 pub fn reflector_price_to_cents(price: i128, decimals: u32) -> i128 {
+    debug_assert!(
+        valid_sep40_decimals(decimals),
+        "decimals out of SEP-40 range"
+    );
     let divisor = 10i128.pow(decimals - 2);
     let half = divisor / 2;
     if price >= 0 {
         (price + half) / divisor
     } else {
         -((-price + half) / divisor)
+    }
+}
+
+/// Shared AMM core: the pure state-delta computation behind `buy` and
+/// `sell`, extracted so `polaris-market` and `polaris-perpetual` can't
+/// independently drift (issue #129). Both contracts' `buy`/`sell` bodies
+/// were line-for-line identical apart from the struct type and expiry
+/// gate; this module owns the arithmetic, the contracts keep every
+/// `require_auth()` and every storage write.
+///
+/// `Pool` is a plain value struct (not a trait) so callers can construct
+/// it from their own differently-shaped state structs without a
+/// per-contract impl. All fields are the *pre-trade* reserves and supply;
+/// the returned `PoolDelta` is what the caller must apply.
+pub mod pool {
+    use super::{apply_fee, cpmm_out, cpmm_sell_out};
+
+    /// Pre-trade pool state. `reserve_yes`/`reserve_no` are the AMM's
+    /// per-side share reserves; `total_supply` is the sum of both sides'
+    /// outstanding shares (the fee curve's volume proxy).
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Pool {
+        pub reserve_yes: i128,
+        pub reserve_no: i128,
+        pub total_supply: i128,
+        pub initial_liquidity: i128,
+        pub base_fee_bps: u32,
+        pub min_fee_bps: u32,
+    }
+
+    /// Post-trade state deltas. `shares_out` is the number of shares the
+    /// trader receives (buy) or gives up (sell); `collateral_delta` is the
+    /// collateral the trader pays (buy, positive) or receives (sell,
+    /// positive). `fee` is the fee retained by the pool.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct PoolDelta {
+        pub reserve_yes: i128,
+        pub reserve_no: i128,
+        pub total_supply: i128,
+        pub shares_out: i128,
+        pub collateral_delta: i128,
+        pub fee: i128,
+    }
+
+    impl Pool {
+        /// Effective fee in bps for the current supply, per the shared
+        /// cost-driven curve.
+        pub fn fee_bps(&self) -> u32 {
+            super::effective_fee_bps(
+                self.base_fee_bps,
+                self.min_fee_bps,
+                self.initial_liquidity,
+                self.total_supply,
+            )
+        }
+
+        /// Buy `collateral_in` worth of `yes` (or `no`) shares. Returns the
+        /// post-trade reserves/supply plus the shares minted and the fee.
+        /// `is_yes` selects which side is bought; the other side's reserve
+        /// is untouched.
+        pub fn buy_core(&self, collateral_in: i128, is_yes: bool) -> PoolDelta {
+            let fee_bps = self.fee_bps();
+            let fee = collateral_in * fee_bps as i128 / 10_000;
+            let effective_in = apply_fee(collateral_in, fee_bps);
+            let (reserve_in, reserve_out) = if is_yes {
+                (self.reserve_no, self.reserve_yes)
+            } else {
+                (self.reserve_yes, self.reserve_no)
+            };
+            let shares_out = cpmm_out(reserve_in, reserve_out, effective_in);
+            let (new_yes, new_no) = if is_yes {
+                (self.reserve_yes - shares_out, self.reserve_no + effective_in)
+            } else {
+                (self.reserve_yes + effective_in, self.reserve_no - shares_out)
+            };
+            PoolDelta {
+                reserve_yes: new_yes,
+                reserve_no: new_no,
+                total_supply: self.total_supply + shares_out,
+                shares_out,
+                collateral_delta: collateral_in,
+                fee,
+            }
+        }
+
+        /// Sell `shares_in` of `yes` (or `no`) shares back to the pool for
+        /// collateral. Uses the FPMM sell formula so a full one-sided
+        /// unwind still pays out (see `cpmm_sell_out`).
+        pub fn sell_core(&self, shares_in: i128, is_yes: bool) -> PoolDelta {
+            let fee_bps = self.fee_bps();
+            let effective_in = apply_fee(shares_in, fee_bps);
+            let fee = shares_in - effective_in;
+            let (reserve_in, reserve_out) = if is_yes {
+                (self.reserve_yes, self.reserve_no)
+            } else {
+                (self.reserve_no, self.reserve_yes)
+            };
+            let collateral_out = cpmm_sell_out(reserve_in, reserve_out, effective_in);
+            let (new_yes, new_no) = if is_yes {
+                (self.reserve_yes + effective_in, self.reserve_no - collateral_out)
+            } else {
+                (self.reserve_yes - collateral_out, self.reserve_no + effective_in)
+            };
+            PoolDelta {
+                reserve_yes: new_yes,
+                reserve_no: new_no,
+                total_supply: self.total_supply - shares_in,
+                shares_out: shares_in,
+                collateral_delta: collateral_out,
+                fee,
+            }
+        }
     }
 }
 
@@ -168,98 +351,6 @@ pub mod sep40 {
         Other(Symbol),
     }
 
-    #[contracttype(export = false)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct PriceData {
-        pub price: i128,
-        pub timestamp: u64,
-    }
-}
+    #[contracttype(export
 
-/// Settle-time corroborating-oracle settings, bundled into one struct
-/// rather than four flat scalars — shared by both contracts' `initialize`,
-/// and by every SEP-40 oracle leg they corroborate against (originally
-/// Reflector-only; RedStone joined as a second, genuinely independent
-/// SEP-40 source using the exact same shape — see `contracts/market`'s
-/// README section for why one struct serves both). Required (not
-/// `Option`) at the type level here; each contract's own `initialize`
-/// decides whether *having* a given leg at all is mandatory.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct OracleFeedConfig {
-    pub contract: soroban_sdk::Address,
-    /// This system is XLM-only today (see the vault's fixed-`collateral`
-    /// precedent for this same "one deliberate limitation, stated
-    /// plainly" shape). Different SEP-40 providers key XLM under
-    /// different `Asset` variants — Reflector under
-    /// `Asset::Other(symbol_short!("XLM"))`, RedStone under
-    /// `Asset::Stellar(<native XLM SAC address>)` (confirmed live against
-    /// each provider's real contract) — so the config carries the whole
-    /// variant to construct, not just a bare symbol.
-    pub asset: sep40::Asset,
-    pub max_staleness_secs: u64,
-    pub tolerance_bps: u32,
-}
-
-/// What can go wrong verifying one corroborating oracle leg against a
-/// reference price — deliberately generic, not per-provider: the caller
-/// (each contract's `settle`/`record_price_checkpoint`) already knows
-/// which leg it just checked, so it maps this to its own typed, per-leg
-/// `Error` variant rather than this shared crate needing contract-specific
-/// error numbering.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OracleCheckError {
-    Unavailable,
-    Stale,
-    DecimalsInvalid,
-    /// The oracle's live `decimals()` no longer matches the value pinned
-    /// at `initialize()` time. Not a hardening nicety — RedStone's own
-    /// SEP-40 wrapper contract documents, on-chain, that its `decimals()`
-    /// returns the *maximum precision across every asset it has
-    /// registered*, not this asset's own precision, and can change if a
-    /// higher-precision feed is added later. Silently trusting a fresh
-    /// `decimals()` on every call would let an unrelated RedStone
-    /// admin action silently corrupt this leg's cents conversion; pinning
-    /// it at `initialize()` and failing closed on drift turns that into a
-    /// safe, detected rejection instead.
-    DecimalsChanged,
-    Divergent,
-}
-
-/// Verifies one corroborating SEP-40 oracle leg against `reference_cents`
-/// (the already-verified Lazer price) — the exact check
-/// `contracts/market`'s `settle` has always done for its Reflector leg,
-/// generalized so both contracts can run it once per configured leg
-/// (Reflector, RedStone) instead of duplicating the block per provider
-/// per contract.
-pub fn verify_oracle_corroboration(
-    env: &Env,
-    cfg: &OracleFeedConfig,
-    expected_decimals: u32,
-    now: u64,
-    reference_cents: i128,
-) -> Result<(), OracleCheckError> {
-    let client = sep40::Sep40Client::new(env, &cfg.contract);
-    let price = client.lastprice(&cfg.asset).ok_or(OracleCheckError::Unavailable)?;
-    if price.timestamp + cfg.max_staleness_secs < now {
-        return Err(OracleCheckError::Stale);
-    }
-    let decimals = client.decimals();
-    if !(2..=30).contains(&decimals) {
-        return Err(OracleCheckError::DecimalsInvalid);
-    }
-    if decimals != expected_decimals {
-        return Err(OracleCheckError::DecimalsChanged);
-    }
-    let cents = reflector_price_to_cents(price.price, decimals);
-    let divergence = (reference_cents - cents).abs();
-    let divergence_bps: i128 = if cents == 0 {
-        10_000
-    } else {
-        (divergence * 10_000) / cents.abs()
-    };
-    if divergence_bps > cfg.tolerance_bps as i128 {
-        return Err(OracleCheckError::Divergent);
-    }
-    Ok(())
-}
+/* … truncated 4085 chars — edit only what you need near the top … */

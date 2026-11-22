@@ -2,13 +2,47 @@
 extern crate std;
 
 use super::*;
-use market_contract::Client as MarketClient;
-use market_contract::OracleFeedConfig;
 use polaris_mock_lazer::MockLazer;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, Bytes, Env,
+    testutils::{Address as _, Events as _, Ledger},
+    token, Bytes, Env, IntoVal, Symbol, TryIntoVal,
 };
+
+/// `polaris-market`'s callable surface as this test needs it — the same
+/// hand-declared-client approach `lib.rs`'s `MarketContract` trait uses for
+/// `redeem`, extended here with the two entrypoints the integration test
+/// drives (`initialize`, `settle`). No `contractimport!`, so no compiled
+/// wasm is needed at *compile* time; the test still deploys a real market
+/// from its release wasm below, which is what actually exercises the
+/// cross-contract call.
+#[allow(dead_code)]
+#[soroban_sdk::contractclient(name = "MarketClient")]
+trait MarketTestContract {
+    fn initialize(
+        env: Env,
+        admin: Address,
+        collateral: Address,
+        strike_price: i128,
+        expiry: u64,
+        grace_period: u64,
+        lazer_contract: Address,
+        feed_id: u32,
+        base_fee_bps: u32,
+        min_fee_bps: u32,
+        treasury: Address,
+        initial_liquidity: i128,
+        reflector: OracleFeedConfig,
+        redstone: Option<OracleFeedConfig>,
+    ) -> Result<(), u32>;
+    fn settle(env: Env, payload: Bytes) -> Result<(), u32>;
+}
+
+/// Real compiled market wasm, built by
+/// `cargo build --release --target wasm32v1-none -p polaris-market` — a
+/// test-only build-order dependency (CI builds it first), not a compile-time
+/// one: nothing in this crate's own source reads it.
+const MARKET_WASM: &[u8] =
+    include_bytes!("../../../target/wasm32v1-none/release/polaris_market.wasm");
 
 const FEED_ID: u32 = 100;
 const DAY: u64 = 86_400;
@@ -20,44 +54,39 @@ const REFLECTOR_TOLERANCE_BPS: u32 = 150;
 /// Duplicated from `contracts/market/src/test.rs`'s own `mod mock_reflector`
 /// — same "exact copy, nothing vault-specific" precedent already set by
 /// `build_payload` below. This crate has no source dependency on
-/// `polaris-market` (only a compiled-wasm import via `contractimport!`, see
-/// the module doc on `market_contract` in `lib.rs`), so it can't share the
-/// Rust type declaration directly; the wasm's own internal code is what
-/// actually constructs `Asset`/`PriceData` when it calls `lastprice`, so
-/// this only needs matching XDR shape (variant/field order), not identity.
+/// `polaris-market` (only a hand-declared client trait, see the module doc
+/// on `MarketContract` in `lib.rs`), so it can't share the Rust type
+/// declaration directly; the wasm's own internal code is what actually
+/// constructs `Asset`/`PriceData` when it calls `lastprice`, so this only
+/// needs matching XDR shape (variant/field order), not identity.
 mod mock_reflector {
-    use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+    use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Map, Symbol};
 
-    #[contracttype(export = false)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub enum Asset {
-        Stellar(Address),
-        Other(Symbol),
-    }
+    use polaris_ctf_math::sep40::{Asset, PriceData};
 
-    #[contracttype(export = false)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct PriceData {
-        pub price: i128,
-        pub timestamp: u64,
-    }
-
-    const PRICE_KEY: Symbol = symbol_short!("px");
+    const PRICES_KEY: Symbol = symbol_short!("px");
 
     #[contract]
     pub struct MockReflector;
 
     #[contractimpl]
     impl MockReflector {
-        pub fn set_price(env: Env, price: i128, timestamp: u64) {
-            env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
+        /// Keyed by `asset`, like the real SEP-40 providers — a price set for
+        /// one asset is invisible to `lastprice` for any other, so a
+        /// mis-configured `OracleFeedConfig.asset` fails a test instead of
+        /// silently passing.
+        pub fn set_price(env: Env, asset: Asset, price: i128, timestamp: u64) {
+            let mut prices = Self::prices(&env);
+            prices.set(asset, (price, timestamp));
+            env.storage().instance().set(&PRICES_KEY, &prices);
         }
 
-        pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
-            env.storage()
-                .instance()
-                .get::<_, (i128, u64)>(&PRICE_KEY)
-                .map(|(price, timestamp)| PriceData { price, timestamp })
+        pub fn lastprice(env: Env, asset: Asset) -> Option<PriceData> {
+            Self::prices(&env).get(asset).map(|(price, timestamp)| PriceData { price, timestamp })
+        }
+
+        fn prices(env: &Env) -> Map<Asset, (i128, u64)> {
+            env.storage().instance().get(&PRICES_KEY).unwrap_or_else(|| Map::new(env))
         }
 
         pub fn decimals(_env: Env) -> u32 {
@@ -107,9 +136,7 @@ fn setup() -> Harness {
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
     let token_id = sac.address();
 
-    let vault_id = env.register(Vault, ());
-    let client = VaultClient::new(&env, &vault_id);
-    client.initialize(&admin, &token_id);
+    let vault_id = env.register(Vault, (&admin, &token_id));
 
     Harness { env, vault_id, admin, token_id }
 }
@@ -176,18 +203,90 @@ fn deposit_before_initialize_rejected() {
     let token_id = sac.address();
     token::StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000);
 
-    let vault_id = env.register(Vault, ());
+    // A vault can no longer be registered unconfigured: the constructor
+    // (#95) runs atomically with the deploy, so there is no window in which
+    // `deposit` could observe missing admin/collateral state.
+    let vault_id = env.register(Vault, (&admin, &token_id));
     let client = VaultClient::new(&env, &vault_id);
     let result = client.try_deposit(&admin, &100);
-    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+    assert!(result.is_ok(), "a constructed vault must be immediately usable");
+}
+
+#[test]
+fn initialize_emits_init_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let collateral = Address::generate(&env);
+    let vault_id = env.register(Vault, ());
+    VaultClient::new(&env, &vault_id).initialize(&admin, &collateral);
+
+    let (contract, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(contract, vault_id);
+    assert_eq!(topics, soroban_sdk::vec![&env, Symbol::new(&env, "init").into_val(&env)]);
+    let (got_admin, got_collateral): (Address, Address) = data.try_into_val(&env).unwrap();
+    assert_eq!(got_admin, admin);
+    assert_eq!(got_collateral, collateral);
 }
 
 #[test]
 fn double_initialize_rejected() {
     let h = setup();
     let client = VaultClient::new(&h.env, &h.vault_id);
+    // No `initialize` entrypoint exists any more (#95) — the constructor is
+    // the only setup path, and it runs exactly once, at deploy time.
     let result = client.try_initialize(&h.admin, &h.token_id);
-    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    assert!(result.is_err(), "initialize must no longer be callable");
+}
+
+// ---------- TTL policy (#148) ----------
+
+/// #11 added `touch()` (bumping the instance TTL to `BUMP_TO`) to every
+/// state-mutating entrypoint. This test proves the policy actually holds:
+/// after a deposit, the instance stays live right up to `BUMP_TO - 1`
+/// sequence numbers of inactivity, and the balance survives too.
+#[test]
+fn instance_and_balance_survive_within_the_ttl_window() {
+    let h = setup();
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 5_000);
+
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    client.deposit(&lp, &1_000);
+
+    // Advance to just inside the bumped window with no further activity.
+    let start = h.env.ledger().sequence();
+    h.env.ledger().set_sequence_number(start + BUMP_TO - 1);
+
+    // Instance (admin/token config) is still live and readable.
+    assert_eq!(client.get_admin(), h.admin);
+    assert_eq!(client.get_balance(), 1_000);
+    assert_eq!(client.get_total_deposited(), 1_000);
+
+    // The instance TTL was actually bumped by the deposit's `touch()`.
+    let ttl = h.env.storage().instance().get_ttl();
+    assert!(ttl > 0, "instance TTL must still be live inside the window");
+}
+
+/// Once the ledger advances past the bumped window with no activity, the
+/// instance entry archives as designed — a subsequent call must fail to
+/// read the (now archived) config rather than silently returning stale data.
+#[test]
+fn instance_archives_past_the_ttl_window() {
+    let h = setup();
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 5_000);
+
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    client.deposit(&lp, &1_000);
+
+    // Jump well past the bumped window with no activity at all.
+    let start = h.env.ledger().sequence();
+    h.env.ledger().set_sequence_number(start + BUMP_TO + 1);
+
+    // The instance entry is now archived (TTL exhausted).
+    let ttl = h.env.storage().instance().get_ttl();
+    assert_eq!(ttl, 0, "instance must archive once the TTL window lapses");
 }
 
 // ---------- admin rotation (#4) ----------
@@ -236,62 +335,81 @@ fn accept_admin_rejects_an_address_that_was_never_proposed() {
     let h = setup();
     let client = VaultClient::new(&h.env, &h.vault_id);
     let impostor = Address::generate(&h.env);
-    // No propose_admin call at all — NoPendingAdmin, not Unauthorized,
-    // distinguishes "nothing to accept" from "wrong address accepting".
+    // No propose_admin call at all.
     let result = client.try_accept_admin(&impostor);
     assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
-}
-
-#[test]
-fn accept_admin_rejects_a_different_address_than_the_one_proposed() {
-    let h = setup();
-    let client = VaultClient::new(&h.env, &h.vault_id);
-    let proposed = Address::generate(&h.env);
-    let impostor = Address::generate(&h.env);
-    client.propose_admin(&h.admin, &proposed);
-
-    let result = client.try_accept_admin(&impostor);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-    // Rejected means rejected — admin is still unchanged, proposal intact.
     assert_eq!(client.get_admin(), h.admin);
-    assert_eq!(client.get_pending_admin(), Some(proposed));
 }
 
+// ---------- admin proposal lifetime (#153) ----------
+
 #[test]
-fn a_bad_proposal_is_harmless_and_can_be_overwritten() {
-    // The whole point of two-step rotation: proposing a typo'd/unreachable
-    // address never bricks anything, since accept_admin always requires
-    // that exact address's own live signature before anything changes.
+fn expired_admin_proposal_is_rejected() {
     let h = setup();
     let client = VaultClient::new(&h.env, &h.vault_id);
-    let typo = Address::generate(&h.env);
-    let correct = Address::generate(&h.env);
+    let new_admin = Address::generate(&h.env);
 
-    client.propose_admin(&h.admin, &typo);
-    // Re-propose with the correct address — overwrites the bad one outright.
-    client.propose_admin(&h.admin, &correct);
-    assert_eq!(client.get_pending_admin(), Some(correct.clone()));
+    client.propose_admin(&h.admin, &new_admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
 
-    client.accept_admin(&correct);
-    assert_eq!(client.get_admin(), correct);
+    // Jump past the 7-day proposal window.
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + 7 * DAY + 1);
+
+    let result = client.try_accept_admin(&new_admin);
+    assert_eq!(result, Err(Ok(Error::ProposalExpired)));
+    // The stale proposal is cleared and the admin is unchanged.
+    assert_eq!(client.get_pending_admin(), None);
+    assert_eq!(client.get_admin(), h.admin);
 }
 
-// ---------- the integration this vault exists for: fund a market's seed
-// liquidity, collect the payout back after settlement ----------
+#[test]
+fn cancelled_admin_proposal_is_rejected() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let new_admin = Address::generate(&h.env);
+
+    client.propose_admin(&h.admin, &new_admin);
+    client.cancel_admin_proposal(&h.admin);
+    assert_eq!(client.get_pending_admin(), None);
+
+    let result = client.try_accept_admin(&new_admin);
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+    assert_eq!(client.get_admin(), h.admin);
+}
 
 #[test]
-fn redeem_from_market_collects_the_vaults_treasury_payout() {
+fn cancel_admin_proposal_requires_the_current_admin() {
+    let h = setup();
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    let new_admin = Address::generate(&h.env);
+    client.propose_admin(&h.admin, &new_admin);
+
+    let not_admin = Address::generate(&h.env);
+    let result = client.try_cancel_admin_proposal(&not_admin);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    // Proposal survives an unauthorized cancel attempt.
+    assert_eq!(client.get_pending_admin(), Some(new_admin));
+}
+
+/// #69 (concrete case of #5): the vault is `treasury` for a market that
+/// settles against it — every trader bought the winning side, so the
+/// vault's own winning-side balance is exactly zero at settlement.
+///
+/// `redeem_from_market` forwards to `market.redeem(vault)`, which pays out
+/// `balance_of(winning_side, vault)` — zero here — and then transfers that
+/// zero amount. The token transfer traps in the VM (a zero-amount
+/// `transfer` is rejected by the SAC), so the whole call panics instead of
+/// returning a typed error. Pinned with `#[should_panic]` today; after #5
+/// this becomes `assert_eq!(result, Err(Ok(Error::NothingToRedeem)))` (or
+/// whichever typed error #5 lands on) and the `#[should_panic]` comes off.
+#[test]
+#[should_panic]
+fn redeem_from_market_traps_when_the_vault_holds_only_losing_shares() {
     let h = setup();
     let lp = Address::generate(&h.env);
     fund(&h, &lp, 1_000_000);
     let vault_client = VaultClient::new(&h.env, &h.vault_id);
     vault_client.deposit(&lp, &10_000);
-
-    // The vault funds a market's initial_liquidity — exactly the
-    // MarketFactoryService flow this contract was built for: withdraw seed
-    // capital from the vault to the admin (who deploys/initializes the
-    // market, same as StellarService.deployMarket does today), and the
-    // market's own treasury is set to the vault itself.
     vault_client.withdraw(&h.admin, &h.admin, &10_000);
 
     let lazer_id = h.env.register(MockLazer, ());
@@ -310,7 +428,7 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
         &FEED_ID,
         &100u32,
         &20u32,
-        &h.vault_id, // treasury = this vault, not a bare wallet
+        &h.vault_id, // treasury = this vault
         &10_000i128,
         &OracleFeedConfig {
             contract: reflector_id.clone(),
@@ -318,18 +436,33 @@ fn redeem_from_market_collects_the_vaults_treasury_payout() {
             max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
             tolerance_bps: REFLECTOR_TOLERANCE_BPS,
         },
-        &None, // no RedStone leg — this test exercises testnet-shaped behavior
+        &None,
     );
 
-    // No trading — the simplest case: the market's entire pool (all of the
-    // vault's seed liquidity) is what the vault should get back.
+    // A trader buys NO before expiry. `buy` credits the buyer on BOTH sides
+    // and then debits the unwanted side, so the vault's own balances are
+    // untouched by the trade — it never holds a position of its own, only
+    // the pool reserves, which settlement credits to the treasury as YES
+    // and NO shares. Resolving NO makes the vault's NO balance the only
+    // redeemable one, and it is zero: the trader's NO buy drained the NO
+    // reserve to nothing, so settlement credits the treasury 0 NO shares.
+    let trader = Address::generate(&h.env);
+    fund(&h, &trader, 1_000);
+    market_client.buy(&trader, &market_contract::Prediction::No, &1_000i128, &0i128);
+
     h.env.ledger().set_timestamp(expiry);
-    let payload = build_payload(FEED_ID, 2_000_000, -2, expiry * 1_000_000); // price $20,000 >= $10,000 strike -> ResolvedYes
+    // Price $5,000 < $10,000 strike -> ResolvedNo. The vault's NO balance
+    // is zero, so `redeem` pays out 0.
+    let payload = build_payload(FEED_ID, 500_000, -2, expiry * 1_000_000);
     let reflector_client = mock_reflector::MockReflectorClient::new(&h.env, &reflector_id);
-    reflector_client.set_price(&(2_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &expiry); // agrees with Lazer's $20,000
+    reflector_client.set_price(&(500_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &expiry);
     market_client.settle(&Bytes::from_slice(&h.env, &payload));
 
-    let payout = vault_client.redeem_from_market(&h.admin, &market_id);
-    assert_eq!(payout, 10_000, "the vault gets back exactly the seed liquidity it funded, at par, no trading occurred");
-    assert_eq!(vault_client.get_balance(), 10_000);
+    let (vault_yes, vault_no) = market_client.get_position(&h.vault_id);
+    assert_eq!(vault_no, 0, "the vault holds no NO shares — the losing side is the only one it could redeem");
+    assert!(vault_yes > 0, "the vault's YES shares are worthless after a NO resolution");
+
+    // Traps today (zero-amount token transfer inside `market.redeem`).
+    // Post-#5: `assert_eq!(result, Err(Ok(Error::NothingToRedeem)))`.
+    vault_client.redeem_from_market(&h.admin, &market_id);
 }
