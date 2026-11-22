@@ -1131,8 +1131,14 @@ that applies to fund-safety-critical code.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-130 -->
-- #130: Oracle error-mapping closures are still inlined three times (market Reflector leg, perpetual Reflector and RedStone legs)
+<!-- handsoff-issue-138 -->
+- #138: ctf-math: staleness boundary (price.timestamp + max_staleness == now) is untested
 
-<!-- handsoff-issue-131 -->
-- #131: Lazer payload verification (verify, find feed, validate price/exponent/timestamp) is duplicated between market settle() and perpetual checkpoint
+<!-- handsoff-issue-139 -->
+- #139: contracts/perpetual: no permissionless wind-down backstop; terminate() is admin-only forever
+
+<!-- handsoff-issue-140 -->
+- #140: contracts/market+perpetual: initialize() accepts treasury == the contract's own address, permanently stranding the seed liquidity
+
+<!-- handsoff-issue-141 -->
+- #141: contracts/market+perpetual: pause()/unpause() aren't idempotent; repeated calls emit duplicate events
