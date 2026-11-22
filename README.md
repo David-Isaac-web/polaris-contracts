@@ -54,6 +54,7 @@ app is at
 - [Engineering notes: soroban-sdk gotchas](#engineering-notes-soroban-sdk-gotchas)
 - [Building & testing](#building--testing)
 - [Deploying](#deploying)
+- [Integrating: polaris-interface](#integrating-polaris-interface)
 - [Contributing](#contributing)
 
 ## Architecture
@@ -82,7 +83,7 @@ each other and the oracle feeds they read.
 
 ## Contracts at a glance
 
-Eight crates, one Cargo workspace:
+Ten crates, one Cargo workspace:
 
 | Crate | Purpose |
 |---|---|
@@ -94,6 +95,8 @@ Eight crates, one Cargo workspace:
 | `contracts/ctf-math` | `rlib`-only shared crate (no `#[contract]`) holding the pure CTF/AMM math, the generic SEP-40 oracle client, and the oracle-corroboration logic both `market` and `perpetual` call. |
 | `contracts/mock-lazer` | Testnet-only stand-in for the real `pyth-lazer-stellar` verifier. **Never deploy to mainnet.** |
 | `contracts/mock-redstone` | Testnet-only stand-in for RedStone's real (mainnet-only) SEP-40 wrapper. **Never deploy to mainnet.** |
+| `interface` | `polaris-interface`: the publishable crate of typed clients and contract types, generated from vendored release wasm. See [Integrating](#integrating-polaris-interface). |
+| `tools/oracle-config` | `polaris-oracle-config`: a CLI that builds validated `OracleFeedConfig`/`PriceOracleConfig` JSON for `initialize`. See [Deploying](#deploying). |
 
 ## Why not the original parimutuel design
 
@@ -722,6 +725,7 @@ shasum -a 256 target/wasm32v1-none/release/*.wasm
 | `polaris-market` | 61 |
 | `polaris-perpetual` | 30 |
 | `polaris-smart-wallet` | 11 |
+| `polaris-oracle-config` | 11 |
 | `polaris-smart-wallet-factory` | 9 |
 | `polaris-vault` | 16 |
 | `polaris-mock-redstone` | 3 |
@@ -734,13 +738,16 @@ actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 59,407 bytes | `8ad8d17ad08c78f6afb52152fe4976422102e2c9f125716532a4a0396ccb4918` |
-| `polaris_perpetual.wasm` | 57,367 bytes | `b62909fa2c78b083a8973b7b733b0ce9e4b8cdb1efd1d0169f61c93370af9727` |
-| `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
-| `polaris_mock_redstone.wasm` | 7,280 bytes | `0db6ff0394999bb28e97a786c5b64891f341290aa323d8a8aec78b711eb28cdf` |
-| `polaris_smart_wallet.wasm` | 27,049 bytes | `bb2e397ba9d56cb58649941576c51e452063554bb43d15d4dfbd29987b1f7dbf` |
-| `polaris_smart_wallet_factory.wasm` | 7,583 bytes | `d64cd44f402db8fb657e8256b20ef7c1b89ebb011bf5adf7e48e3ca335729710` |
-| `polaris_vault.wasm` | 10,568 bytes | `5847a7781556d7c4e727e63fe48a84d6bed9ff6c34686e6a0b09a03d3c925c3d` |
+| `polaris_market.wasm` | 63,067 bytes | `8b9affbb95c698dd26b7a981797bb80c0298219066de26b5c526fc03422ad068` |
+| `polaris_perpetual.wasm` | 60,343 bytes | `37dee64443ac6b312ebb006433ebf0fa8590e925ab667a236cdb7ce0bd5b72d3` |
+| `polaris_mock_lazer.wasm` | 855 bytes | `c0848b74e840eece46de06e424ea99e75467ed3ce80b36e4f9c975395978ce40` |
+| `polaris_mock_redstone.wasm` | 7,465 bytes | `8c77fc03cf73ba92c3df188b73b9c54357358041c0ccc20701c91d1a198ef2ee` |
+| `polaris_smart_wallet.wasm` | 28,307 bytes | `438833c472524aa6b91d50451fc8b9267a9aea74f64e6e3a00cad0ff7d859986` |
+| `polaris_smart_wallet_factory.wasm` | 7,768 bytes | `c72006a7c649cacc291fba664ff6f31f3649c1f74c3756e7beccdf2877e13523` |
+| `polaris_vault.wasm` | 18,579 bytes | `c2968db2b7b53114193571d9f1dfdd7bedd837f135cb57b407e97f7e039916d6` |
+
+Built with rustc 1.95.0. These match `interface/wasm/SHA256SUMS` for the
+five contracts `polaris-interface` vendors.
 
 ## Deploying
 
@@ -761,9 +768,75 @@ stellar contract invoke --id <CONTRACT_ID> --source deployer --network testnet -
 #   --redstone '{"contract":"CBMGLKUQZVSAIL5CPDDAWSUY7MAKXISHMOZEVLMBUWBMFGHRJSR4WYRF","asset":{"Stellar":"<native XLM SAC>"},"max_staleness_secs":600,"tolerance_bps":150}'
 ```
 
+### Oracle config without hand-written JSON
+
+`polaris-oracle-config` (`tools/oracle-config`,
+[#35](https://github.com/PolarisQ-xyz/polaris-contracts/issues/35)) builds
+the `--reflector`/`--redstone` (market) and `--price_oracle` (perpetual)
+values from validated inputs, and prompts for anything missing when run in
+a terminal:
+
+```sh
+cargo build --release -p polaris-oracle-config
+CFG=target/release/polaris-oracle-config
+
+# The deploy example above, without the hand-written --reflector blob:
+stellar contract invoke --id <CONTRACT_ID> --source deployer --network testnet -- \
+  initialize --admin <ADMIN> ... --initial_liquidity 10000000000 \
+  --reflector "$($CFG feed --network testnet --provider reflector \
+                  --max-staleness-secs 600 --tolerance-bps 150)" \
+  --redstone null
+
+# Each prints one line of JSON on stdout:
+$CFG feed --network mainnet --provider redstone --max-staleness-secs 600 --tolerance-bps 150
+$CFG price-oracle --network mainnet --lazer-contract <LAZER_ID> --feed-id <ID> \
+  --reflector-contract <REFLECTOR_ID> --reflector-max-staleness-secs 600 --reflector-tolerance-bps 150 \
+  --redstone-max-staleness-secs 600 --redstone-tolerance-bps 150
+$CFG feed   # no flags in a terminal: prompts for each value
+```
+
+What it catches before anything reaches the chain:
+
+- Contract addresses are checked as `C...` strkeys, checksum included, so a
+  typo fails here instead of at `initialize`.
+- Each provider gets the asset variant it really uses for XLM: Reflector
+  `Other("XLM")`, RedStone `Stellar(<that network's native XLM SAC>)`.
+- `--contract` defaults to this repo's known deployments (Reflector on
+  testnet, RedStone on mainnet).
+- `tolerance_bps` must be within `1..=10000`, `max_staleness_secs` must be
+  above zero, and `feed_id` must be non-zero.
+
+Its tests parse the emitted JSON with `soroban-spec-tools` (the parser the
+`stellar` CLI itself uses) against the released `initialize` signatures.
+One thing it can't check offline: `max_staleness_secs` must be at least
+the oracle's live `resolution()`. `initialize` itself rejects that.
+
 In practice, `polaris-oracle`'s `POST /markets/create` and
 `POST /perpetuals/create` do this deploy+initialize sequence for you against
 the wasm files already checked into that repo — see its README.
+
+## Integrating: polaris-interface
+
+`interface/` is `polaris-interface`
+([#34](https://github.com/PolarisQ-xyz/polaris-contracts/issues/34)), a
+publishable crate of typed clients and contract types for the market,
+perpetual, vault, smart-wallet and factory contracts. A third party
+depends on it like any crate, instead of copying a `.wasm` file into its
+own `contractimport!`:
+
+```rust
+use polaris_interface::market;
+let (yes_bps, no_bps) = market::Client::new(&env, &market_id).get_price();
+```
+
+It follows the convention other published Soroban SDK crates use (e.g.
+Blend's `blend-contract-sdk`): vendor each release wasm in
+`interface/wasm/` and wrap it in `contractimport!`. Its version is the
+contract release it vendors. `scripts/sync-interface-wasm.sh` refreshes
+the wasm and `SHA256SUMS`. A test fails CI if any contract's interface
+(spec, docs included) changes without a re-sync. See
+[interface/README.md](./interface/README.md) for the release steps and for
+generating TypeScript bindings from the same files.
 
 ## Contributing
 
