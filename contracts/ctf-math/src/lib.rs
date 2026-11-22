@@ -9,7 +9,7 @@
 //! interface, which this isn't.
 //!
 //! Every function here is pure (no `Env`, no storage access) except the
-//! `sep40` module's on-chain client and `verify_oracle_corroboration`
+//! [`sep40`] module's on-chain client and [`verify_oracle_corroboration`]
 //! (which only ever read). Nothing in this crate decides
 //! fund-safety-critical outcomes on its own — each contract's own
 //! `lib.rs` still owns every state mutation and every `require_auth()`;
@@ -168,7 +168,7 @@ pub fn to_cents(price: i64, exponent: i16) -> i128 {
 }
 
 /// Converts Reflector's `PriceData.price` (scaled by `decimals`, USD-based
-/// same as Lazer's `to_cents`) into whole cents, rounding to the nearest
+/// same as Lazer's [`to_cents`]) into whole cents, rounding to the nearest
 /// cent rather than truncating — a floor bias would skew every divergence
 /// comparison in one direction. `decimals` must be within
 /// [`SEP40_DECIMALS_RANGE`] (guards the `10^(decimals - 2)` scaling from
@@ -186,6 +186,118 @@ pub fn reflector_price_to_cents(price: i128, decimals: u32) -> i128 {
         (price + half) / divisor
     } else {
         -((-price + half) / divisor)
+    }
+}
+
+/// Shared AMM core: the pure state-delta computation behind `buy` and
+/// `sell`, extracted so `polaris-market` and `polaris-perpetual` can't
+/// independently drift (issue #129). Both contracts' `buy`/`sell` bodies
+/// were line-for-line identical apart from the struct type and expiry
+/// gate; this module owns the arithmetic, the contracts keep every
+/// `require_auth()` and every storage write.
+///
+/// `Pool` is a plain value struct (not a trait) so callers can construct
+/// it from their own differently-shaped state structs without a
+/// per-contract impl. All fields are the *pre-trade* reserves and supply;
+/// the returned `PoolDelta` is what the caller must apply.
+pub mod pool {
+    use super::{apply_fee, cpmm_out, cpmm_sell_out};
+
+    /// Pre-trade pool state. `reserve_yes`/`reserve_no` are the AMM's
+    /// per-side share reserves; `total_supply` is the sum of both sides'
+    /// outstanding shares (the fee curve's volume proxy).
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Pool {
+        pub reserve_yes: i128,
+        pub reserve_no: i128,
+        pub total_supply: i128,
+        pub initial_liquidity: i128,
+        pub base_fee_bps: u32,
+        pub min_fee_bps: u32,
+    }
+
+    /// Post-trade state deltas. `shares_out` is the number of shares the
+    /// trader receives (buy) or gives up (sell); `collateral_delta` is the
+    /// collateral the trader pays (buy, positive) or receives (sell,
+    /// positive). `fee` is the fee retained by the pool.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct PoolDelta {
+        pub reserve_yes: i128,
+        pub reserve_no: i128,
+        pub total_supply: i128,
+        pub shares_out: i128,
+        pub collateral_delta: i128,
+        pub fee: i128,
+    }
+
+    impl Pool {
+        /// Effective fee in bps for the current supply, per the shared
+        /// cost-driven curve.
+        pub fn fee_bps(&self) -> u32 {
+            super::effective_fee_bps(
+                self.base_fee_bps,
+                self.min_fee_bps,
+                self.initial_liquidity,
+                self.total_supply,
+            )
+        }
+
+        /// Buy `collateral_in` worth of `yes` (or `no`) shares. Returns the
+        /// post-trade reserves/supply plus the shares minted and the fee.
+        /// `is_yes` selects which side is bought; the other side's reserve
+        /// is untouched.
+        pub fn buy_core(&self, collateral_in: i128, is_yes: bool) -> PoolDelta {
+            let fee_bps = self.fee_bps();
+            let fee = collateral_in * fee_bps as i128 / 10_000;
+            let effective_in = apply_fee(collateral_in, fee_bps);
+            let (reserve_in, reserve_out) = if is_yes {
+                (self.reserve_no, self.reserve_yes)
+            } else {
+                (self.reserve_yes, self.reserve_no)
+            };
+            let shares_out = cpmm_out(reserve_in, reserve_out, effective_in);
+            let (new_yes, new_no) = if is_yes {
+                (self.reserve_yes - shares_out, self.reserve_no + effective_in)
+            } else {
+                (self.reserve_yes + effective_in, self.reserve_no - shares_out)
+            };
+            PoolDelta {
+                reserve_yes: new_yes,
+                reserve_no: new_no,
+                total_supply: self.total_supply + shares_out,
+                shares_out,
+                collateral_delta: collateral_in,
+                fee,
+            }
+        }
+
+        /// Sell `shares_in` of `yes` (or `no`) shares back to the pool for
+        /// collateral. Uses the FPMM sell formula so a full one-sided
+        /// unwind still pays out (see `cpmm_sell_out`).
+        pub fn sell_core(&self, shares_in: i128, is_yes: bool) -> PoolDelta {
+            let fee_bps = self.fee_bps();
+            let effective_in = apply_fee(shares_in, fee_bps);
+            let fee = shares_in - effective_in;
+            let (reserve_in, reserve_out) = if is_yes {
+                (self.reserve_yes, self.reserve_no)
+            } else {
+                (self.reserve_no, self.reserve_yes)
+            };
+            let collateral_out = cpmm_sell_out(reserve_in, reserve_out, effective_in);
+            let (new_yes, new_no) = if is_yes {
+                (self.reserve_yes + effective_in, self.reserve_no - collateral_out)
+            } else {
+                (self.reserve_yes - collateral_out, self.reserve_no + effective_in)
+            };
+            PoolDelta {
+                reserve_yes: new_yes,
+                reserve_no: new_no,
+                total_supply: self.total_supply - shares_in,
+                shares_out: shares_in,
+                collateral_delta: collateral_out,
+                fee,
+            }
+        }
     }
 }
 

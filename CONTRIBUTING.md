@@ -120,35 +120,38 @@ approve, and should preserve the solvency invariant
 (`collateral_token.balance(contract) == contract.total_supply`) under
 every ordering of calls.
 
-### Funds-critical changes
+## Error codes are append-only
 
-Any change to `contracts/*/src/lib.rs` (or other code that moves balances,
-share accounting, or signature verification) must satisfy the checklist
-below. These steps are distilled from bugs that actually shipped — the
-Cancelled double count and the factory hijack both came from skipping one
-of them. The same list is in the PR template; tick each box in your PR
-description.
+Each contract's `Error` enum assigns a numeric value to every variant,
+and those numbers are part of the contract's public ABI — integrators
+(including `polaris-oracle` and `polaris-frontend`) map
+`Error(Contract, #N)` to user-facing messages using them. The same number
+means different things in different contracts, so mappings must be
+per-contract.
 
-- [ ] **Assert solvency for multi-holder flows.** The invariant
-  `collateral_token.balance(contract) == contract.total_supply` must hold
-  under every ordering of calls, and a test must exercise the multi-holder
-  path (not just a single depositor).
-- [ ] **Don't change stored struct shapes.** No fields added, removed, or
-  reordered in `#[contracttype]` structs that are already persisted
-  on-chain. If a shape change is unavoidable, document the migration and
-  test it against pre-existing state.
-- [ ] **Rebuild and update the WASM hash table.** Run
-  `cargo build --release --target wasm32v1-none` and update the recorded
-  WASM hash table so it matches the new artifact.
-- [ ] **Copy the WASM into `polaris-oracle/wasm/`.** The rebuilt artifact
-  must be copied to the oracle-side `wasm/` directory so both sides stay in
-  sync.
-- [ ] **Coordinate oracle-side argument changes.** If the arguments the
-  oracle passes (or expects) change, update the oracle side in the same PR
-  or a linked one — don't leave the two halves disagreeing.
-- [ ] **Add a regression test named after the bug.** The test must fail
-  without the fix and pass with it, and be named for the bug it guards
-  against (e.g. `test_cancelled_double_count`).
+**Never renumber an existing error variant.** Once a variant has shipped
+with a numeric value, that value is permanent: do not change it, do not
+remove the variant, and do not reuse its number. New variants are
+appended with the next unused number. This keeps published mappings
+stable and prevents a code from silently changing meaning.
+
+When you add a variant, also add a row to the matching table in
+[ERRORS.md](./ERRORS.md), which is the canonical per-contract reference
+(code, variant, meaning, returning entrypoints, suggested user message).
+
+## Changing storage
+
+Storage keys, storage classes (instance vs persistent), and TTL bump
+policies are documented per contract in [docs/storage.md](./docs/storage.md).
+Before adding or changing any storage key or stored struct:
+
+- [ ] Read [docs/storage.md](./docs/storage.md) and confirm you are not
+  changing the shape of an already-deployed struct (add a new key instead).
+- [ ] Add a row for any new key to the matching table in
+  [docs/storage.md](./docs/storage.md), including its storage class, value
+  type, and TTL bump policy.
+- [ ] If the key is persistent, note it so archival/restore planning picks
+  it up.
 
 ## Peer review
 
