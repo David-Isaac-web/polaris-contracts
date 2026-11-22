@@ -1131,5 +1131,8 @@ that applies to fund-safety-critical code.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-127 -->
-- #127: contracts/market module doc still says cancelled redemption pays 1:1 per share on either side
+<!-- handsoff-issue-130 -->
+- #130: Oracle error-mapping closures are still inlined three times (market Reflector leg, perpetual Reflector and RedStone legs)
+
+<!-- handsoff-issue-131 -->
+- #131: Lazer payload verification (verify, find feed, validate price/exponent/timestamp) is duplicated between market settle() and perpetual checkpoint

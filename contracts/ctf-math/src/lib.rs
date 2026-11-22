@@ -16,7 +16,43 @@
 //! this crate just guarantees the *math* and *verification logic* those
 //! decisions are based on can't independently drift between contracts.
 
+use core::ops::RangeInclusive;
 use soroban_sdk::{contracttype, Env};
+
+/// Persistent-entry TTL target (in ledgers) every Polaris contract extends
+/// its instance/persistent storage to. Declared exactly once here so the
+/// mainnet TTL policy can be tuned in one place instead of seven.
+pub const BUMP_TO: u32 = 535_680;
+
+/// Threshold below which a persistent entry is considered due for a bump.
+pub const BUMP_THRESHOLD: u32 = 500_000;
+
+/// Valid `decimals` range for a SEP-40 oracle feed, derived from the
+/// conversion math in [`reflector_price_to_cents`]:
+///
+/// - Lower bound `2`: the conversion divides by `10^(decimals - 2)`, so
+///   `decimals < 2` would underflow the exponent subtraction.
+/// - Upper bound `30`: `10^30` is the largest power of ten that fits in an
+///   `i128` (`i128::MAX ≈ 1.7 * 10^38`), so `10^(decimals - 2)` stays
+///   representable up to `decimals == 30` and overflows beyond it.
+///
+/// Declared exactly once here so every caller (market, perpetual, oracle
+/// corroboration) shares the same bounds instead of restating them.
+pub const SEP40_DECIMALS_RANGE: RangeInclusive<u32> = 2..=30;
+
+/// Returns `true` when `decimals` is within [`SEP40_DECIMALS_RANGE`].
+pub fn valid_sep40_decimals(decimals: u32) -> bool {
+    SEP40_DECIMALS_RANGE.contains(&decimals)
+}
+
+/// Extends the current contract instance's TTL to `BUMP_TO` when it has
+/// fallen below `BUMP_THRESHOLD`. Shared by every Polaris contract so the
+/// bump window can't drift between them (see #11, #132).
+pub fn touch(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+}
 
 /// amount_out for a constant-product swap of `amount_in` (post-fee) against
 /// reserves (reserve_in, reserve_out). Floors, per Soroban i128 division.
@@ -134,13 +170,16 @@ pub fn to_cents(price: i64, exponent: i16) -> i128 {
 /// Converts Reflector's `PriceData.price` (scaled by `decimals`, USD-based
 /// same as Lazer's [`to_cents`]) into whole cents, rounding to the nearest
 /// cent rather than truncating — a floor bias would skew every divergence
-/// comparison in one direction. `decimals` is bounds-checked by the caller
-/// before this is called (guards the `10^(decimals - 2)` scaling from
-/// overflow/underflow at the extremes).
-///
-/// Rounds half away from zero, the same rule `to_cents` uses, so the two
-/// settlement paths agree at the strike boundary.
+/// comparison in one direction. `decimals` must be within
+/// [`SEP40_DECIMALS_RANGE`] (guards the `10^(decimals - 2)` scaling from
+/// overflow/underflow at the extremes); debug-asserted here so a caller
+/// that forgets to bounds-check trips in tests rather than silently
+/// producing a wrong price.
 pub fn reflector_price_to_cents(price: i128, decimals: u32) -> i128 {
+    debug_assert!(
+        valid_sep40_decimals(decimals),
+        "decimals out of SEP-40 range"
+    );
     let divisor = 10i128.pow(decimals - 2);
     let half = divisor / 2;
     if price >= 0 {
@@ -298,18 +337,6 @@ pub mod sep40 {
     // `lastprice`), where suppressing its own top-level spec entry seemed
     // right. It's since become a genuine field of `OracleFeedConfig`,
     // which *is* part of this contract's own public interface (an
-    // `Asset` is stored in market state), so it must be exported.
-    #[contracttype]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub enum Asset {
-        Stellar(Address),
-        Other(Symbol),
-    }
+    // `i
 
-    #[contracttype(export
-
-/// Placeholder kept so the file's existing `Env` import stays used; the
-/// oracle corroboration helpers below live in the same crate and are
-/// unchanged by the pool extraction.
-#[allow(dead_code)]
-fn _env_marker(_env: &Env) {}
+/* … truncated 688 chars — edit only what you need near the top … */
