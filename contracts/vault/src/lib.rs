@@ -32,30 +32,33 @@
 //! product would need share accounting before this is safe to open past a
 //! single trusted operator.
 
-use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, token, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, InvokeError, Symbol, Vec,
+};
 
-/// Imports `polaris-market`'s client from its *compiled wasm's own spec* —
-/// deliberately not a source dependency on the `polaris-market` crate.
-/// Depending on that crate directly (for its generated `PolarisMarketClient`)
-/// pulls its `#[contract]`-exported wasm symbols into *this* contract's own
-/// compiled output — confirmed the hard way: `cargo build --release
-/// --target wasm32v1-none` linked "successfully" but warned `function
-/// signature mismatch: initialize`, because both contracts export a
-/// same-named function and the linker was merging them into one binary.
-/// `contractimport!` reads the target wasm's embedded interface spec at
-/// compile time (the same spec `polaris-oracle`'s `contract.Spec.fromWasm`
-/// reads at runtime) to generate a byte-correct client — including the
-/// right `Result<T, Error>` unwrapping for `redeem` — without linking in
-/// any of that wasm's actual executable code. Path is relative to this
-/// crate's own directory (`contracts/vault/`), confirmed empirically —
-/// the SDK's own doc comment on `contractimport!` claims "relative to the
-/// workspace root," which did not hold for this soroban-sdk version.
-/// Requires `polaris-market`'s release wasm already built (`cargo build
-/// --release --target wasm32v1-none -p polaris-market`), same build-order
-/// dependency the top-level README already documents for wiring the
-/// compiled wasm into `polaris-oracle`.
-mod market_contract {
-    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/polaris_market.wasm");
+use polaris_ctf_math::OracleFeedConfig;
+
+/// `polaris-market`'s callable surface, hand-declared rather than imported
+/// from its compiled wasm. Deliberately not a source dependency on the
+/// `polaris-market` crate: depending on it directly (for its generated
+/// `PolarisMarketClient`) pulls its `#[contract]`-exported wasm symbols into
+/// *this* contract's own compiled output — confirmed the hard way: `cargo
+/// build --release --target wasm32v1-none` linked "successfully" but warned
+/// `function signature mismatch: initialize`, because both contracts export
+/// a same-named function and the linker was merging them into one binary.
+/// This used to be a `contractimport!` of the market's release wasm, which
+/// worked but made `cargo test -p polaris-vault` depend on a prior
+/// `cargo build -p polaris-market` — a build-order dependency invisible to
+/// Cargo's own graph. A hand-declared `#[contractclient]` trait generates
+/// the same byte-correct client (Soroban's wire encoding is structural, not
+/// identity-based) with no wasm file involved at all. Only the entrypoints
+/// this vault actually calls are declared; `try_redeem` is the generated
+/// `Result`-returning variant, so a market-side error surfaces as `Err`
+/// instead of trapping.
+#[allow(dead_code)]
+#[soroban_sdk::contractclient(name = "MarketClient")]
+pub trait MarketContract {
+    fn redeem(env: Env, user: Address) -> Result<i128, u32>;
 }
 
 /// Same TTL bump market/perpetual already use (~31 days at 5s/ledger) —
@@ -65,6 +68,30 @@ mod market_contract {
 /// its own instance-storage TTL, not just the ones that happen to write.
 const BUMP_TO: u32 = 535_680;
 const BUMP_THRESHOLD: u32 = 500_000;
+
+/// Most markets one `redeem_from_markets` call accepts — measured, not
+/// assumed (#38). Each market redeemed adds a fixed set of ledger entries
+/// to the transaction's footprint (the market's instance, the vault's YES
+/// and NO balance entries in it, and the market's collateral balance) on
+/// top of a fixed base (vault, token, shared market code). Metered against
+/// real `polaris-market` wasm under soroban-sdk 26.1's
+/// `InvocationResourceLimits::mainnet()`:
+///
+/// | markets | footprint entries (max 100) | write entries (max 50) | CPU insns (max 600M) | memory (max 40 MiB) | event bytes (max 16 KiB) |
+/// |---|---|---|---|---|---|
+/// | 1  | 18  | 6  | 1.1M  | 1.3 MB  | 492   |
+/// | 10 | 90  | 42 | 11.9M | 13.6 MB | 4,920 |
+/// | 11 | 98  | 46 | 13.2M | 15.0 MB | 5,412 |
+/// | 12 | 106 | 50 | 14.5M | 16.4 MB | 5,904 |
+///
+/// The footprint limit is the one that binds, not CPU: 12 markets is
+/// rejected (106 > 100), 11 is the true ceiling. The cap sits one below
+/// that, leaving 8 entries of headroom for what a test can't see — e.g.
+/// markets running different wasm versions after an upgrade, each adding
+/// its own code entry. Re-measure with the `measure_redeem_batch_costs`
+/// test (see `test.rs`) after any change to `polaris-market`'s storage
+/// layout or this entrypoint, and if the network's limits change.
+pub const MAX_REDEEM_BATCH: u32 = 10;
 
 fn touch(env: &Env) {
     env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
@@ -125,6 +152,7 @@ impl Vault {
         env.storage().instance().set(&STORAGE_KEY_TOTAL_WITHDRAWN, &0i128);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_REDEEMED, &0i128);
         touch(&env);
+        env.events().publish((symbol_short!("init"),), (admin, collateral));
         Ok(())
     }
 
@@ -133,18 +161,23 @@ impl Vault {
     /// track per-depositor shares, so depositing is currently a one-way,
     /// admin-trusted contribution, not a redeemable LP position. Stated
     /// plainly in the module doc; not hidden in the implementation.
+    /// Rejected with `DepositsPaused` while `pause_deposits` is in effect.
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), Error> {
         from.require_auth();
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
         let collateral = Self::require_collateral(&env)?;
+        if Self::is_deposits_paused(env.clone()) {
+            return Err(Error::DepositsPaused);
+        }
         token::Client::new(&env, &collateral).transfer(&from, &env.current_contract_address(), &amount);
 
         let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_DEPOSITED).unwrap_or(0);
-        env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &(total + amount));
+        let new_total = total + amount;
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &new_total);
         touch(&env);
-        env.events().publish((symbol_short!("deposit"), from), amount);
+        env.events().publish((symbol_short!("deposit"), from), (amount, new_total));
         Ok(())
     }
 
@@ -168,6 +201,35 @@ impl Vault {
         touch(&env);
         env.events().publish((symbol_short!("withdraw"), to), amount);
         Ok(())
+    }
+
+    /// Admin-gated pause for `deposit` only (#41) — e.g. during a migration
+    /// or an admin-rotation window, when new capital shouldn't land in an
+    /// instance that's about to be retired. Deliberately independent of
+    /// `polaris-market`/`polaris-perpetual`'s `pause()` (#8), which gates
+    /// trading on those contracts, not capital flowing into this one.
+    /// `withdraw`, `redeem_from_market`, and admin rotation are never
+    /// blocked by this, so the admin can still move funds out while
+    /// deposits are halted. Idempotent: pausing an already-paused vault is a
+    /// no-op that still emits the event.
+    pub fn pause_deposits(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_DEPOSITS_PAUSED, &true);
+        touch(&env);
+        env.events().publish((symbol_short!("dpaused"),), ());
+        Ok(())
+    }
+
+    pub fn unpause_deposits(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_DEPOSITS_PAUSED, &false);
+        touch(&env);
+        env.events().publish((symbol_short!("dunpaused"),), ());
+        Ok(())
+    }
+
+    pub fn is_deposits_paused(env: Env) -> bool {
+        env.storage().instance().get(&STORAGE_KEY_DEPOSITS_PAUSED).unwrap_or(false)
     }
 
     /// Collects this vault's own payout from a settled/cancelled market it
