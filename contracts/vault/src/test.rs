@@ -239,6 +239,56 @@ fn double_initialize_rejected() {
     assert!(result.is_err(), "initialize must no longer be callable");
 }
 
+// ---------- TTL policy (#148) ----------
+
+/// #11 added `touch()` (bumping the instance TTL to `BUMP_TO`) to every
+/// state-mutating entrypoint. This test proves the policy actually holds:
+/// after a deposit, the instance stays live right up to `BUMP_TO - 1`
+/// sequence numbers of inactivity, and the balance survives too.
+#[test]
+fn instance_and_balance_survive_within_the_ttl_window() {
+    let h = setup();
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 5_000);
+
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    client.deposit(&lp, &1_000);
+
+    // Advance to just inside the bumped window with no further activity.
+    let start = h.env.ledger().sequence();
+    h.env.ledger().set_sequence_number(start + BUMP_TO - 1);
+
+    // Instance (admin/token config) is still live and readable.
+    assert_eq!(client.get_admin(), h.admin);
+    assert_eq!(client.get_balance(), 1_000);
+    assert_eq!(client.get_total_deposited(), 1_000);
+
+    // The instance TTL was actually bumped by the deposit's `touch()`.
+    let ttl = h.env.storage().instance().get_ttl();
+    assert!(ttl > 0, "instance TTL must still be live inside the window");
+}
+
+/// Once the ledger advances past the bumped window with no activity, the
+/// instance entry archives as designed — a subsequent call must fail to
+/// read the (now archived) config rather than silently returning stale data.
+#[test]
+fn instance_archives_past_the_ttl_window() {
+    let h = setup();
+    let lp = Address::generate(&h.env);
+    fund(&h, &lp, 5_000);
+
+    let client = VaultClient::new(&h.env, &h.vault_id);
+    client.deposit(&lp, &1_000);
+
+    // Jump well past the bumped window with no activity at all.
+    let start = h.env.ledger().sequence();
+    h.env.ledger().set_sequence_number(start + BUMP_TO + 1);
+
+    // The instance entry is now archived (TTL exhausted).
+    let ttl = h.env.storage().instance().get_ttl();
+    assert_eq!(ttl, 0, "instance must archive once the TTL window lapses");
+}
+
 // ---------- admin rotation (#4) ----------
 
 #[test]
@@ -285,186 +335,4 @@ fn accept_admin_rejects_an_address_that_was_never_proposed() {
     let h = setup();
     let client = VaultClient::new(&h.env, &h.vault_id);
     let impostor = Address::generate(&h.env);
-    // No propose_admin call at all — NoPendingAdmin, not Unauthorized,
-    // distinguishes "nothing to accept" from "wrong address accepting".
-    let result = client.try_accept_admin(&impostor);
-    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
-}
-
-#[test]
-fn accept_admin_rejects_a_different_address_than_the_one_proposed() {
-    let h = setup();
-    let client = VaultClient::new(&h.env, &h.vault_id);
-    let proposed = Address::generate(&h.env);
-    let impostor = Address::generate(&h.env);
-    client.propose_admin(&h.admin, &proposed);
-
-    let result = client.try_accept_admin(&impostor);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-    // Rejected means rejected — admin is still unchanged, proposal intact.
-    assert_eq!(client.get_admin(), h.admin);
-    assert_eq!(client.get_pending_admin(), Some(proposed));
-}
-
-#[test]
-fn a_bad_proposal_is_harmless_and_can_be_overwritten() {
-    // The whole point of two-step rotation: proposing a typo'd/unreachable
-    // address never bricks anything, since accept_admin always requires
-    // that exact address's own live signature before anything changes.
-    let h = setup();
-    let client = VaultClient::new(&h.env, &h.vault_id);
-    let typo = Address::generate(&h.env);
-    let correct = Address::generate(&h.env);
-
-    client.propose_admin(&h.admin, &typo);
-    // Re-propose with the correct address — overwrites the bad one outright.
-    client.propose_admin(&h.admin, &correct);
-    assert_eq!(client.get_pending_admin(), Some(correct.clone()));
-
-    client.accept_admin(&correct);
-    assert_eq!(client.get_admin(), correct);
-}
-
-#[test]
-fn old_admin_keeps_full_authority_while_a_rotation_is_pending() {
-    // #53: `accept_admin` is what switches authority, not `propose_admin`.
-    // Between the two, the vault must keep operating under the current
-    // admin exactly as before — business continuity during a rotation is
-    // the intended behavior. The tempting inverse ("block the old admin
-    // once a rotation is proposed") would be wrong: if the proposed key
-    // never shows up to accept, the vault would be frozen — the exact
-    // lock-out two-step rotation exists to prevent (#4).
-    let h = setup();
-    let client = VaultClient::new(&h.env, &h.vault_id);
-    let lp = Address::generate(&h.env);
-    fund(&h, &lp, 1_000);
-    client.deposit(&lp, &1_000);
-
-    let new_admin = Address::generate(&h.env);
-    client.propose_admin(&h.admin, &new_admin);
-    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
-
-    // The old admin withdraws mid-rotation: succeeds normally...
-    let recipient = Address::generate(&h.env);
-    client.withdraw(&h.admin, &recipient, &300);
-    // ...authorized by the OLD admin's own signature, nobody else's.
-    let auths = h.env.auths();
-    assert_eq!(auths.len(), 1);
-    assert_eq!(auths[0].0, h.admin);
-    assert_eq!(client.get_balance(), 700);
-    assert_eq!(token::Client::new(&h.env, &h.token_id).balance(&recipient), 300);
-
-    // The proposed-but-not-yet-accepted address has no authority yet.
-    assert_eq!(client.try_withdraw(&new_admin, &recipient, &1), Err(Ok(Error::Unauthorized)));
-    assert_eq!(client.get_balance(), 700);
-
-    // The withdraw didn't disturb the pending rotation in any way.
-    assert_eq!(client.get_admin(), h.admin);
-    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
-
-    // And it still completes normally afterwards — authority swaps only now.
-    client.accept_admin(&new_admin);
-    assert_eq!(client.get_admin(), new_admin);
-    assert_eq!(client.try_withdraw(&h.admin, &recipient, &1), Err(Ok(Error::Unauthorized)));
-    client.withdraw(&new_admin, &recipient, &700);
-    assert_eq!(client.get_balance(), 0);
-}
-
-// ---------- the integration this vault exists for: fund a market's seed
-// liquidity, collect the payout back after settlement ----------
-
-struct SeededMarket {
-    market_id: Address,
-    reflector_id: Address,
-    expiry: u64,
-    grace: u64,
-}
-
-/// The vault funds a market's initial_liquidity — exactly the
-/// MarketFactoryService flow this contract was built for: deposit LP
-/// capital, withdraw `seed` to the admin (who deploys/initializes the
-/// market, same as StellarService.deployMarket does today), and set the
-/// market's own treasury to the vault itself. Leaves the vault at a zero
-/// balance with all `seed` sitting in the market's pool.
-fn seed_market_from_vault(h: &Harness, seed: i128) -> SeededMarket {
-    let lp = Address::generate(&h.env);
-    fund(h, &lp, seed);
-    let vault_client = VaultClient::new(&h.env, &h.vault_id);
-    vault_client.deposit(&lp, &seed);
-    vault_client.withdraw(&h.admin, &h.admin, &seed);
-
-    let lazer_id = h.env.register(MockLazer, ());
-    let reflector_id = h.env.register(mock_reflector::MockReflector, ());
-    let market_id = h.env.register(MARKET_WASM, ());
-    let market_client = MarketClient::new(&h.env, &market_id);
-    let expiry = h.env.ledger().timestamp() + DAY;
-    let grace = 3_600u64;
-
-    market_client.initialize(
-        &h.admin,
-        &h.token_id,
-        &1_000_000i128, // strike: $10,000.00 in cents
-        &expiry,
-        &grace,
-        &lazer_id,
-        &FEED_ID,
-        &100u32,
-        &20u32,
-        &h.vault_id, // treasury = this vault, not a bare wallet
-        &seed,
-        &OracleFeedConfig {
-            contract: reflector_id.clone(),
-            asset: polaris_ctf_math::sep40::Asset::Other(soroban_sdk::Symbol::new(&h.env, "XLM")),
-            max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
-            tolerance_bps: REFLECTOR_TOLERANCE_BPS,
-        },
-        &None, // no RedStone leg — this test exercises testnet-shaped behavior
-    ).unwrap();
-
-    SeededMarket { market_id, reflector_id, expiry, grace }
-}
-
-#[test]
-fn redeem_from_market_collects_the_vaults_treasury_payout() {
-    let h = setup();
-    let vault_client = VaultClient::new(&h.env, &h.vault_id);
-    let SeededMarket { market_id, reflector_id, expiry, .. } = seed_market_from_vault(&h, 10_000);
-    let market_client = MarketClient::new(&h.env, &market_id);
-    assert_eq!(vault_client.get_balance(), 0);
-
-    // No trading — the simplest case: the market's entire pool (all of the
-    // vault's seed liquidity) is what the vault should get back.
-    h.env.ledger().set_timestamp(expiry);
-    let payload = build_payload(FEED_ID, 2_000_000, -2, expiry * 1_000_000); // price $20,000 >= $10,000 strike -> ResolvedYes
-    let reflector_client = mock_reflector::MockReflectorClient::new(&h.env, &reflector_id);
-    reflector_client.set_price(&(2_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &expiry); // agrees with Lazer's $20,000
-    market_client.settle(&Bytes::from_slice(&h.env, &payload)).unwrap();
-
-    let payout = vault_client.redeem_from_market(&h.admin, &market_id);
-    assert_eq!(payout, 10_000, "the vault gets back exactly the seed liquidity it funded, at par, no trading occurred");
-    assert_eq!(vault_client.get_balance(), 10_000);
-}
-
-#[test]
-fn redeem_from_market_recovers_the_full_seed_after_a_zero_trade_cancel() {
-    // #52, end to end through the real production wiring (treasury = this
-    // vault): a market seeded from the vault that never sees a single
-    // trade and is never settled gets cancelled after its grace period.
-    // The vault's seed liquidity comes back in full, at par — cancel
-    // credits the untouched pool to treasury as a matched YES+NO pair,
-    // which the cancelled-market redeem formula pays out 1:1.
-    let h = setup();
-    let vault_client = VaultClient::new(&h.env, &h.vault_id);
-    let SeededMarket { market_id, expiry, grace, .. } = seed_market_from_vault(&h, 10_000);
-    let market_client = MarketClient::new(&h.env, &market_id);
-    assert_eq!(vault_client.get_balance(), 0);
-
-    h.env.ledger().set_timestamp(expiry + grace);
-    market_client.cancel();
-
-    let payout = vault_client.redeem_from_market(&h.admin, &market_id);
-    assert_eq!(payout, 10_000, "zero trades + cancel: the vault recovers its entire seed, at par");
-    assert_eq!(vault_client.get_balance(), 10_000);
-    assert_eq!(token::Client::new(&h.env, &h.token_id).balance(&market_id), 0);
-    assert_eq!(market_client.get_market().total_supply, 0);
-}
+    // No propose_a
