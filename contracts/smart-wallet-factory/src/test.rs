@@ -30,16 +30,14 @@ fn test_origin(env: &Env) -> Bytes {
     Bytes::from_slice(env, TEST_ORIGIN)
 }
 
-/// Registers a factory, uploads the real smart-wallet wasm, and pins it
-/// (plus a fixed origin) via `initialize` — the setup every test below
-/// needs before `deploy` will do anything.
+/// Registers a factory, uploading the real smart-wallet wasm and pinning it
+/// (plus a fixed origin) through the `__constructor` — the setup every test
+/// below needs before `deploy` will do anything.
 fn setup(env: &Env) -> (Address, BytesN<32>) {
     env.mock_all_auths();
-    let factory_id = env.register(SmartWalletFactory, ());
     let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
     let admin = Address::generate(env);
-    let client = SmartWalletFactoryClient::new(env, &factory_id);
-    client.initialize(&admin, &wasm_hash, &test_origin(env));
+    let factory_id = env.register(SmartWalletFactory, (&admin, &wasm_hash, &test_origin(env)));
     (factory_id, wasm_hash)
 }
 
@@ -58,6 +56,26 @@ fn resolve_matches_what_deploy_actually_produces() {
 
     assert_eq!(resolved_before, deployed_address);
     assert_eq!(resolved_after, deployed_address);
+}
+
+#[test]
+fn is_deployed_is_false_before_deploy_and_true_after() {
+    let env = Env::default();
+    let (factory_id, _) = setup(&env);
+    let pk = sample_pk(&env, 3);
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+
+    assert!(!client.is_deployed(&pk));
+    let (resolved, deployed_before) = client.resolve_with_status(&pk);
+    assert!(!deployed_before);
+
+    let address = client.deploy(&pk);
+
+    assert!(client.is_deployed(&pk));
+    let (resolved_after, deployed_after) = client.resolve_with_status(&pk);
+    assert!(deployed_after);
+    assert_eq!(resolved, address);
+    assert_eq!(resolved_after, address);
 }
 
 #[test]
@@ -94,6 +112,30 @@ fn deployed_wallet_is_initialized_with_the_given_key() {
 }
 
 #[test]
+fn deploy_emits_a_deploy_event_indexing_the_wallet() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{Symbol, TryIntoVal};
+
+    let env = Env::default();
+    let (factory_id, _) = setup(&env);
+    let pk = sample_pk(&env, 9);
+
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+    let wallet_address = client.deploy(&pk);
+
+    let events = env.events().all();
+    let (contract, topics, data) = events.last().expect("deploy must emit an event");
+    assert_eq!(contract, factory_id);
+    assert_eq!(topics.len(), 2);
+    let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+    let topic1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic0, symbol_short!("deploy"));
+    assert_eq!(topic1, wallet_address);
+    let emitted_pk: BytesN<65> = data.try_into_val(&env).unwrap();
+    assert_eq!(emitted_pk, pk);
+}
+
+#[test]
 fn deployed_wallet_is_bound_to_the_factorys_pinned_origin() {
     let env = Env::default();
     let (factory_id, _) = setup(&env);
@@ -111,41 +153,88 @@ fn deployed_wallet_is_bound_to_the_factorys_pinned_origin() {
 }
 
 #[test]
+fn deploy_with_malformed_key_fails_atomically() {
+    let env = Env::default();
+    let (factory_id, _) = setup(&env);
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+
+    let mut bytes = [9u8; 65];
+    bytes[0] = 0x02; // compressed prefix, not an uncompressed SEC1 point
+    let bad_pk = BytesN::from_array(&env, &bytes);
+
+    let result = client.try_deploy(&bad_pk);
+    assert!(result.is_err());
+
+    // The child's `init` rejected the key, so the whole deploy rolled back:
+    // no contract exists at the address `resolve` predicts for that key.
+    let predicted = client.resolve(&bad_pk);
+    let stored_pk: Result<BytesN<65>, _> = env.try_invoke_contract(
+        &predicted,
+        &soroban_sdk::Symbol::new(&env, "get_public_key"),
+        soroban_sdk::vec![&env],
+    );
+    assert!(stored_pk.is_err());
+}
+
+#[test]
 fn same_public_key_cannot_deploy_twice() {
     let env = Env::default();
     let (factory_id, _) = setup(&env);
     let pk = sample_pk(&env, 3);
 
     let client = SmartWalletFactoryClient::new(&env, &factory_id);
-    client.deploy(&pk);
+    let first = client.deploy(&pk);
 
-    let result = client.try_deploy(&pk);
-    assert!(result.is_err(), "redeploying the same passkey must fail, not silently succeed");
+    let second = client.try_deploy(&pk);
+    assert_eq!(
+        second,
+        Ok(Ok(first.clone())),
+        "a second deploy for the same passkey must return the existing address"
+    );
+    assert_eq!(client.resolve(&pk), first);
 }
 
 #[test]
-fn deploy_before_initialize_rejected() {
+fn constructor_stores_the_admin() {
     let env = Env::default();
     env.mock_all_auths();
-    let factory_id = env.register(SmartWalletFactory, ());
+    let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
+    let admin = Address::generate(&env);
+    let factory_id = env.register(SmartWalletFactory, (&admin, &wasm_hash, &test_origin(&env)));
+    let client = SmartWalletFactoryClient::new(&env, &factory_id);
+
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn get_admin_before_initialize_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // A factory can no longer be registered unconfigured: the constructor
+    // (#95) runs atomically with the deploy, so there is no window in which
+    // `deploy` could observe missing wasm/origin state.
+    let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
+    let admin = Address::generate(&env);
+    let factory_id = env.register(SmartWalletFactory, (&admin, &wasm_hash, &test_origin(&env)));
     let client = SmartWalletFactoryClient::new(&env, &factory_id);
 
     let result = client.try_deploy(&sample_pk(&env, 4));
-    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+    assert!(result.is_ok(), "a constructed factory must be immediately usable");
 }
 
 #[test]
 fn double_initialize_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    let factory_id = env.register(SmartWalletFactory, ());
     let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
     let admin = Address::generate(&env);
+    let factory_id = env.register(SmartWalletFactory, (&admin, &wasm_hash, &test_origin(&env)));
     let client = SmartWalletFactoryClient::new(&env, &factory_id);
 
-    client.initialize(&admin, &wasm_hash, &test_origin(&env));
+    // No `initialize` entrypoint exists any more (#95) — the constructor is
+    // the only setup path, and it runs exactly once, at deploy time.
     let result = client.try_initialize(&admin, &wasm_hash, &test_origin(&env));
-    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    assert!(result.is_err(), "initialize must no longer be callable");
 }
 
 #[test]
@@ -163,6 +252,63 @@ fn initialize_requires_the_admins_own_authorization() {
         client.initialize(&admin, &wasm_hash, &test_origin(&env))
     }));
     assert!(result.is_err(), "initialize without the admin's authorization must fail, not succeed");
+}
+
+// ---------- origin validation at initialize() ----------
+
+#[test]
+fn initialize_accepts_well_formed_origins() {
+    let accepted: [&[u8]; 5] = [
+        b"https://polaris-frontend-iota.vercel.app",
+        b"https://polaris.xyz",
+        b"https://localhost:3000",
+        b"http://localhost",
+        b"http://localhost:8080",
+    ];
+    for origin in accepted {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register(SmartWalletFactory, ());
+        let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
+        let admin = Address::generate(&env);
+        let client = SmartWalletFactoryClient::new(&env, &factory_id);
+        let origin = Bytes::from_slice(&env, origin);
+        assert_eq!(
+            client.try_initialize(&admin, &wasm_hash, &origin),
+            Ok(Ok(())),
+            "origin should be accepted"
+        );
+    }
+}
+
+#[test]
+fn initialize_rejects_malformed_origins() {
+    let rejected: [&[u8]; 10] = [
+        b"",
+        b"https://",
+        b"https://polaris.xyz/",
+        b"https://polaris.xyz/app",
+        b"https://polaris.xyz?x=1",
+        b"https://polaris.xyz#frag",
+        b"http://polaris.xyz",
+        b"ftp://polaris.xyz",
+        b"polaris.xyz",
+        b"https://user@polaris.xyz",
+    ];
+    for origin in rejected {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register(SmartWalletFactory, ());
+        let wasm_hash = env.deployer().upload_contract_wasm(SMART_WALLET_WASM);
+        let admin = Address::generate(&env);
+        let client = SmartWalletFactoryClient::new(&env, &factory_id);
+        let origin = Bytes::from_slice(&env, origin);
+        assert_eq!(
+            client.try_initialize(&admin, &wasm_hash, &origin),
+            Err(Ok(Error::InvalidOrigin)),
+            "origin should be rejected"
+        );
+    }
 }
 
 // ---------- regression: deploy() always uses the pinned wasm, no matter
