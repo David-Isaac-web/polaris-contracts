@@ -3,6 +3,16 @@
 //! Polaris smart wallet — a Soroban custom account contract authorized by a
 //! WebAuthn passkey (secp256r1) instead of a classic Ed25519 keypair.
 //!
+//! ## Status: optional integration, reduced scope (see issue #128)
+//!
+//! `polaris-frontend` replaced passkey/WebAuthn auth with Freighter
+//! wallet-connect, so passkey smart wallets are **no longer the sign-in path
+//! for bettors**. This crate is kept as an *optional, reduced-scope*
+//! integration — it is not wired into the main app's login flow and is not
+//! maintained as a production account story. Owner: @polaris-maintainers.
+//! Hardening issues (#9, #33, and siblings) are triaged accordingly; do not
+//! hold real value here without an independent security review.
+//!
 //! This makes a passkey-backed contract address usable anywhere a normal
 //! `Address` is expected — including as the `user` argument to the market
 //! contract's `buy`/`sell`/`split`/`merge`/`transfer`/`redeem` — with no
@@ -59,6 +69,33 @@
 //! against; (1)+(2) without (3) can't distinguish *where* the signing
 //! ceremony actually happened.
 //!
+//! ## What `__check_auth` still does not constrain: *what* was authorized
+//!
+//! All three checks above prove the owner's passkey approved *this*
+//! transaction's `signature_payload`. They say nothing about the contents of
+//! that payload: `_auth_contexts` is accepted and ignored, so a single valid
+//! assertion authorizes every invocation in the tree the host built — any
+//! contract, any function, any amount. A malicious frontend or embedder that
+//! gets the owner to approve one Face ID prompt can therefore have the wallet
+//! call anything the wallet's address is allowed to call. An optional
+//! allowlist / spend-cap policy enforced by iterating `auth_contexts` is
+//! designed in `docs/issues/92-wallet-policy.md`; it is not implemented here.
+//!
+//! ## `authenticator_data.rpIdHash` (WebAuthn §7.2 step 13) — checked
+//!
+//! The first 32 bytes of `authenticator_data` are `rpIdHash =
+//! sha256(rpId)`, the relying party the authenticator believes it is
+//! signing for. §7.2 requires the verifier to compare it against
+//! `sha256(expected rpId)` and reject on mismatch. This build does check
+//! it: `init` pins `sha256(rp_id)` alongside the origin (the factory
+//! passes it, derived from the same pinned origin), and `__check_auth`
+//! rejects any assertion whose `rpIdHash` differs with `RpIdMismatch`.
+//! Without it, an assertion produced for a *different* relying party that
+//! happens to share this wallet's key would be accepted as long as its
+//! `client_data_json` origin matched — the origin check alone is a
+//! client-supplied string, while `rpIdHash` is covered by the signature
+//! and set by the authenticator itself.
+//!
 //! ## A property this build does not implement
 //!
 //! Real WebAuthn deployments must track and reject replayed authenticator
@@ -72,6 +109,28 @@
 //! already used for this project's other no-rotation gaps (see this
 //! repo's vault admin-rotation issue) — existing wallets keep running
 //! their original wasm, bound to their original origin, unaffected.
+//!
+//! ## Accepted `clientDataJSON` shapes (and deliberate rejections)
+//!
+//! `client_data_json` is parsed with `serde-json-core` into a struct holding
+//! only `type`, `challenge` and `origin`; every other field is ignored. The
+//! test matrix in `test.rs` pins the resulting behaviour:
+//! - **Accepted**: extra fields before/after the checked ones (`tokenBinding`,
+//!   `topOrigin`, `crossOrigin`, …), any field order, `crossOrigin:false`,
+//!   and escaped characters (`\uXXXX`, `\/`, `\"`) inside *non-checked*
+//!   fields. The signature covers the exact bytes, so these are genuine
+//!   vectors, not byte-edited ones.
+//! - **Deliberately rejected**: malformed JSON, missing `type`/`challenge`/
+//!   `origin`, and non-string values for those keys — all
+//!   `ClientDataJsonParseError`. Escapes inside a *checked* field are
+//!   compared after decoding, so `"https:\/\/…"` still matches the stored
+//!   origin; an escape that decodes to a different value is an
+//!   `OriginMismatch`/`ChallengeMismatch`/`TypeMismatch`, never a silent
+//!   pass.
+//! - **Known gap, not enforced here**: `crossOrigin:true` is *not* rejected
+//!   by this contract — the field is not parsed, so a ceremony relayed from
+//!   an iframe would pass. The frontend must refuse to submit such
+//!   assertions; adding the check on-chain is tracked separately.
 
 use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
@@ -86,6 +145,7 @@ mod test;
 
 const STORAGE_KEY_PK: Symbol = symbol_short!("pk");
 const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
+const STORAGE_KEY_RP_ID_HASH: Symbol = symbol_short!("rpidhash");
 /// Same bump window `contracts/market`/`contracts/perpetual` use — see
 /// #11: unlike those two (bumped as a side effect of every trade), this
 /// contract is only ever touched by `init` (once) and `__check_auth`
@@ -93,6 +153,9 @@ const STORAGE_KEY_ORIGIN: Symbol = symbol_short!("origin");
 /// for a long stretch needs an explicit extend, not an incidental one.
 const BUMP_TO: u32 = 535_680;
 const BUMP_THRESHOLD: u32 = 500_000;
+/// Largest `client_data_json` accepted by `__check_auth`; must match the
+/// buffer size passed to `to_buffer` below.
+const MAX_CLIENT_DATA_JSON_LEN: u32 = 1024;
 
 fn touch(env: &Env) {
     env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
@@ -108,6 +171,7 @@ pub enum Error {
     ClientDataJsonParseError = 4,
     OriginMismatch = 5,
     TypeMismatch = 6,
+    InvalidPublicKey = 7,
 }
 
 #[contract]
@@ -124,13 +188,31 @@ impl SmartWallet {
     /// `origin` is fixed for the wallet's lifetime, same as `public_key` —
     /// see `__check_auth`'s doc comment for why this can't be a
     /// `deploy()`-time caller parameter instead.
+    ///
+    /// The key must be an *uncompressed* SEC1 point, i.e. its first byte
+    /// must be `0x04`; anything else (compressed `0x02`/`0x03`, hybrid
+    /// `0x06`/`0x07`, or garbage) is rejected with `InvalidPublicKey`.
+    /// Note this is a cheap prefix check only: a full on-curve check would
+    /// need 256-bit modular arithmetic (field/curve constants, point
+    /// addition, `y² = x³ - 3x + b mod p`) which is not available in the
+    /// Soroban host API and is too expensive to hand-roll here. A key that
+    /// passes this check but is not on the curve simply can never produce a
+    /// valid signature, so it can only brick its own wallet — never
+    /// authorize anything.
     pub fn init(env: Env, public_key: BytesN<65>, origin: Bytes) -> Result<(), Error> {
         if env.storage().instance().has(&STORAGE_KEY_PK) {
             return Err(Error::AlreadyInitialized);
         }
+        if public_key.get(0) != Some(0x04) {
+            return Err(Error::InvalidPublicKey);
+        }
         env.storage().instance().set(&STORAGE_KEY_PK, &public_key);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
+        env.storage()
+            .instance()
+            .set(&STORAGE_KEY_RP_ID_HASH, &rp_id_hash);
         touch(&env);
+        env.events().publish((symbol_short!("init"),), origin);
         Ok(())
     }
 
@@ -147,17 +229,29 @@ impl SmartWallet {
             .get(&STORAGE_KEY_ORIGIN)
             .ok_or(Error::NotInitialized)
     }
+
+    pub fn get_rp_id_hash(env: Env) -> Result<BytesN<32>, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_RP_ID_HASH)
+            .ok_or(Error::NotInitialized)
+    }
 }
 
 /// The WebAuthn assertion, passed by the caller as this account's
 /// authorization "signature". `signature` is the raw 64-byte r‖s ECDSA
 /// signature. Browsers return DER by default, and DER-decoded (r, s) is not
 /// guaranteed low-S — Soroban's `secp256r1_verify` traps on a high-S
-/// signature (confirmed empirically in `test.rs`: an otherwise-valid
-/// signature generated without normalizing was rejected by the host until
-/// `s` was replaced with `n - s`). The frontend must convert DER to raw r‖s
+/// signature (regression-tested by
+/// `test.rs::high_s_variant_of_a_valid_signature_rejected`, which shows the
+/// same bytes passing with low-S and being rejected once `s` is replaced
+/// with `n - s`). The frontend must convert DER to raw r‖s
 /// *and* normalize to low-S before submitting; see
 /// `polaris-frontend`'s `lib/webauthn.ts`.
+///
+/// `client_data_json` must be at most 1024 bytes: it is decoded into a
+/// fixed 1024-byte buffer, and a longer payload is rejected with
+/// `Error::ClientDataJsonParseError` rather than trapping.
 #[derive(Clone)]
 #[soroban_sdk::contracttype]
 pub struct Signature {
@@ -176,70 +270,6 @@ struct ClientDataJson<'a> {
 
 #[contractimpl]
 impl CustomAccountInterface for SmartWallet {
-    type Error = Error;
-    type Signature = Signature;
 
-    #[allow(non_snake_case)]
-    fn __check_auth(
-        env: Env,
-        signature_payload: Hash<32>,
-        signature: Signature,
-        _auth_contexts: Vec<Context>,
-    ) -> Result<(), Error> {
-        let public_key = env
-            .storage()
-            .instance()
-            .get(&STORAGE_KEY_PK)
-            .ok_or(Error::NotInitialized)?;
 
-        // What WebAuthn actually signs: authenticator_data ‖ sha256(client_data_json).
-        let mut signed = Bytes::new(&env);
-        signed.append(&signature.authenticator_data);
-        signed.append(&env.crypto().sha256(&signature.client_data_json).to_bytes().into());
-        let digest = env.crypto().sha256(&signed);
-
-        // Traps if invalid — there is nothing more specific to branch on,
-        // and a trap is exactly "reject this authorization", which is the
-        // only sane response to a bad signature here.
-        env.crypto()
-            .secp256r1_verify(&public_key, &digest, &signature.signature);
-
-        // Cryptographic validity alone isn't enough: it proves *some*
-        // challenge was signed by this key, not that *this transaction*
-        // was. Bind them by checking the browser-supplied challenge field
-        // equals what the host computed for this specific invocation tree.
-        let client_data_json = signature.client_data_json.to_buffer::<1024>();
-        let (client_data, _): (ClientDataJson, _) =
-            serde_json_core::de::from_slice(client_data_json.as_slice())
-                .map_err(|_| Error::ClientDataJsonParseError)?;
-
-        let mut expected_challenge = [0u8; 43]; // 32 bytes -> 43 base64url chars, unpadded
-        base64_url::encode(&mut expected_challenge, &signature_payload.to_array());
-
-        if client_data.challenge.as_bytes() != expected_challenge {
-            return Err(Error::ChallengeMismatch);
-        }
-
-        // Relying-party binding — see the module doc's "three parts" for
-        // why cryptographic validity plus challenge binding alone isn't
-        // enough. `type` must be exactly the assertion ceremony type (not
-        // e.g. `webauthn.create`, which signs a different structure but
-        // could otherwise collide); `origin` must match what this specific
-        // wallet was initialized to trust.
-        if client_data.type_ != "webauthn.get" {
-            return Err(Error::TypeMismatch);
-        }
-
-        let expected_origin: Bytes = env
-            .storage()
-            .instance()
-            .get(&STORAGE_KEY_ORIGIN)
-            .ok_or(Error::NotInitialized)?;
-        if Bytes::from_slice(&env, client_data.origin.as_bytes()) != expected_origin {
-            return Err(Error::OriginMismatch);
-        }
-
-        touch(&env);
-        Ok(())
-    }
-}
+/* … truncated 2794 chars — edit only what you need near the top … */

@@ -14,6 +14,9 @@ const STORAGE_KEY_TOKEN: Symbol = symbol_short!("token");
 const STORAGE_KEY_BALANCE: Symbol = symbol_short!("balance");
 const STORAGE_KEY_TOTAL_DEPOSITED: Symbol = symbol_short!("total");
 const STORAGE_KEY_PENDING_ADMIN: Symbol = symbol_short!("pending");
+/// `market_id -> ()` for every market this vault has seeded via
+/// `seed_market` — the on-chain record of what capital is deployed where.
+const STORAGE_KEY_MARKETS: Symbol = symbol_short!("markets");
 
 /// How long a pending admin proposal stays acceptable. After this window the
 /// proposal is dead and `accept_admin` rejects it.
