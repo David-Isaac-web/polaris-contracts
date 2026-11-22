@@ -1131,8 +1131,5 @@ that applies to fund-safety-critical code.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-146 -->
-- #146: contracts/market+perpetual: get_price() rounding and its post-resolution behavior are untested
-
-<!-- handsoff-issue-149 -->
-- #149: contracts/market: both settlement paths are always callable, so the caller picks Lazer or Reflector with no per-market restriction
+<!-- handsoff-issue-144 -->
+- #144: contracts/market: redeem() requires the holder's auth even though the payout always goes to the holder, so keepers can't auto-pay winners
