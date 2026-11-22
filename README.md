@@ -342,6 +342,41 @@ which has no expiry, so "wait for it to resolve" never comes.
 brute-forces the monotonicity claim, floor rounding included, against the
 shared curve.)
 
+## Fee yield vs. price movement in the pool
+
+Swap fees never leave the pool. They accrue into its depth and reach the
+treasury at settlement. `get_market()`'s raw `pool_yes`/`pool_no` can't
+separate that yield from the seed or from the pool simply going lopsided
+as the price moves. `get_pool_growth()` (read-only, `Open` markets only,
+nothing new stored) does:
+
+| Field | Meaning |
+|---|---|
+| `initial_liquidity` | the seed |
+| `invariant_liquidity` | `floor(sqrt(pool_yes · pool_no))`: depth with the price effect removed |
+| `fee_growth` | `invariant_liquidity − initial_liquidity`: fee accrual |
+| `pool_value` | pool shares marked at `get_price`'s odds, `floor(2·pool_yes·pool_no / (pool_yes + pool_no))` |
+| `price_effect` | `pool_value − invariant_liquidity`, always `≤ 0`: the AMM's impermanent loss |
+
+`pool_value == initial_liquidity + fee_growth + price_effect` holds exactly.
+The split works because a fee-free constant-product swap leaves `k =
+pool_yes · pool_no` unchanged, and only the fee grows it. Price movement
+shows up only in `price_effect`, and it unwinds as odds return to 50/50.
+`fee_growth` only grows. The one exception is integer rounding of about one
+unit per trade, which can go either way, so it is visible only on a 0 bps
+curve. Once a market settles or is cancelled, the reserves are swept to the
+treasury and zeroed. The swept amounts are the treasury's credited YES/NO
+shares (and are in the `cancel` event), so the same formulas give the final
+breakdown.
+
+It describes the whole pool, not a per-LP share. That's enough while the
+treasury/vault is the only LP. Fractional LP shares
+([#2](https://github.com/PolarisQ-xyz/polaris-contracts/issues/2)) would
+divide these numbers by shares rather than replace them.
+([#31](https://github.com/PolarisQ-xyz/polaris-contracts/issues/31), tests:
+`pool_growth_separates_fee_accrual_from_price_movement`,
+`fee_growth_accumulates_across_trades_while_the_price_effect_can_unwind`.)
+
 ## Event schema
 
 Every event was audited against one question: could an indexer render a

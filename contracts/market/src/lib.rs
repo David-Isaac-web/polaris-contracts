@@ -89,7 +89,7 @@ use pyth_lazer_stellar_sdk::PythLazerClient;
 // this crate's full test suite after touching this file; every number
 // must come out identical).
 use polaris_ctf_math::{
-    apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, reflector_price_to_cents,
+    apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, isqrt, reflector_price_to_cents,
     sep40::Sep40Client, to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig,
     MAX_STALENESS_SECS,
 };
@@ -309,6 +309,50 @@ pub struct Market {
 pub struct RedstoneOracle {
     pub config: OracleFeedConfig,
     pub decimals_at_init: u32,
+}
+
+/// `get_pool_growth()`'s answer to "how much of the AMM pool is fee yield,
+/// and how much is the seed plus price movement?" (#31). Every field is
+/// derived from `Market`'s existing `pool_yes`/`pool_no`/`initial_liquidity`
+/// on each call. Nothing extra is stored, and the stored `Market` shape
+/// is unchanged.
+///
+/// Why the split is clean: `buy`/`sell` without a fee would keep the
+/// constant product `k = pool_yes * pool_no` fixed while moving the price.
+/// Up to integer rounding, the fee is the only thing that grows `k`,
+/// because the pool keeps the full input but pays out only against the
+/// fee-reduced `effective_in`. So `sqrt(k)` is a price-independent measure
+/// of depth, and its growth over the seed is fee accrual. What's left in
+/// the pool's marked value is the price-driven part.
+///
+/// Exact identity, in collateral units (integer floors included):
+/// `pool_value == initial_liquidity + fee_growth + price_effect`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PoolGrowth {
+    /// Seed collateral, which is also each reserve's starting depth.
+    pub initial_liquidity: i128,
+    pub pool_yes: i128,
+    pub pool_no: i128,
+    /// `floor(sqrt(pool_yes * pool_no))`: depth with the price effect
+    /// removed. Equals `initial_liquidity` on a fresh market.
+    pub invariant_liquidity: i128,
+    /// `invariant_liquidity - initial_liquidity`. Fee accrual, plus the
+    /// integer rounding in `cpmm_out`/`cpmm_sell_out`, which can go either
+    /// way by about one unit of `sqrt(k)` per trade. With a nonzero fee the
+    /// fee dominates, so this only goes negative on a market whose fee
+    /// curve is at `0` bps, and then only by that rounding.
+    pub fee_growth: i128,
+    /// The pool's YES + NO shares marked at the current implied price, the
+    /// same price `get_price` reports: `pool_yes * p_yes + pool_no * p_no`
+    /// with `p_yes = pool_no / (pool_yes + pool_no)`, which simplifies to
+    /// `floor(2 * pool_yes * pool_no / (pool_yes + pool_no))`.
+    pub pool_value: i128,
+    /// `pool_value - invariant_liquidity`: the price-driven part. Always
+    /// `<= 0` (a harmonic mean never exceeds the geometric mean). This is
+    /// the AMM's impermanent loss. It is `0` when the price is 50/50, so a
+    /// round trip back to even odds leaves only fee growth.
+    pub price_effect: i128,
 }
 
 #[derive(Clone)]
@@ -1253,6 +1297,41 @@ impl PolarisMarket {
     pub fn get_fee(env: Env) -> Result<u32, Error> {
         let m = load_market(&env)?;
         Ok(effective_fee_bps(&m))
+    }
+
+    /// Splits the AMM pool's current size into the seed, fee-accrued
+    /// growth, and the price-driven part (#31). See `PoolGrowth` for the
+    /// definitions and the identity they satisfy. Read-only; it doesn't
+    /// need per-share LP accounting, because it describes the whole pool,
+    /// which today has one LP (the treasury/vault).
+    ///
+    /// Open markets only, the same as `get_price`: `settle`/`cancel` sweep
+    /// both reserves to the treasury and zero them, so there is no pool
+    /// left to describe. Returns `MarketSettledOrCancelled` then. The swept
+    /// amounts are exactly the treasury's credited YES/NO shares (and are
+    /// in the `cancel` event), so the same formulas applied to them give
+    /// the pool's final breakdown.
+    ///
+    /// Arithmetic is the same magnitude class as `buy`/`sell`'s own
+    /// (`pool_yes * pool_no` must fit in `i128`), so any pool those
+    /// entrypoints can produce is covered.
+    pub fn get_pool_growth(env: Env) -> Result<PoolGrowth, Error> {
+        let m = load_market(&env)?;
+        if m.status != MarketStatus::Open {
+            return Err(Error::MarketSettledOrCancelled);
+        }
+        let product = m.pool_yes * m.pool_no;
+        let invariant_liquidity = isqrt(product);
+        let pool_value = 2 * product / (m.pool_yes + m.pool_no);
+        Ok(PoolGrowth {
+            initial_liquidity: m.initial_liquidity,
+            pool_yes: m.pool_yes,
+            pool_no: m.pool_no,
+            invariant_liquidity,
+            fee_growth: invariant_liquidity - m.initial_liquidity,
+            pool_value,
+            price_effect: pool_value - invariant_liquidity,
+        })
     }
 }
 

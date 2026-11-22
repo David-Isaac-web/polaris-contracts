@@ -50,6 +50,9 @@ are not affected. Renamed in #58:
 - `RedstoneDecimalsInvalid` → `RedstoneDecimalsOutOfRange` (32)
 - `RedstoneDecimalsChanged` → `RedstoneDecimalsDriftedSinceInit` (33)
 
+Added: `market::Client::get_pool_growth` and the `market::PoolGrowth` type
+(#31).
+
 Bump `version` to 0.2.0 when `wasm/` is next re-synced with
 `scripts/sync-interface-wasm.sh` (see Releasing below).
 

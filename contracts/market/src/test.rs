@@ -2293,6 +2293,129 @@ fn resolved_no_redeem_stays_solvent_for_every_holder_including_treasury() {
     resolved_redeem_stays_solvent_for_every_holder(false);
 }
 
+// ---------- fee-driven vs price-driven pool growth (#31) ----------
+
+fn assert_growth_identity(g: &PoolGrowth) {
+    assert_eq!(g.pool_value, g.initial_liquidity + g.fee_growth + g.price_effect, "{g:?}");
+    assert_eq!(g.fee_growth, g.invariant_liquidity - g.initial_liquidity, "{g:?}");
+    assert!(g.price_effect <= 0, "price movement can only cost the pool, never add to it: {g:?}");
+}
+
+#[test]
+fn pool_growth_on_a_fresh_market_is_all_seed() {
+    let h = setup(1_000_000, 10_000);
+    let g = PolarisMarketClient::new(&h.env, &h.market_id).get_pool_growth();
+    assert_eq!(
+        g,
+        PoolGrowth {
+            initial_liquidity: 10_000,
+            pool_yes: 10_000,
+            pool_no: 10_000,
+            invariant_liquidity: 10_000,
+            fee_growth: 0,
+            pool_value: 10_000,
+            price_effect: 0,
+        }
+    );
+}
+
+#[test]
+fn pool_growth_separates_fee_accrual_from_price_movement() {
+    // The same trade on two identical markets, except one charges no fee
+    // at all. The price moves the same way on both; only one of them earns
+    // fees.
+    let with_fee = setup(1_000_000, 100_000);
+    let no_fee = setup_with_fees(1_000_000, 100_000, 0, 0);
+
+    let mut results = std::vec::Vec::new();
+    for h in [&with_fee, &no_fee] {
+        let user = Address::generate(&h.env);
+        fund(h, &user, 20_000);
+        let client = PolarisMarketClient::new(&h.env, &h.market_id);
+        client.buy(&user, &Prediction::Yes, &10_000, &0);
+        let g = client.get_pool_growth();
+        assert_growth_identity(&g);
+        results.push(g);
+    }
+    let (fee_g, free_g) = (&results[0], &results[1]);
+
+    // Both pools are now lopsided toward NO (YES got dearer). That shows
+    // up as a negative price effect on both, not as growth.
+    assert!(fee_g.price_effect < 0 && free_g.price_effect < 0);
+    // Without a fee the invariant is unchanged up to rounding...
+    assert!(free_g.fee_growth.abs() <= 1, "a zero-fee trade is not fee growth: {free_g:?}");
+    // ...and with one, the 1% fee on 10_000 shows up as real growth.
+    assert!(fee_g.fee_growth > 1, "{fee_g:?}");
+    // The total pool size alone can't tell the two apart this cleanly:
+    // both pools "grew" in raw share count from the same trade.
+    assert!(fee_g.pool_yes + fee_g.pool_no > 200_000 && free_g.pool_yes + free_g.pool_no > 200_000);
+}
+
+#[test]
+fn fee_growth_accumulates_across_trades_while_the_price_effect_can_unwind() {
+    let h = setup(1_000_000, 100_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let bob = Address::generate(&h.env);
+    let carol = Address::generate(&h.env);
+    fund(&h, &bob, 50_000);
+    fund(&h, &carol, 50_000);
+
+    client.buy(&bob, &Prediction::Yes, &10_000, &0);
+    let after_yes = client.get_pool_growth();
+    assert_growth_identity(&after_yes);
+
+    // An opposite trade of the same size pulls the price back toward
+    // 50/50: most of the price effect unwinds, but fees only ever add up.
+    client.buy(&carol, &Prediction::No, &10_000, &0);
+    let after_no = client.get_pool_growth();
+    assert_growth_identity(&after_no);
+    assert!(after_no.fee_growth > after_yes.fee_growth);
+    assert!(after_no.price_effect.abs() < after_yes.price_effect.abs() / 10, "{after_yes:?} {after_no:?}");
+
+    // Selling also pays a fee into the pool.
+    let (bob_yes, _) = client.get_position(&bob);
+    client.sell(&bob, &Prediction::Yes, &(bob_yes / 2), &0);
+    let after_sell = client.get_pool_growth();
+    assert_growth_identity(&after_sell);
+    assert!(after_sell.fee_growth > after_no.fee_growth);
+    assert_solvent(&h);
+}
+
+#[test]
+fn split_and_merge_never_touch_pool_growth() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    client.buy(&user, &Prediction::No, &1_000, &0);
+    let before = client.get_pool_growth();
+
+    client.split(&user, &2_000);
+    assert_eq!(client.get_pool_growth(), before);
+    client.merge(&user, &1_500);
+    assert_eq!(client.get_pool_growth(), before);
+}
+
+#[test]
+fn pool_growth_is_unavailable_once_settled_and_the_treasury_holds_the_final_pool() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let last_open = client.get_pool_growth();
+
+    h.env.ledger().set_timestamp(h.expiry);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle_via_reflector();
+
+    // The pool was swept to the treasury, so there's nothing left to split.
+    assert_eq!(client.try_get_pool_growth(), Err(Ok(Error::MarketSettledOrCancelled)));
+    // The swept reserves are exactly the treasury's shares, so the final
+    // breakdown is still recoverable with the same formulas.
+    assert_eq!(client.get_position(&h.treasury), (last_open.pool_yes, last_open.pool_no));
+}
+
 // ---------- unambiguous error names (#58) ----------
 
 /// The #58 renames are names only. Every code a deployed caller might
