@@ -211,7 +211,7 @@ fn setup_with_redstone(strike_cents: i128, initial_liquidity: i128) -> (Harness,
     )
 }
 
-fn fund(h: &Harness, who: &Address, amount: i128) {
+pub(crate) fn fund(h: &Harness, who: &Address, amount: i128) {
     token::StellarAssetClient::new(&h.env, &h.token_id).mint(who, &amount);
 }
 
@@ -884,69 +884,29 @@ fn transfer_insufficient_balance_rejected() {
 }
 
 #[test]
-fn post_settlement_transfer_moves_redemption_right_to_recipient() {
+fn transfer_to_the_contract_itself_rejected() {
     let h = setup(1_000_000, 10_000);
     let alice = Address::generate(&h.env);
-    let bob = Address::generate(&h.env);
     fund(&h, &alice, 5_000);
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
-    let shares = client.buy(&alice, &Prediction::Yes, &1_000, &0);
 
-    h.env.ledger().set_timestamp(h.expiry);
-    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
-    let bytes = Bytes::from_slice(&h.env, &payload);
-    set_reflector_price_cents(&h, 1_000_000);
-    client.settle(&bytes);
-    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
-
-    // Winning shares stay transferable after settlement — the recipient,
-    // not the original buyer, now owns the redemption right.
-    client.transfer(&alice, &bob, &Prediction::Yes, &shares);
-    assert_eq!(client.get_position(&alice), (0, 0));
-    assert_eq!(client.get_position(&bob), (shares, 0));
-    assert_solvent(&h);
-
-    let before = token::Client::new(&h.env, &h.token_id).balance(&bob);
-    let payout = client.redeem(&bob);
-    assert_eq!(payout, shares);
-    let after = token::Client::new(&h.env, &h.token_id).balance(&bob);
-    assert_eq!(after - before, shares);
-    assert_solvent(&h);
-
-    // Alice transferred everything away, so she has nothing left to redeem.
-    assert_eq!(
-        client.try_redeem(&alice),
-        Err(Ok(Error::NothingToRedeem))
-    );
+    client.split(&alice, &1_000);
+    let res = client.try_transfer(&alice, &h.market_id, &Prediction::Yes, &400);
+    assert_eq!(res, Err(Ok(Error::InvalidRecipient)));
+    assert_eq!(client.get_position(&alice), (1_000, 1_000));
     assert_solvent(&h);
 }
 
 #[test]
-fn transfer_after_redeem_fails_with_insufficient_balance() {
+fn transfer_to_self_is_a_noop() {
     let h = setup(1_000_000, 10_000);
     let alice = Address::generate(&h.env);
-    let bob = Address::generate(&h.env);
     fund(&h, &alice, 5_000);
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
-    let shares = client.buy(&alice, &Prediction::Yes, &1_000, &0);
 
-    h.env.ledger().set_timestamp(h.expiry);
-    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
-    let bytes = Bytes::from_slice(&h.env, &payload);
-    set_reflector_price_cents(&h, 1_000_000);
-    client.settle(&bytes);
-
-    assert_eq!(client.redeem(&alice), shares);
-    assert_eq!(client.get_position(&alice), (0, 0));
-    assert_solvent(&h);
-
-    // Redeemed shares are burned — they can't be transferred (or
-    // double-redeemed) afterwards.
-    assert_eq!(
-        client.try_transfer(&alice, &bob, &Prediction::Yes, &shares),
-        Err(Ok(Error::InsufficientBalance))
-    );
-    assert_eq!(client.get_position(&bob), (0, 0));
+    client.split(&alice, &1_000);
+    client.transfer(&alice, &alice, &Prediction::Yes, &400);
+    assert_eq!(client.get_position(&alice), (1_000, 1_000));
     assert_solvent(&h);
 }
 
@@ -1744,6 +1704,84 @@ fn cancel_before_grace_elapsed_rejected() {
     assert_eq!(res, Err(Ok(Error::GracePeriodNotElapsed)));
 }
 
+// ---------- settle-vs-cancel exactly at expiry + grace_period ----------
+//
+// `cancel` gates on `now < expiry + grace_period` and `settle` gates on
+// `now < expiry`, so at the exact boundary ledger timestamp
+// `expiry + grace_period` both are legal on an un-settled Open market.
+// Whichever runs first wins; the other must then see `AlreadyFinalized`.
+// Both orderings are pinned here, with exact timestamps.
+
+/// A Lazer payload + agreeing Reflector price that `settle` accepts at
+/// `expiry + grace_period` (feed timestamp == expiry, inside the freshness
+/// window, price above strike so YES wins).
+fn settle_at_boundary(h: &Harness, client: &PolarisMarketClient) {
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(h, 1_000_000); // agrees with Lazer's $10,000.00
+    client.settle(&bytes);
+}
+
+#[test]
+fn cancel_succeeds_at_exact_expiry_plus_grace_boundary() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    assert_eq!(client.get_market().status, MarketStatus::Open);
+
+    client.cancel();
+    assert_eq!(client.get_market().status, MarketStatus::Cancelled);
+    assert_eq!(client.redeem(&user), 1_000);
+    assert_solvent(&h);
+}
+
+#[test]
+fn settle_first_at_boundary_then_cancel_is_already_finalized() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    settle_at_boundary(&h, &client);
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+
+    let res = client.try_cancel();
+    assert_eq!(res, Err(Ok(Error::AlreadyFinalized)));
+    assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
+
+    assert_eq!(client.redeem(&user), shares);
+    assert_solvent(&h);
+}
+
+#[test]
+fn cancel_first_at_boundary_then_settle_is_already_finalized() {
+    let h = setup(1_000_000, 10_000);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    client.split(&user, &1_000);
+
+    h.env.ledger().set_timestamp(h.expiry + h.grace);
+    client.cancel();
+    assert_eq!(client.get_market().status, MarketStatus::Cancelled);
+
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    let res = client.try_settle(&bytes);
+    assert_eq!(res, Err(Ok(Error::AlreadyFinalized)));
+    assert_eq!(client.get_market().status, MarketStatus::Cancelled);
+
+    assert_eq!(client.redeem(&user), 1_000);
+    assert_solvent(&h);
+}
+
 #[test]
 fn cancel_after_grace_refunds_a_matched_pair_at_merge_parity() {
     // A matched pair (equal YES+NO from a plain split, no AMM involved) is
@@ -1988,7 +2026,7 @@ fn zero_fee_config_charges_nothing_and_round_trip_loses_only_slippage() {
 
 // ---------- global solvency invariant ----------
 
-fn assert_solvent(h: &Harness) {
+pub(crate) fn assert_solvent(h: &Harness) {
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     let m = client.get_market();
     let bal = token::Client::new(&h.env, &h.token_id).balance(&h.market_id);
