@@ -38,10 +38,8 @@ cargo test --workspace
 cargo build --release --target wasm32v1-none -p polaris-market
 ```
 
-If you change any contract's public interface, including a doc comment on
-a public function or type, also run `scripts/sync-interface-wasm.sh` and
-commit `interface/wasm/`. Otherwise `polaris-interface`'s
-`vendored_specs_match_current_source` test fails in CI.
+`Cargo.lock` is committed — build with `--locked` (as CI does) to reproduce
+the exact dependency versions behind the published WASM hashes.
 
 ## Communication
 

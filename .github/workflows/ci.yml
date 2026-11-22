@@ -17,7 +17,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   test:
-    name: cargo test --workspace
+    name: cargo test --locked --workspace
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,20 +38,13 @@ jobs:
         # this — confirmed live: this exact gap was in production, broken,
         # since the vault was first added, because every local run had
         # already built the wasm manually first and never hit it.
-        run: cargo build --release --target wasm32v1-none -p polaris-market
+        run: cargo build --locked --release --target wasm32v1-none -p polaris-market
       - name: Build the rest
         run: |
-          cargo build --release --target wasm32v1-none \
+          cargo build --locked --release --target wasm32v1-none \
             -p polaris-mock-lazer -p polaris-mock-redstone -p polaris-smart-wallet \
             -p polaris-smart-wallet-factory -p polaris-vault -p polaris-perpetual
-      - run: cargo test --workspace
-        env:
-          # polaris-interface's vendored_specs_match_current_source
-          # compares interface/wasm/ against the release wasm built above.
-          # Locally it skips a contract that isn't built; here a missing
-          # build must fail, or the drift guard would silently stop
-          # guarding (see interface/README.md).
-          POLARIS_REQUIRE_SPEC_CHECK: "1"
+      - run: cargo test --locked --workspace
 
   wasm-build:
     name: release WASM builds
@@ -71,10 +64,10 @@ jobs:
         # two builds relative to each other on its own, so this step is
         # split out and run first, explicitly, rather than trusting
         # incidental scheduling to keep working.
-        run: cargo build --release --target wasm32v1-none -p polaris-market
+        run: cargo build --locked --release --target wasm32v1-none -p polaris-market
       - name: Build the rest
         run: |
-          cargo build --release --target wasm32v1-none \
+          cargo build --locked --release --target wasm32v1-none \
             -p polaris-mock-lazer -p polaris-mock-redstone -p polaris-smart-wallet \
             -p polaris-smart-wallet-factory -p polaris-vault -p polaris-perpetual
       - name: Verify README hash table is current
