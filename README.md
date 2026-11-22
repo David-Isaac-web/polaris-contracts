@@ -759,32 +759,38 @@ feed ID for XLM/USD.
 
 ## Building & testing
 
-The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
-(Rust 1.91.0, with the `wasm32v1-none` target and `rustfmt`/`clippy`).
-`rustup` picks it up automatically, and CI reads the same file, so local and
-CI builds use the same compiler — no manual `rustup target add` needed.
+Build and test with [`just`](https://github.com/casey/just) — the recipes
+encode the required build order once, and CI runs the same targets:
 
 ```sh
-# unit tests (native target; 100 across the whole workspace)
-cargo test --locked --workspace
-
-# release WASM (the wasm32v1-none target comes from rust-toolchain.toml)
-# polaris-market first, on its own — polaris-vault's contractimport! reads
-# its compiled wasm as a file at build time, a dependency Cargo's own
-# graph doesn't know about (see "The capital-efficiency vault" above).
-cargo build --locked --release --target wasm32v1-none -p polaris-market
-cargo build --locked --release --target wasm32v1-none -p polaris-mock-lazer \
-  -p polaris-mock-redstone -p polaris-smart-wallet -p polaris-smart-wallet-factory \
-  -p polaris-vault -p polaris-perpetual
-shasum -a 256 target/wasm32v1-none/release/*.wasm
+just test        # build the wasm in order, then `cargo test --workspace`
+just build-wasm  # release WASM only (requires `rustup target add wasm32v1-none`)
+just hashes      # sha256 of the release WASM artifacts
+just ci          # everything CI runs: test, diagnostic build, hashes
 ```
 
-`Cargo.lock` is committed and every build above uses `--locked`, so a fresh
-clone resolves the exact same dependency versions. The hashes below were
-produced with the stable toolchain CI uses (`dtolnay/rust-toolchain@stable`);
-a different `rustc`/`soroban-sdk` build can still change the bytes, so if a
-rebuild from a fresh clone does not match, check `rustc --version` before
-assuming a source change.
+The order matters: `polaris-market` is built first, on its own, because
+`polaris-vault`'s `contractimport!` reads its compiled wasm as a file at
+build time — a dependency Cargo's own graph doesn't know about (see "The
+capital-efficiency vault" above). That's why `cargo test --workspace` alone
+fails on a fresh clone; use `just test`.
+
+### Diagnostic builds (`release-with-logs`)
+
+`Cargo.toml` also defines a `release-with-logs` profile: it inherits
+`release` but turns on `debug-assertions`, so contract panics and
+`assert!`/`debug_assert!` failures carry their messages instead of being
+stripped. Use it **only for diagnostic testnet deploys — never for mainnet**:
+the extra checks cost CPU instructions and the artifacts are not the ones
+whose hashes are recorded above.
+
+```sh
+# diagnostic WASM for testnet debugging (same ordering rule as above)
+just build-wasm-logs
+# artifacts land in target/wasm32v1-none/release-with-logs/
+```
+
+CI builds this profile on every push/PR so it cannot silently break.
 
 | Crate | Unit tests |
 |---|---|
