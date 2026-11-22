@@ -44,6 +44,7 @@ app is at
 - [Pool-depth guard](#pool-depth-guard)
 - [Errors, not panics](#errors-not-panics)
 - [Cost-driven fee curve](#cost-driven-fee-curve)
+- [Event schema](#event-schema)
 - [Passkey smart wallets](#passkey-smart-wallets)
 - [The capital-efficiency vault](#the-capital-efficiency-vault)
 - [On-chain second-oracle: Reflector Network](#on-chain-second-oracle-reflector-network)
@@ -53,6 +54,7 @@ app is at
 - [Engineering notes: soroban-sdk gotchas](#engineering-notes-soroban-sdk-gotchas)
 - [Building & testing](#building--testing)
 - [Deploying](#deploying)
+- [Integrating: polaris-interface](#integrating-polaris-interface)
 - [Contributing](#contributing)
 
 ## Architecture
@@ -81,7 +83,7 @@ each other and the oracle feeds they read.
 
 ## Contracts at a glance
 
-Eight crates, one Cargo workspace:
+Ten crates, one Cargo workspace:
 
 | Crate | Purpose |
 |---|---|
@@ -93,6 +95,8 @@ Eight crates, one Cargo workspace:
 | `contracts/ctf-math` | `rlib`-only shared crate (no `#[contract]`) holding the pure CTF/AMM math, the generic SEP-40 oracle client, and the oracle-corroboration logic both `market` and `perpetual` call. |
 | `contracts/mock-lazer` | Testnet-only stand-in for the real `pyth-lazer-stellar` verifier. **Never deploy to mainnet.** |
 | `contracts/mock-redstone` | Testnet-only stand-in for RedStone's real (mainnet-only) SEP-40 wrapper. **Never deploy to mainnet.** |
+| `interface` | `polaris-interface`: the publishable crate of typed clients and contract types, generated from vendored release wasm. See [Integrating](#integrating-polaris-interface). |
+| `tools/oracle-config` | `polaris-oracle-config`: a CLI that builds validated `OracleFeedConfig`/`PriceOracleConfig` JSON for `initialize`. See [Deploying](#deploying). |
 
 ## Why not the original parimutuel design
 
@@ -251,6 +255,19 @@ state.
 `pause_requires_admin_auth`, `redeem_still_works_while_paused`, in both
 `contracts/market/src/test.rs` and `contracts/perpetual/src/test.rs`.)
 
+The vault has its own, separate switch: `pause_deposits(admin)` /
+`unpause_deposits(admin)` halt `deposit` only, for a migration or
+admin-rotation window when new capital shouldn't land in an instance about
+to be retired. `withdraw`, `redeem_from_market`, and admin rotation keep
+working, so the admin can still move funds out while deposits are halted.
+The flag is stored under its own key (a missing key reads as "not paused",
+so existing instances need no migration), and it survives an admin rotation:
+only the *current* admin can lift it.
+([#41](https://github.com/PolarisQ-xyz/polaris-contracts/issues/41), tests:
+`pause_deposits_blocks_deposit_but_not_withdraw`,
+`pause_and_unpause_deposits_require_the_admin`,
+`deposit_pause_survives_admin_rotation_and_only_the_new_admin_can_lift_it`.)
+
 ## Instance-storage TTL
 
 `market` and `perpetual` have always called `extend_ttl` on every write —
@@ -279,6 +296,86 @@ initial_liquidity / total_supply`. A fresh market charges `base_fee_bps`;
 as `total_supply` grows (more collateral locked via `split`/`buy`), the fee
 compresses toward `min_fee_bps` automatically. Query the current value with
 `get_fee()` rather than recomputing it elsewhere.
+
+**Adjusting a live curve is decrease-only.** `set_fee_curve(base_fee_bps,
+min_fee_bps)` (admin-gated, `market` and `perpetual`, `Open` only) can
+lower either bound, but rejects any increase with `FeeIncreaseNotAllowed`.
+A freely adjustable fee would let an admin add a house edge after people
+had already traded, which contradicts the "no house edge" framing. A
+decrease-only change can't harm traders. With `r = initial_liquidity /
+total_supply` in `(0, 1]`, the curve is `floor(base·r + min·(1−r))`, which
+is non-decreasing in both bounds, so as long as neither bound rises, every
+future trade at every `total_supply` is charged at most what the old curve
+charged. The only cost of a reduction falls on the treasury, because fees
+stay in the pool that is swept to it at settlement. Each change emits
+`fee_set` with the old and new values. This matters more for `perpetual`,
+which has no expiry, so "wait for it to resolve" never comes.
+([#42](https://github.com/PolarisQ-xyz/polaris-contracts/issues/42), tests:
+`set_fee_curve_rejects_any_increase_and_leaves_the_curve_untouched`,
+`a_decrease_only_change_never_charges_more_at_any_total_supply`, which
+brute-forces the monotonicity claim, floor rounding included, against the
+shared curve.)
+
+## Event schema
+
+Every event was audited against one question: could an indexer render a
+correct trade-history page from events alone, with **zero** extra
+`get_market()` reads? Before #39 the answer was no. `buy`/`sell` didn't say
+what fee was charged or where the pools ended up, so a price chart needed
+polling. `settle`/`cancel`/`terminate` silently credited the treasury with
+the swept pool shares, and no event showed it. `redeem` zeroed both share
+balances but reported only the payout.
+
+The rule now: **every event that changes contract state carries the
+post-call value of each field it changed**, plus anything (like the fee rate
+actually charged) that a consumer would otherwise have to recompute with
+protocol math. Topics are unchanged throughout. Data is a positional tuple
+(`ScVec`).
+
+| Contract | Topics | Data |
+|---|---|---|
+| market | `init` | `(strike_price, expiry, grace_period, feed_id, base_fee_bps, min_fee_bps, initial_liquidity, admin, treasury, collateral)` |
+| perpetual | `init` | `(initial_liquidity, base_fee_bps, min_fee_bps, admin, treasury, collateral)` |
+| both | `split, user` / `merge, user` | `(amount, total_supply)` |
+| both | `buy, user, prediction` | `(collateral_in, bonus_shares, fee_bps, pool_yes, pool_no, total_supply)` — shares received = `collateral_in + bonus_shares` |
+| both | `sell, user, prediction` | `(shares_in, collateral_out, fee_bps, pool_yes, pool_no, total_supply)` |
+| both | `xfer, from, to, prediction` | `amount` (unchanged; no contract state besides the two balances) |
+| market | `settle` | `(status, final_price_cents, source, treasury, swept_yes, swept_no)` — `source` is `lazer` or `reflector` |
+| market | `cancel` | `(treasury, swept_yes, swept_no)` |
+| perpetual | `term` | `(treasury, swept_yes, swept_no)` |
+| perpetual | `chkpt` | `(price_cents, timestamp)` (unchanged; already complete) |
+| both | `redeem, user` | `(payout, yes_burned, no_burned, total_supply)` |
+| both | `fee_set` | `(old_base_bps, old_min_bps, new_base_bps, new_min_bps)` |
+| both | `paused` / `unpaused` | `()` |
+| vault | `init` | `(admin, collateral)` (new; `initialize` used to emit nothing) |
+| vault | `deposit, from` | `(amount, total_deposited)` |
+| vault | `dpaused` / `dunpaused` | `()` |
+| vault | `withdraw, to` / `mkt_rdm, market` / `propose` / `newadmin` | unchanged |
+
+`fee_bps` is the rate actually charged on that trade (the pre-trade value
+of `get_fee()`). `pool_yes`/`pool_no`/`total_supply` are absolute
+post-trade values, so the implied price after any trade is
+`pool_no / (pool_yes + pool_no)` and an indexer can resync pool state from
+any single trade event. Per-holder share balances are still
+**delta-encoded** (each event says how a balance moved, not where it
+ended), so they need a replay from `init`. Stellar RPC only serves events
+for a bounded retention window, so an indexer that falls further behind
+than that window has to bootstrap positions with `get_position()` reads.
+
+**Compatibility.** Where the old payload was already a tuple (`buy`, `sell`,
+market `init`, `settle`), the original fields keep their positions and the
+new ones are appended. A positional decoder that only reads the leading
+fields keeps working. Events whose data used to be a bare scalar or `()`
+(`split`, `merge`, `redeem`, perpetual `init`, `cancel`, `term`, vault
+`deposit`) are now tuples, which is a breaking change for any consumer that
+decoded them as a bare `i128`. No indexer exists yet; this change should
+land before `polaris-oracle`'s trade-history indexer work begins, not after.
+([#39](https://github.com/PolarisQ-xyz/polaris-contracts/issues/39), tests:
+`an_event_only_indexer_reconstructs_the_full_market_state_exactly`, which
+folds only emitted events into a shadow ledger across a mixed
+buy/sell/split/merge/transfer/settle/redeem flow and asserts it matches
+`get_market()` and every holder's `get_position()` exactly, plus
+per-event payload tests in all three contracts.)
 
 ## Passkey smart wallets
 
@@ -406,6 +503,8 @@ independently collateralized as it already was.
   draws on), or an LP redemption.
 - `redeem_from_market(admin, market_id)` — collects the vault's own payout
   from a settled/cancelled market it was `treasury` for.
+- `pause_deposits(admin)` / `unpause_deposits(admin)` — halt new deposits
+  only, e.g. during a migration window; see [Emergency pause](#emergency-pause).
 
 **v1 is deliberately simple, stated up front**: single-admin-owned capital,
 not fractional LP shares. Multiple depositors can `deposit`, but there's no
@@ -578,6 +677,13 @@ just `sell()` at the current AMM-implied price, any time.
   YES+NO pair is worth 0.5 collateral each, the only per-holder formula
   guaranteed solvent regardless of trading history.
 
+The whole path — `initialize` (with Lazer + Reflector + RedStone
+configured) → `buy` on both sides → `record_price_checkpoint` → `terminate`
+→ `redeem` for every holder, treasury included — is also exercised as one
+chained test with the solvency invariant asserted after every step
+(`full_lifecycle_initialize_buy_checkpoint_terminate_redeem_stays_solvent_throughout`,
+[#54](https://github.com/PolarisQ-xyz/polaris-contracts/issues/54)).
+
 ## Engineering notes: soroban-sdk gotchas
 
 <details>
@@ -648,6 +754,7 @@ shasum -a 256 target/wasm32v1-none/release/*.wasm
 | `polaris-market` | 52 |
 | `polaris-perpetual` | 25 |
 | `polaris-smart-wallet` | 11 |
+| `polaris-oracle-config` | 11 |
 | `polaris-smart-wallet-factory` | 9 |
 | `polaris-vault` | 13 |
 | `polaris-mock-redstone` | 3 |
@@ -660,13 +767,16 @@ actually uploaded):
 
 | Contract | Size | SHA-256 |
 |---|---|---|
-| `polaris_market.wasm` | 59,407 bytes | `8ad8d17ad08c78f6afb52152fe4976422102e2c9f125716532a4a0396ccb4918` |
-| `polaris_perpetual.wasm` | 57,367 bytes | `b62909fa2c78b083a8973b7b733b0ce9e4b8cdb1efd1d0169f61c93370af9727` |
-| `polaris_mock_lazer.wasm` | 649 bytes | `7840d96cc309b74e37b5ec22f37e978eaec0aef3feb00146a6e8ce3bdee7087d` |
-| `polaris_mock_redstone.wasm` | 7,280 bytes | `0db6ff0394999bb28e97a786c5b64891f341290aa323d8a8aec78b711eb28cdf` |
-| `polaris_smart_wallet.wasm` | 27,049 bytes | `bb2e397ba9d56cb58649941576c51e452063554bb43d15d4dfbd29987b1f7dbf` |
-| `polaris_smart_wallet_factory.wasm` | 7,583 bytes | `d64cd44f402db8fb657e8256b20ef7c1b89ebb011bf5adf7e48e3ca335729710` |
-| `polaris_vault.wasm` | 10,568 bytes | `5847a7781556d7c4e727e63fe48a84d6bed9ff6c34686e6a0b09a03d3c925c3d` |
+| `polaris_market.wasm` | 63,067 bytes | `8b9affbb95c698dd26b7a981797bb80c0298219066de26b5c526fc03422ad068` |
+| `polaris_perpetual.wasm` | 60,343 bytes | `37dee64443ac6b312ebb006433ebf0fa8590e925ab667a236cdb7ce0bd5b72d3` |
+| `polaris_mock_lazer.wasm` | 855 bytes | `c0848b74e840eece46de06e424ea99e75467ed3ce80b36e4f9c975395978ce40` |
+| `polaris_mock_redstone.wasm` | 7,465 bytes | `8c77fc03cf73ba92c3df188b73b9c54357358041c0ccc20701c91d1a198ef2ee` |
+| `polaris_smart_wallet.wasm` | 28,307 bytes | `438833c472524aa6b91d50451fc8b9267a9aea74f64e6e3a00cad0ff7d859986` |
+| `polaris_smart_wallet_factory.wasm` | 7,768 bytes | `c72006a7c649cacc291fba664ff6f31f3649c1f74c3756e7beccdf2877e13523` |
+| `polaris_vault.wasm` | 18,579 bytes | `c2968db2b7b53114193571d9f1dfdd7bedd837f135cb57b407e97f7e039916d6` |
+
+Built with rustc 1.95.0. These match `interface/wasm/SHA256SUMS` for the
+five contracts `polaris-interface` vendors.
 
 ## Deploying
 
@@ -714,9 +824,75 @@ stellar contract invoke --id <CONTRACT_ID> --source deployer --network mainnet -
 # on-chain against each oracle's own resolution() at initialize().
 ```
 
+### Oracle config without hand-written JSON
+
+`polaris-oracle-config` (`tools/oracle-config`,
+[#35](https://github.com/PolarisQ-xyz/polaris-contracts/issues/35)) builds
+the `--reflector`/`--redstone` (market) and `--price_oracle` (perpetual)
+values from validated inputs, and prompts for anything missing when run in
+a terminal:
+
+```sh
+cargo build --release -p polaris-oracle-config
+CFG=target/release/polaris-oracle-config
+
+# The deploy example above, without the hand-written --reflector blob:
+stellar contract invoke --id <CONTRACT_ID> --source deployer --network testnet -- \
+  initialize --admin <ADMIN> ... --initial_liquidity 10000000000 \
+  --reflector "$($CFG feed --network testnet --provider reflector \
+                  --max-staleness-secs 600 --tolerance-bps 150)" \
+  --redstone null
+
+# Each prints one line of JSON on stdout:
+$CFG feed --network mainnet --provider redstone --max-staleness-secs 600 --tolerance-bps 150
+$CFG price-oracle --network mainnet --lazer-contract <LAZER_ID> --feed-id <ID> \
+  --reflector-contract <REFLECTOR_ID> --reflector-max-staleness-secs 600 --reflector-tolerance-bps 150 \
+  --redstone-max-staleness-secs 600 --redstone-tolerance-bps 150
+$CFG feed   # no flags in a terminal: prompts for each value
+```
+
+What it catches before anything reaches the chain:
+
+- Contract addresses are checked as `C...` strkeys, checksum included, so a
+  typo fails here instead of at `initialize`.
+- Each provider gets the asset variant it really uses for XLM: Reflector
+  `Other("XLM")`, RedStone `Stellar(<that network's native XLM SAC>)`.
+- `--contract` defaults to this repo's known deployments (Reflector on
+  testnet, RedStone on mainnet).
+- `tolerance_bps` must be within `1..=10000`, `max_staleness_secs` must be
+  above zero, and `feed_id` must be non-zero.
+
+Its tests parse the emitted JSON with `soroban-spec-tools` (the parser the
+`stellar` CLI itself uses) against the released `initialize` signatures.
+One thing it can't check offline: `max_staleness_secs` must be at least
+the oracle's live `resolution()`. `initialize` itself rejects that.
+
 In practice, `polaris-oracle`'s `POST /markets/create` and
 `POST /perpetuals/create` do this deploy+initialize sequence for you against
 the wasm files already checked into that repo — see its README.
+
+## Integrating: polaris-interface
+
+`interface/` is `polaris-interface`
+([#34](https://github.com/PolarisQ-xyz/polaris-contracts/issues/34)), a
+publishable crate of typed clients and contract types for the market,
+perpetual, vault, smart-wallet and factory contracts. A third party
+depends on it like any crate, instead of copying a `.wasm` file into its
+own `contractimport!`:
+
+```rust
+use polaris_interface::market;
+let (yes_bps, no_bps) = market::Client::new(&env, &market_id).get_price();
+```
+
+It follows the convention other published Soroban SDK crates use (e.g.
+Blend's `blend-contract-sdk`): vendor each release wasm in
+`interface/wasm/` and wrap it in `contractimport!`. Its version is the
+contract release it vendors. `scripts/sync-interface-wasm.sh` refreshes
+the wasm and `SHA256SUMS`. A test fails CI if any contract's interface
+(spec, docs included) changes without a re-sync. See
+[interface/README.md](./interface/README.md) for the release steps and for
+generating TypeScript bindings from the same files.
 
 ## Contributing
 
