@@ -117,6 +117,15 @@ fn setup_with_fees(initial_liquidity: i128, with_oracle: bool, base_fee_bps: u32
         None
     };
 
+    // `initialize` now rejects an oracle with no price for the configured
+    // asset, so seed one on both legs before it runs.
+    if with_oracle {
+        let price = 1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2);
+        let ts = env.ledger().timestamp();
+        mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(&price, &ts);
+        mock_sep40::MockSep40Client::new(&env, &redstone_id).set_price(&price, &ts);
+    }
+
     let client = PolarisPerpetualClient::new(&env, &market_id);
     client.initialize(&admin, &token_id, &base_fee_bps, &min_fee_bps, &treasury, &initial_liquidity, &price_oracle);
 
@@ -227,6 +236,48 @@ fn init_without_a_price_oracle_is_allowed() {
     let h = setup(10_000, false);
     let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
     assert_eq!(client.get_price_oracle(), None);
+}
+
+#[test]
+fn init_rejects_oracle_with_no_price_for_the_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_id = sac.address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000_000);
+    let lazer_id = env.register(mock_lazer::MockLazer, ());
+    let reflector_id = env.register(mock_sep40::MockSep40, ());
+    let redstone_id = env.register(mock_sep40::MockSep40, ());
+    let price = 1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2);
+    let ts = env.ledger().timestamp();
+
+    // Reflector leg has no price at all.
+    let no_reflector_price = env.register(PolarisPerpetual, ());
+    let c = PolarisPerpetualClient::new(&env, &no_reflector_price);
+    assert_eq!(
+        c.try_initialize(
+            &admin, &token_id, &100u32, &20u32, &treasury, &10_000i128,
+            &Some(default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id)),
+        ),
+        Err(Ok(Error::ReflectorPriceUnavailable)),
+        "an oracle with no price for the configured asset must be rejected at init"
+    );
+
+    // Reflector priced, but the RedStone leg has no price.
+    mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(&price, &ts);
+    let no_redstone_price = env.register(PolarisPerpetual, ());
+    let c = PolarisPerpetualClient::new(&env, &no_redstone_price);
+    assert_eq!(
+        c.try_initialize(
+            &admin, &token_id, &100u32, &20u32, &treasury, &10_000i128,
+            &Some(default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id)),
+        ),
+        Err(Ok(Error::RedstonePriceUnavailable)),
+        "same check applies to the RedStone leg"
+    );
 }
 
 #[test]
@@ -552,6 +603,51 @@ fn checkpoint_succeeds_when_lazer_reflector_and_redstone_all_agree() {
     set_redstone_price_cents(&h, 1_000_000);
     client.record_price_checkpoint(&bytes);
     assert_eq!(client.get_market().last_price_cents, 1_000_000);
+}
+
+#[test]
+fn checkpoint_stores_the_feed_timestamp_not_ledger_time() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    // Feed timestamp deliberately behind ledger time (but still fresh).
+    let feed_ts = now - 60;
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, feed_ts * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    client.record_price_checkpoint(&bytes);
+
+    let after = client.get_market();
+    assert_eq!(after.last_price_at, feed_ts, "stored timestamp must be the feed's own");
+    assert_ne!(after.last_price_at, now);
+}
+
+#[test]
+fn checkpoint_rejects_an_older_payload_after_a_newer_one() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+
+    let newer_ts = now - 10;
+    let newer = build_payload(FEED_ID, 10_000_00000000, -8, newer_ts * 1_000_000);
+    client.record_price_checkpoint(&Bytes::from_slice(&h.env, &newer));
+    assert_eq!(client.get_market().last_price_at, newer_ts);
+
+    // Older payload, still inside the freshness window — must be rejected
+    // rather than rolling the checkpoint backwards.
+    let older_ts = now - 120;
+    let older = build_payload(FEED_ID, 20_000_00000000, -8, older_ts * 1_000_000);
+    let res = client.try_record_price_checkpoint(&Bytes::from_slice(&h.env, &older));
+    assert_eq!(res, Err(Ok(Error::StaleCheckpoint)));
+
+    let after = client.get_market();
+    assert_eq!(after.last_price_at, newer_ts);
+    assert_eq!(after.last_price_cents, 1_000_000, "rejected checkpoint must not overwrite the price");
 }
 
 #[test]
