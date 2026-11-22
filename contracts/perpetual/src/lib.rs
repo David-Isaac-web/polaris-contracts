@@ -143,6 +143,10 @@ pub enum Error {
     /// `pause()`'s doc comment, identical rationale to `polaris-market`'s
     /// `Error::Paused`.
     Paused = 31,
+    /// `set_fee_curve` was asked to raise `base_fee_bps` or `min_fee_bps` —
+    /// decrease-only, identical rule to `polaris-market`'s
+    /// `Error::FeeIncreaseNotAllowed`.
+    FeeIncreaseNotAllowed = 32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -444,7 +448,19 @@ impl PolarisPerpetual {
             last_price_at: 0,
         };
         save_market(&env, &market);
-        env.events().publish((symbol_short!("init"),), initial_liquidity);
+        // Leading field unchanged. See `polaris-market`'s `init` event and the
+        // README's "Event schema" section.
+        env.events().publish(
+            (symbol_short!("init"),),
+            (
+                initial_liquidity,
+                market.base_fee_bps,
+                market.min_fee_bps,
+                market.admin,
+                market.treasury,
+                market.collateral,
+            ),
+        );
         Ok(())
     }
 
@@ -473,6 +489,32 @@ impl PolarisPerpetual {
         is_paused(&env)
     }
 
+    /// Admin-gated, **decrease-only** fee-curve adjustment (#42). Same rule
+    /// and reasoning as `polaris-market`'s `set_fee_curve` (see its doc
+    /// comment for why lowering both bounds can never charge any future
+    /// trade more than before). A perpetual needs this more than a dated
+    /// market does: it has no expiry, so "wait for it to resolve" never
+    /// arrives as an alternative.
+    pub fn set_fee_curve(env: Env, base_fee_bps: u32, min_fee_bps: u32) -> Result<(), Error> {
+        let mut m = load_market(&env)?;
+        m.admin.require_auth();
+        if m.status != PerpetualStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
+        if min_fee_bps > base_fee_bps {
+            return Err(Error::InvalidFeeBps);
+        }
+        if base_fee_bps > m.base_fee_bps || min_fee_bps > m.min_fee_bps {
+            return Err(Error::FeeIncreaseNotAllowed);
+        }
+        let (old_base, old_min) = (m.base_fee_bps, m.min_fee_bps);
+        m.base_fee_bps = base_fee_bps;
+        m.min_fee_bps = min_fee_bps;
+        save_market(&env, &m);
+        env.events().publish((symbol_short!("fee_set"),), (old_base, old_min, base_fee_bps, min_fee_bps));
+        Ok(())
+    }
+
     /// Lock `amount` collateral, mint `amount` YES + `amount` NO to `user`.
     /// Identical to `polaris-market`'s `split`.
     pub fn split(env: Env, user: Address, amount: i128) -> Result<(), Error> {
@@ -490,7 +532,7 @@ impl PolarisPerpetual {
         credit(&env, Prediction::No, &user, amount);
         m.total_supply += amount;
         save_market(&env, &m);
-        env.events().publish((symbol_short!("split"), user), amount);
+        env.events().publish((symbol_short!("split"), user), (amount, m.total_supply));
         Ok(())
     }
 
@@ -511,7 +553,7 @@ impl PolarisPerpetual {
         token::Client::new(&env, &m.collateral).transfer(&env.current_contract_address(), &user, &amount);
         m.total_supply -= amount;
         save_market(&env, &m);
-        env.events().publish((symbol_short!("merge"), user), amount);
+        env.events().publish((symbol_short!("merge"), user), (amount, m.total_supply));
         Ok(())
     }
 
@@ -540,7 +582,8 @@ impl PolarisPerpetual {
 
         let unwanted = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, unwanted);
-        let effective_in = apply_fee(collateral_amount, effective_fee_bps(&m));
+        let fee_bps = effective_fee_bps(&m);
+        let effective_in = apply_fee(collateral_amount, fee_bps);
         let amount_out = cpmm_out(reserve_in, reserve_out, effective_in);
         if amount_out * 2 >= reserve_out {
             return Err(Error::PoolDepthExceeded);
@@ -560,7 +603,10 @@ impl PolarisPerpetual {
         credit(&env, prediction, &user, amount_out);
 
         save_market(&env, &m);
-        env.events().publish((symbol_short!("buy"), user, prediction), (collateral_amount, amount_out));
+        env.events().publish(
+            (symbol_short!("buy"), user, prediction),
+            (collateral_amount, amount_out, fee_bps, m.pool_yes, m.pool_no, m.total_supply),
+        );
         Ok(collateral_amount + amount_out)
     }
 
@@ -590,7 +636,8 @@ impl PolarisPerpetual {
 
         let opposite = prediction.other();
         let (reserve_in, reserve_out) = reserves(&m, prediction);
-        let effective_in = apply_fee(shares_in, effective_fee_bps(&m));
+        let fee_bps = effective_fee_bps(&m);
+        let effective_in = apply_fee(shares_in, fee_bps);
         let collateral_out = cpmm_sell_out(reserve_in, reserve_out, effective_in);
         if collateral_out * 2 >= reserve_out {
             return Err(Error::PoolDepthExceeded);
@@ -607,7 +654,10 @@ impl PolarisPerpetual {
         m.total_supply -= collateral_out;
 
         save_market(&env, &m);
-        env.events().publish((symbol_short!("sell"), user, prediction), (shares_in, collateral_out));
+        env.events().publish(
+            (symbol_short!("sell"), user, prediction),
+            (shares_in, collateral_out, fee_bps, m.pool_yes, m.pool_no, m.total_supply),
+        );
         Ok(collateral_out)
     }
 
@@ -708,14 +758,17 @@ impl PolarisPerpetual {
             return Err(Error::AlreadyFinalized);
         }
 
-        credit(&env, Prediction::Yes, &m.treasury, m.pool_yes);
-        credit(&env, Prediction::No, &m.treasury, m.pool_no);
+        let (swept_yes, swept_no) = (m.pool_yes, m.pool_no);
+        credit(&env, Prediction::Yes, &m.treasury, swept_yes);
+        credit(&env, Prediction::No, &m.treasury, swept_no);
         m.pool_yes = 0;
         m.pool_no = 0;
         m.status = PerpetualStatus::Terminated;
 
         save_market(&env, &m);
-        env.events().publish((symbol_short!("term"),), ());
+        // Sweep amounts for the same reason as `polaris-market`'s `cancel`:
+        // the treasury credit isn't visible in any other event.
+        env.events().publish((symbol_short!("term"),), (m.treasury.clone(), swept_yes, swept_no));
         Ok(())
     }
 
@@ -748,7 +801,7 @@ impl PolarisPerpetual {
         token::Client::new(&env, &m.collateral).transfer(&env.current_contract_address(), &user, &payout);
         m.total_supply -= payout;
         save_market(&env, &m);
-        env.events().publish((symbol_short!("redeem"), user), payout);
+        env.events().publish((symbol_short!("redeem"), user), (payout, by, bn, m.total_supply));
         Ok(payout)
     }
 
