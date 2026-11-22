@@ -42,9 +42,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32v1-none
+          toolchain: 1.91.0
       - uses: Swatinem/rust-cache@v2
       - uses: extractions/setup-just@v2
       # Keeps the `release-with-logs` profile (Cargo.toml) from rotting: it is

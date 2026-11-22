@@ -19,3 +19,4 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 # (`include_bytes!` in test.rs), which is a test-only, CI-ordered concern.
 polaris-ctf-math = { path = "../ctf-math" }
 polaris-mock-lazer = { path = "../mock-lazer" }
+polaris-test-utils = { path = "../test-utils" }
