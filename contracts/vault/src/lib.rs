@@ -32,7 +32,9 @@
 //! product would need share accounting before this is safe to open past a
 //! single trusted operator.
 
-use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, token, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, InvokeError, Symbol, Vec,
+};
 
 /// Imports `polaris-market`'s client from its *compiled wasm's own spec* —
 /// deliberately not a source dependency on the `polaris-market` crate.
@@ -66,6 +68,30 @@ mod market_contract {
 const BUMP_TO: u32 = 535_680;
 const BUMP_THRESHOLD: u32 = 500_000;
 
+/// Most markets one `redeem_from_markets` call accepts — measured, not
+/// assumed (#38). Each market redeemed adds a fixed set of ledger entries
+/// to the transaction's footprint (the market's instance, the vault's YES
+/// and NO balance entries in it, and the market's collateral balance) on
+/// top of a fixed base (vault, token, shared market code). Metered against
+/// real `polaris-market` wasm under soroban-sdk 26.1's
+/// `InvocationResourceLimits::mainnet()`:
+///
+/// | markets | footprint entries (max 100) | write entries (max 50) | CPU insns (max 600M) | memory (max 40 MiB) | event bytes (max 16 KiB) |
+/// |---|---|---|---|---|---|
+/// | 1  | 18  | 6  | 1.1M  | 1.3 MB  | 492   |
+/// | 10 | 90  | 42 | 11.9M | 13.6 MB | 4,920 |
+/// | 11 | 98  | 46 | 13.2M | 15.0 MB | 5,412 |
+/// | 12 | 106 | 50 | 14.5M | 16.4 MB | 5,904 |
+///
+/// The footprint limit is the one that binds, not CPU: 12 markets is
+/// rejected (106 > 100), 11 is the true ceiling. The cap sits one below
+/// that, leaving 8 entries of headroom for what a test can't see — e.g.
+/// markets running different wasm versions after an upgrade, each adding
+/// its own code entry. Re-measure with the `measure_redeem_batch_costs`
+/// test (see `test.rs`) after any change to `polaris-market`'s storage
+/// layout or this entrypoint, and if the network's limits change.
+pub const MAX_REDEEM_BATCH: u32 = 10;
+
 fn touch(env: &Env) {
     env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
 }
@@ -77,6 +103,10 @@ const STORAGE_KEY_TOTAL_DEPOSITED: Symbol = symbol_short!("deposit");
 /// absent the rest of the time. See `propose_admin`'s doc comment for why
 /// this is two steps, not a single `set_admin`.
 const STORAGE_KEY_PENDING_ADMIN: Symbol = symbol_short!("pending");
+/// `true` while `deposit` is paused (#41). A missing key means "not
+/// paused", so instances deployed before this key existed read as
+/// unpaused with no migration.
+const STORAGE_KEY_DEPOSITS_PAUSED: Symbol = symbol_short!("dep_pause");
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -89,6 +119,9 @@ pub enum Error {
     /// `accept_admin` called with no `propose_admin` ever having been
     /// called (or one already consumed by a prior `accept_admin`).
     NoPendingAdmin = 5,
+    /// `deposit` called while the admin has paused deposits — see
+    /// `pause_deposits`.
+    DepositsPaused = 6,
 }
 
 #[contract]
@@ -119,18 +152,23 @@ impl Vault {
     /// track per-depositor shares, so depositing is currently a one-way,
     /// admin-trusted contribution, not a redeemable LP position. Stated
     /// plainly in the module doc; not hidden in the implementation.
+    /// Rejected with `DepositsPaused` while `pause_deposits` is in effect.
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), Error> {
         from.require_auth();
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
         let collateral = Self::require_collateral(&env)?;
+        if Self::is_deposits_paused(env.clone()) {
+            return Err(Error::DepositsPaused);
+        }
         token::Client::new(&env, &collateral).transfer(&from, &env.current_contract_address(), &amount);
 
         let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_DEPOSITED).unwrap_or(0);
-        env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &(total + amount));
+        let new_total = total + amount;
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &new_total);
         touch(&env);
-        env.events().publish((symbol_short!("deposit"), from), amount);
+        env.events().publish((symbol_short!("deposit"), from), (amount, new_total));
         Ok(())
     }
 
@@ -153,6 +191,35 @@ impl Vault {
         Ok(())
     }
 
+    /// Admin-gated pause for `deposit` only (#41) — e.g. during a migration
+    /// or an admin-rotation window, when new capital shouldn't land in an
+    /// instance that's about to be retired. Deliberately independent of
+    /// `polaris-market`/`polaris-perpetual`'s `pause()` (#8), which gates
+    /// trading on those contracts, not capital flowing into this one.
+    /// `withdraw`, `redeem_from_market`, and admin rotation are never
+    /// blocked by this, so the admin can still move funds out while
+    /// deposits are halted. Idempotent: pausing an already-paused vault is a
+    /// no-op that still emits the event.
+    pub fn pause_deposits(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_DEPOSITS_PAUSED, &true);
+        touch(&env);
+        env.events().publish((symbol_short!("dpaused"),), ());
+        Ok(())
+    }
+
+    pub fn unpause_deposits(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&STORAGE_KEY_DEPOSITS_PAUSED, &false);
+        touch(&env);
+        env.events().publish((symbol_short!("dunpaused"),), ());
+        Ok(())
+    }
+
+    pub fn is_deposits_paused(env: Env) -> bool {
+        env.storage().instance().get(&STORAGE_KEY_DEPOSITS_PAUSED).unwrap_or(false)
+    }
+
     /// Collects this vault's own payout from a settled/cancelled market it
     /// was `treasury` for, by calling that market's existing `redeem`
     /// on the vault's own behalf. The one cross-contract call in this
@@ -167,6 +234,48 @@ impl Vault {
         touch(&env);
         env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
         Ok(payout)
+    }
+
+    /// Batch `redeem_from_market`: collects the vault's payout from each
+    /// of `market_ids` in one transaction, returning one `RedeemOutcome`
+    /// per market in the same order. One market failing doesn't revert the
+    /// others: each `redeem` runs as a `try_` sub-call, so a failure rolls
+    /// back only that market's own sub-call and is reported in its slot,
+    /// while every successful redemption commits and emits the same
+    /// `mkt_rdm` event `redeem_from_market` does. A duplicate id is
+    /// harmless: its second slot reports `NothingToRedeem` (`22`).
+    ///
+    /// At most `MAX_REDEEM_BATCH` markets per call (`BatchTooLarge`
+    /// otherwise), a ceiling measured against mainnet's per-transaction
+    /// limits, not picked arbitrarily: see that constant's doc comment.
+    pub fn redeem_from_markets(
+        env: Env,
+        admin: Address,
+        market_ids: Vec<Address>,
+    ) -> Result<Vec<RedeemOutcome>, Error> {
+        Self::require_admin(&env, &admin)?;
+        if market_ids.len() > MAX_REDEEM_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+        let vault = env.current_contract_address();
+        let mut outcomes = Vec::new(&env);
+        for market_id in market_ids.iter() {
+            let outcome = match market_contract::Client::new(&env, &market_id).try_redeem(&vault) {
+                Ok(Ok(payout)) => {
+                    // Same topic and data as `redeem_from_market`'s event,
+                    // so indexers see one shape however a payout arrived.
+                    #[allow(deprecated)]
+                    env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
+                    RedeemOutcome::Redeemed(payout)
+                }
+                Err(Ok(market_error)) => RedeemOutcome::MarketError(market_error as u32),
+                Err(Err(InvokeError::Contract(code))) => RedeemOutcome::MarketError(code),
+                Ok(Err(_)) | Err(Err(InvokeError::Abort)) => RedeemOutcome::Failed,
+            };
+            outcomes.push_back(outcome);
+        }
+        touch(&env);
+        Ok(outcomes)
     }
 
     /// Step 1 of a two-step admin rotation. Deliberately not a single-call
