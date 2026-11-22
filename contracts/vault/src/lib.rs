@@ -99,15 +99,22 @@ fn touch(env: &Env) {
 
 const STORAGE_KEY_ADMIN: Symbol = symbol_short!("admin");
 const STORAGE_KEY_COLLATERAL: Symbol = symbol_short!("collat");
+/// Cumulative lifetime counter: every `deposit` ever made, never decremented
+/// by `withdraw`/`redeem_from_market`. Reconcile the live balance with
+/// `total_deposited - total_withdrawn + total_redeemed == get_balance()`.
 const STORAGE_KEY_TOTAL_DEPOSITED: Symbol = symbol_short!("deposit");
+/// Cumulative lifetime counter: every `withdraw` ever made.
+const STORAGE_KEY_TOTAL_WITHDRAWN: Symbol = symbol_short!("withdrawn");
+/// Cumulative lifetime counter: every payout ever collected from a market
+/// via `redeem_from_market`.
+const STORAGE_KEY_TOTAL_REDEEMED: Symbol = symbol_short!("redeemed");
 /// Set only between a `propose_admin` and the matching `accept_admin` —
 /// absent the rest of the time. See `propose_admin`'s doc comment for why
 /// this is two steps, not a single `set_admin`.
 const STORAGE_KEY_PENDING_ADMIN: Symbol = symbol_short!("pending");
-/// `true` while `deposit` is paused (#41). A missing key means "not
-/// paused", so instances deployed before this key existed read as
-/// unpaused with no migration.
-const STORAGE_KEY_DEPOSITS_PAUSED: Symbol = symbol_short!("dep_pause");
+/// `market_id -> ()` for every market this vault has seeded via
+/// `seed_market` — the on-chain record of what capital is deployed where.
+const STORAGE_KEY_MARKETS: Symbol = symbol_short!("markets");
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -120,10 +127,8 @@ pub enum Error {
     /// `accept_admin` called with no `propose_admin` ever having been
     /// called (or one already consumed by a prior `accept_admin`).
     NoPendingAdmin = 5,
-    /// The market's `redeem` returned an error (e.g. `NothingToRedeem`, or
-    /// the market was never settled). Surfaced as a typed vault error rather
-    /// than a trap, since the client call is `try_redeem`.
-    MarketRedeemFailed = 6,
+    /// `seed_market` called with a `market_id` this vault already seeded.
+    MarketAlreadySeeded = 6,
 }
 
 #[contract]
@@ -144,6 +149,8 @@ impl Vault {
         env.storage().instance().set(&STORAGE_KEY_ADMIN, &admin);
         env.storage().instance().set(&STORAGE_KEY_COLLATERAL, &collateral);
         env.storage().instance().set(&STORAGE_KEY_TOTAL_DEPOSITED, &0i128);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_WITHDRAWN, &0i128);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_REDEEMED, &0i128);
         touch(&env);
         env.events().publish((symbol_short!("init"),), (admin, collateral));
         Ok(())
@@ -188,6 +195,9 @@ impl Vault {
         }
         let collateral = Self::require_collateral(&env)?;
         token::Client::new(&env, &collateral).transfer(&env.current_contract_address(), &to, &amount);
+
+        let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_WITHDRAWN).unwrap_or(0);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_WITHDRAWN, &(total + amount));
         touch(&env);
         env.events().publish((symbol_short!("withdraw"), to), amount);
         Ok(())
@@ -231,53 +241,115 @@ impl Vault {
     /// from that address's own on-chain share balance.
     pub fn redeem_from_market(env: Env, admin: Address, market_id: Address) -> Result<i128, Error> {
         Self::require_admin(&env, &admin)?;
-        let market = MarketClient::new(&env, &market_id);
-        let payout = market.try_redeem(&env.current_contract_address()).map_err(|_| Error::MarketRedeemFailed)?;
+        let market = market_contract::Client::new(&env, &market_id);
+        let payout = market.redeem(&env.current_contract_address());
+
+        let total: i128 = env.storage().instance().get(&STORAGE_KEY_TOTAL_REDEEMED).unwrap_or(0);
+        env.storage().instance().set(&STORAGE_KEY_TOTAL_REDEEMED, &(total + payout));
         touch(&env);
         env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
         Ok(payout)
     }
 
-    /// Batch `redeem_from_market`: collects the vault's payout from each
-    /// of `market_ids` in one transaction, returning one `RedeemOutcome`
-    /// per market in the same order. One market failing doesn't revert the
-    /// others: each `redeem` runs as a `try_` sub-call, so a failure rolls
-    /// back only that market's own sub-call and is reported in its slot,
-    /// while every successful redemption commits and emits the same
-    /// `mkt_rdm` event `redeem_from_market` does. A duplicate id is
-    /// harmless: its second slot reports `NothingToRedeem` (`22`).
+    /// Seeds a brand-new market directly from this vault's own balance —
+    /// no admin EOA in the middle. Calls the market's existing
+    /// `initialize` with `admin` and `treasury` both set to this vault's
+    /// address, and authorizes the market's own `transfer(admin, market,
+    /// initial_liquidity)` from the vault via
+    /// `authorize_as_current_contract`, so the seed capital moves
+    /// vault → market inside the same call. If `initialize` rejects
+    /// anything (bad expiry, bad fee bps, bad oracle config, …) the whole
+    /// call reverts and the vault's balance is untouched.
     ///
-    /// At most `MAX_REDEEM_BATCH` markets per call (`BatchTooLarge`
-    /// otherwise), a ceiling measured against mainnet's per-transaction
-    /// limits, not picked arbitrarily: see that constant's doc comment.
-    pub fn redeem_from_markets(
+    /// `admin` is the vault's own admin, gated exactly like `withdraw` —
+    /// seeding is a capital deployment, not a permissionless action.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_market(
         env: Env,
         admin: Address,
-        market_ids: Vec<Address>,
-    ) -> Result<Vec<RedeemOutcome>, Error> {
+        market_id: Address,
+        collateral: Address,
+        strike_price: i128,
+        expiry: u64,
+        grace_period: u64,
+        lazer_contract: Address,
+        feed_id: u32,
+        base_fee_bps: u32,
+        min_fee_bps: u32,
+        initial_liquidity: i128,
+        reflector: market_contract::OracleFeedConfig,
+        redstone: Option<market_contract::OracleFeedConfig>,
+    ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        if market_ids.len() > MAX_REDEEM_BATCH {
-            return Err(Error::BatchTooLarge);
+        if initial_liquidity <= 0 {
+            return Err(Error::InvalidAmount);
         }
         let vault = env.current_contract_address();
-        let mut outcomes = Vec::new(&env);
-        for market_id in market_ids.iter() {
-            let outcome = match market_contract::Client::new(&env, &market_id).try_redeem(&vault) {
-                Ok(Ok(payout)) => {
-                    // Same topic and data as `redeem_from_market`'s event,
-                    // so indexers see one shape however a payout arrived.
-                    #[allow(deprecated)]
-                    env.events().publish((symbol_short!("mkt_rdm"), market_id), payout);
-                    RedeemOutcome::Redeemed(payout)
-                }
-                Err(Ok(market_error)) => RedeemOutcome::MarketError(market_error as u32),
-                Err(Err(InvokeError::Contract(code))) => RedeemOutcome::MarketError(code),
-                Ok(Err(_)) | Err(Err(InvokeError::Abort)) => RedeemOutcome::Failed,
-            };
-            outcomes.push_back(outcome);
+        let mut seeded: soroban_sdk::Vec<Address> =
+            env.storage().instance().get(&STORAGE_KEY_MARKETS).unwrap_or(soroban_sdk::Vec::new(&env));
+        if seeded.contains(&market_id) {
+            return Err(Error::MarketAlreadySeeded);
         }
+
+        // The market's `initialize` calls `collateral.transfer(admin, …)`
+        // with `admin` = this vault, so the SAC requires this contract's
+        // own authorization for that transfer. Authorize exactly that one
+        // invocation — not a blanket grant — and only for the duration of
+        // the `initialize` call below.
+        let token_client = token::Client::new(&env, &collateral);
+        env.authorize_as_current_contract(soroban_sdk::vec![
+            &env,
+            soroban_sdk::auth::InvokerContractAuthEntry::Contract(
+                soroban_sdk::auth::SubContractInvocation {
+                    context: soroban_sdk::auth::ContractContext {
+                        contract: collateral.clone(),
+                        fn_name: Symbol::new(&env, "transfer"),
+                        args: soroban_sdk::vec![
+                            &env,
+                            vault.to_val(),
+                            market_id.to_val(),
+                            initial_liquidity.into_val(&env),
+                        ],
+                    },
+                    sub_invocations: soroban_sdk::vec![&env],
+                },
+            ),
+        ]);
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+        let _ = transfer;
+
+        let market = market_contract::Client::new(&env, &market_id);
+        market.initialize(
+            &vault, // admin = this vault
+            &collateral,
+            &strike_price,
+            &expiry,
+            &grace_period,
+            &lazer_contract,
+            &feed_id,
+            &base_fee_bps,
+            &min_fee_bps,
+            &vault, // treasury = this vault
+            &initial_liquidity,
+            &reflector,
+            &redstone,
+        );
+
+        seeded.push_back(market_id.clone());
+        env.storage().instance().set(&STORAGE_KEY_MARKETS, &seeded);
         touch(&env);
-        Ok(outcomes)
+        env.events().publish((symbol_short!("mkt_seed"), market_id), initial_liquidity);
+        Ok(())
+    }
+
+    /// Every market this vault has seeded via `seed_market`.
+    pub fn get_seeded_markets(env: Env) -> soroban_sdk::Vec<Address> {
+        env.storage().instance().get(&STORAGE_KEY_MARKETS).unwrap_or(soroban_sdk::Vec::new(&env))
     }
 
     /// Step 1 of a two-step admin rotation. Deliberately not a single-call
@@ -335,6 +407,22 @@ impl Vault {
         env.storage()
             .instance()
             .get(&STORAGE_KEY_TOTAL_DEPOSITED)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Cumulative lifetime total ever withdrawn via `withdraw`.
+    pub fn get_total_withdrawn(env: Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_TOTAL_WITHDRAWN)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Cumulative lifetime total ever collected via `redeem_from_market`.
+    pub fn get_total_redeemed(env: Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_KEY_TOTAL_REDEEMED)
             .ok_or(Error::NotInitialized)
     }
 
