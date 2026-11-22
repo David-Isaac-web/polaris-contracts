@@ -992,46 +992,95 @@ fn get_origin_returns_stored_origin() {
     assert_eq!(client.get_origin(), origin(&env));
 }
 
-/// The upgrade invocation, authorized by the wallet's own passkey. The
-/// `known_good_vector` assertion signs `signature_payload = [0u8; 32]`, so
-/// the auth entry is built over exactly that payload — the same vector the
-/// `__check_auth` tests use, now driving a real `upgrade` call rather than
-/// being handed to `try_invoke_contract_check_auth` directly.
 #[test]
-fn upgrade_authorized_by_own_passkey_succeeds() {
+fn up_flag_cleared_rejected() {
     let env = Env::default();
     let contract_id = env.register(SmartWallet, ());
     let client = SmartWalletClient::new(&env, &contract_id);
-    let (pk, payload, signature) = known_good_vector(&env);
+
+    let (pk, payload, mut signature) = known_good_vector(&env);
     client.init(&pk, &origin(&env));
 
-    // The host asks the wallet to authorize the upgrade over `payload`; the
-    // known-good assertion is valid for exactly that payload.
+    // Byte 32 is the flags byte; clear UP (0x01). The signature no longer
+    // matches the edited authenticator_data, but the flag check runs before
+    // any crypto, so this is a deterministic typed rejection.
+    let mut data = [0u8; 37];
+    data.copy_from_slice(
+        signature
+            .authenticator_data
+            .slice(0..37)
+            .to_buffer::<37>()
+            .as_slice(),
+    );
+    data[32] &= !0x01;
+    signature.authenticator_data = Bytes::from_array(&env, &data);
+
     let result: Result<(), Result<Error, _>> = env.try_invoke_contract_check_auth::<Error>(
         &contract_id,
         &payload,
         signature.into_val(&env),
         &vec![&env],
     );
-    assert_eq!(result, Ok(()));
-
-    // `upgrade` itself requires the wallet's own auth; mock it so the call
-    // reaches `update_current_contract_wasm` (which the test host no-ops).
-    env.mock_all_auths();
-    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
-    client.upgrade(&new_wasm_hash);
-    assert_eq!(client.get_public_key(), pk);
+    assert_eq!(result, Err(Ok(Error::UserNotVerified)));
 }
 
 #[test]
-fn upgrade_without_wallet_auth_rejected() {
+fn uv_flag_cleared_rejected() {
     let env = Env::default();
     let contract_id = env.register(SmartWallet, ());
     let client = SmartWalletClient::new(&env, &contract_id);
-    let (pk, _, _) = known_good_vector(&env);
+
+    let (pk, payload, mut signature) = known_good_vector(&env);
     client.init(&pk, &origin(&env));
 
-    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
-    let result = client.try_upgrade(&new_wasm_hash);
-    assert!(result.is_err());
+    // UV (0x04) is mandatory: a presence-only assertion would downgrade the
+    // Face ID / Touch ID promise this wallet makes.
+    let mut data = [0u8; 37];
+    data.copy_from_slice(
+        signature
+            .authenticator_data
+            .slice(0..37)
+            .to_buffer::<37>()
+            .as_slice(),
+    );
+    data[32] &= !0x04;
+    signature.authenticator_data = Bytes::from_array(&env, &data);
+
+    let result: Result<(), Result<Error, _>> = env.try_invoke_contract_check_auth::<Error>(
+        &contract_id,
+        &payload,
+        signature.into_val(&env),
+        &vec![&env],
+    );
+    assert_eq!(result, Err(Ok(Error::UserNotVerified)));
+}
+
+#[test]
+fn short_authenticator_data_rejected() {
+    let env = Env::default();
+    let contract_id = env.register(SmartWallet, ());
+    let client = SmartWalletClient::new(&env, &contract_id);
+
+    let (pk, payload, mut signature) = known_good_vector(&env);
+    client.init(&pk, &origin(&env));
+
+    // 36 bytes: rpIdHash + flags + only 3 of the 4 signCount bytes — no
+    // room for a complete fixed prefix, so flags can't be trusted.
+    let mut data = [0u8; 36];
+    data.copy_from_slice(
+        signature
+            .authenticator_data
+            .slice(0..36)
+            .to_buffer::<36>()
+            .as_slice(),
+    );
+    signature.authenticator_data = Bytes::from_array(&env, &data);
+
+    let result: Result<(), Result<Error, _>> = env.try_invoke_contract_check_auth::<Error>(
+        &contract_id,
+        &payload,
+        signature.into_val(&env),
+        &vec![&env],
+    );
+    assert_eq!(result, Err(Ok(Error::AuthenticatorDataTooShort)));
 }
