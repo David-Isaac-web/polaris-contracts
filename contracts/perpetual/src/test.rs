@@ -10,9 +10,23 @@ use soroban_sdk::{token, Address, Env};
 /// payload format, not production logic, so there's no drift risk the
 /// shared `polaris-ctf-math` crate exists to prevent.
 fn build_payload(feed_id: u32, price: i64, exponent: i16, feed_ts_micros: u64) -> std::vec::Vec<u8> {
+    build_payload_with_feed_ts(feed_id, price, exponent, feed_ts_micros, Some(feed_ts_micros))
+}
+
+/// Same as `build_payload`, but lets the feed's own `feed_update_timestamp`
+/// property be omitted (`None`) while the payload-level timestamp stays
+/// `payload_ts_micros` — the shape that drives
+/// `record_price_checkpoint`'s `unwrap_or(verified.timestamp)` fallback.
+fn build_payload_with_feed_ts(
+    feed_id: u32,
+    price: i64,
+    exponent: i16,
+    payload_ts_micros: u64,
+    feed_ts_micros: Option<u64>,
+) -> std::vec::Vec<u8> {
     let mut b = std::vec::Vec::new();
     b.extend_from_slice(&2_479_346_549u32.to_le_bytes()); // magic
-    b.extend_from_slice(&feed_ts_micros.to_le_bytes());
+    b.extend_from_slice(&payload_ts_micros.to_le_bytes());
     b.push(3); // channel = FixedRate200ms
     b.push(1); // num_feeds
     b.extend_from_slice(&feed_id.to_le_bytes());
@@ -22,8 +36,13 @@ fn build_payload(feed_id: u32, price: i64, exponent: i16, feed_ts_micros: u64) -
     b.push(4); // property: exponent
     b.extend_from_slice(&(exponent as u16).to_le_bytes());
     b.push(12); // property: feed_update_timestamp
-    b.push(1); // exists = true
-    b.extend_from_slice(&feed_ts_micros.to_le_bytes());
+    match feed_ts_micros {
+        Some(ts) => {
+            b.push(1); // exists = true
+            b.extend_from_slice(&ts.to_le_bytes());
+        }
+        None => b.push(0), // exists = false
+    }
     b
 }
 
@@ -68,6 +87,12 @@ fn default_price_oracle(env: &Env, lazer_id: &Address, reflector_id: &Address, r
 }
 
 fn setup(initial_liquidity: i128, with_oracle: bool) -> Harness {
+    setup_with_fees(initial_liquidity, with_oracle, 100, 20)
+}
+
+/// `setup` with an explicit fee curve — for the degenerate configs
+/// (`min == base`, and `base == 0`) that `initialize` also accepts.
+fn setup_with_fees(initial_liquidity: i128, with_oracle: bool, base_fee_bps: u32, min_fee_bps: u32) -> Harness {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(1_000_000);
@@ -92,8 +117,17 @@ fn setup(initial_liquidity: i128, with_oracle: bool) -> Harness {
         None
     };
 
+    // `initialize` now rejects an oracle with no price for the configured
+    // asset, so seed one on both legs before it runs.
+    if with_oracle {
+        let price = 1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2);
+        let ts = env.ledger().timestamp();
+        mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(&price, &ts);
+        mock_sep40::MockSep40Client::new(&env, &redstone_id).set_price(&price, &ts);
+    }
+
     let client = PolarisPerpetualClient::new(&env, &market_id);
-    client.initialize(&admin, &token_id, &100u32, &20u32, &treasury, &initial_liquidity, &price_oracle);
+    client.initialize(&admin, &token_id, &base_fee_bps, &min_fee_bps, &treasury, &initial_liquidity, &price_oracle);
 
     Harness { env, market_id, lazer_id, reflector_id, redstone_id, token_id, admin, treasury }
 }
@@ -105,13 +139,15 @@ fn fund(h: &Harness, who: &Address, amount: i128) {
 fn set_reflector_price_cents(h: &Harness, cents: i128) {
     let client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
     let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
-    client.set_price(&price, &h.env.ledger().timestamp());
+    let asset = default_price_oracle(&h.env, &h.lazer_id, &h.reflector_id, &h.redstone_id).reflector.asset;
+    client.set_price(&asset, &price, &h.env.ledger().timestamp());
 }
 
 fn set_redstone_price_cents(h: &Harness, cents: i128) {
     let client = mock_sep40::MockSep40Client::new(&h.env, &h.redstone_id);
     let price = cents * 10i128.pow(REFLECTOR_DECIMALS - 2);
-    client.set_price(&price, &h.env.ledger().timestamp());
+    let asset = default_price_oracle(&h.env, &h.lazer_id, &h.reflector_id, &h.redstone_id).redstone.asset;
+    client.set_price(&asset, &price, &h.env.ledger().timestamp());
 }
 
 mod mock_lazer {
@@ -135,9 +171,9 @@ mod mock_lazer {
 /// rationale.
 mod mock_sep40 {
     use polaris_ctf_math::sep40::{Asset, PriceData};
-    use soroban_sdk::{contract, contractimpl, symbol_short, Env};
+    use soroban_sdk::{contract, contractimpl, symbol_short, Env, Map};
 
-    const PRICE_KEY: soroban_sdk::Symbol = symbol_short!("px");
+    const PRICES_KEY: soroban_sdk::Symbol = symbol_short!("px");
     const DECIMALS_KEY: soroban_sdk::Symbol = symbol_short!("dec");
     const RESOLUTION_KEY: soroban_sdk::Symbol = symbol_short!("res");
 
@@ -146,12 +182,20 @@ mod mock_sep40 {
 
     #[contractimpl]
     impl MockSep40 {
-        pub fn set_price(env: Env, price: i128, timestamp: u64) {
-            env.storage().instance().set(&PRICE_KEY, &(price, timestamp));
+        /// Keyed by `asset`, like the real SEP-40 providers — a price set for
+        /// one asset is invisible to `lastprice` for any other, so a
+        /// mis-configured `OracleFeedConfig.asset` fails a test instead of
+        /// silently passing.
+        pub fn set_price(env: Env, asset: Asset, price: i128, timestamp: u64) {
+            let mut prices = Self::prices(&env);
+            prices.set(asset, (price, timestamp));
+            env.storage().instance().set(&PRICES_KEY, &prices);
         }
 
+        /// Clears every asset's price — the mock is a single shared instance,
+        /// so "no price yet" is a whole-contract state, not a per-asset one.
         pub fn set_none(env: Env) {
-            env.storage().instance().remove(&PRICE_KEY);
+            env.storage().instance().remove(&PRICES_KEY);
         }
 
         pub fn set_decimals(env: Env, decimals: u32) {
@@ -162,8 +206,8 @@ mod mock_sep40 {
             env.storage().instance().set(&RESOLUTION_KEY, &resolution);
         }
 
-        pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
-            env.storage().instance().get::<_, (i128, u64)>(&PRICE_KEY).map(|(price, timestamp)| PriceData { price, timestamp })
+        pub fn lastprice(env: Env, asset: Asset) -> Option<PriceData> {
+            Self::prices(&env).get(asset).map(|(price, timestamp)| PriceData { price, timestamp })
         }
 
         pub fn decimals(env: Env) -> u32 {
@@ -172,6 +216,10 @@ mod mock_sep40 {
 
         pub fn resolution(env: Env) -> u32 {
             env.storage().instance().get(&RESOLUTION_KEY).unwrap_or(super::REFLECTOR_RESOLUTION_SECS)
+        }
+
+        fn prices(env: &Env) -> Map<Asset, (i128, u64)> {
+            env.storage().instance().get(&PRICES_KEY).unwrap_or_else(|| Map::new(env))
         }
     }
 }
@@ -202,6 +250,44 @@ fn init_without_a_price_oracle_is_allowed() {
     let h = setup(10_000, false);
     let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
     assert_eq!(client.get_price_oracle(), None);
+}
+
+#[test]
+fn init_rejects_an_oversize_staleness_window_on_either_leg() {
+    // The staleness comparison adds `max_staleness_secs` to an
+    // oracle-supplied timestamp, so an unbounded window could overflow
+    // `u64` and trap every checkpoint — capped at `MAX_STALENESS_SECS`.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_id = sac.address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &1_000_000);
+    let lazer_id = env.register(mock_lazer::MockLazer, ());
+    let reflector_id = env.register(mock_sep40::MockSep40, ());
+    let redstone_id = env.register(mock_sep40::MockSep40, ());
+
+    let mut wide_reflector = default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id);
+    wide_reflector.reflector.max_staleness_secs = MAX_STALENESS_SECS + 1;
+    let market_id = env.register(PolarisPerpetual, ());
+    let client = PolarisPerpetualClient::new(&env, &market_id);
+    assert_eq!(
+        client.try_initialize(&admin, &token_id, &100u32, &20u32, &treasury, &10_000i128, &Some(wide_reflector)),
+        Err(Ok(Error::InvalidReflectorConfig)),
+        "a Reflector staleness window above MAX_STALENESS_SECS must be rejected"
+    );
+
+    let mut wide_redstone = default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id);
+    wide_redstone.redstone.max_staleness_secs = u64::MAX;
+    let market_id = env.register(PolarisPerpetual, ());
+    let client = PolarisPerpetualClient::new(&env, &market_id);
+    assert_eq!(
+        client.try_initialize(&admin, &token_id, &100u32, &20u32, &treasury, &10_000i128, &Some(wide_redstone)),
+        Err(Ok(Error::InvalidRedstoneConfig)),
+        "same oversize cap applies to the RedStone leg"
+    );
 }
 
 #[test]
@@ -262,6 +348,43 @@ fn sell_full_one_sided_position_returns_nonzero_collateral() {
 }
 
 #[test]
+fn buy_return_equals_position_delta_on_bought_side() {
+    let h = setup(10_000, true);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+
+    let (yes_before, no_before) = client.get_position(&user);
+    let returned = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let (yes_after, no_after) = client.get_position(&user);
+
+    assert_eq!(returned, yes_after - yes_before);
+    assert_eq!(no_after, no_before);
+    assert_solvent(&h);
+}
+
+#[test]
+fn sell_return_equals_collateral_received() {
+    let h = setup(10_000, true);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let token = token::Client::new(&h.env, &h.token_id);
+
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let (yes_before, _) = client.get_position(&user);
+    let balance_before = token.balance(&user);
+
+    let returned = client.sell(&user, &Prediction::Yes, &shares, &0);
+    let (yes_after, _) = client.get_position(&user);
+    let balance_after = token.balance(&user);
+
+    assert_eq!(returned, balance_after - balance_before);
+    assert_eq!(returned, yes_before - yes_after);
+    assert_solvent(&h);
+}
+
+#[test]
 fn buy_large_enough_to_exhaust_a_reserve_is_rejected() {
     let h = setup(10_000, true);
     let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
@@ -270,6 +393,72 @@ fn buy_large_enough_to_exhaust_a_reserve_is_rejected() {
 
     let res = client.try_buy(&user, &Prediction::Yes, &101_000_000, &0);
     assert_eq!(res, Err(Ok(Error::PoolDepthExceeded)));
+    assert_solvent(&h);
+}
+
+/// Smallest `collateral_amount` whose post-fee `cpmm_out` against
+/// `(reserve_in, reserve_out)` lands exactly on `target_out`. `cpmm_out` is
+/// monotonic in `effective_in`, so a binary search finds the boundary trade
+/// without hardcoding fee-curve internals.
+fn collateral_for_amount_out(
+    h: &Harness,
+    reserve_in: i128,
+    reserve_out: i128,
+    target_out: i128,
+) -> i128 {
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let fee_bps = client.get_fee();
+    let out_at = |collateral: i128| {
+        cpmm_out(reserve_in, reserve_out, apply_fee(collateral, fee_bps))
+    };
+    let mut lo = 1i128;
+    let mut hi = reserve_out * 1_000;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if out_at(mid) >= target_out {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    assert_eq!(out_at(lo), target_out, "no collateral amount hits target_out");
+    lo
+}
+
+#[test]
+fn buy_at_exactly_half_the_reserve_is_rejected() {
+    // Boundary equality: `amount_out * 2 == reserve_out` must be rejected.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000_000);
+
+    let collateral = collateral_for_amount_out(&h, 10_000, 10_000, 5_000);
+    let res = client.try_buy(&user, &Prediction::Yes, &collateral, &0);
+    assert_eq!(res, Err(Ok(Error::PoolDepthExceeded)));
+
+    let m = client.get_market();
+    assert_eq!(m.pool_yes, 10_000);
+    assert_eq!(m.pool_no, 10_000);
+    assert_solvent(&h);
+}
+
+#[test]
+fn buy_one_stroop_under_half_the_reserve_is_accepted() {
+    // Adjacent case: `amount_out * 2 == reserve_out - 1` must be accepted,
+    // and the pool must stay solvent afterwards.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000_000);
+
+    let collateral = collateral_for_amount_out(&h, 10_000, 10_000, 4_999);
+    let total = client.buy(&user, &Prediction::Yes, &collateral, &0);
+    assert_eq!(total, collateral + 4_999);
+
+    let m = client.get_market();
+    assert_eq!(m.pool_yes, 10_000 - 4_999);
+    assert_eq!(m.pool_no, 10_000 + collateral);
     assert_solvent(&h);
 }
 
@@ -401,6 +590,40 @@ fn checkpoint_without_a_configured_oracle_is_rejected() {
 }
 
 #[test]
+fn checkpoint_accepts_fresh_payload_level_timestamp_when_feed_omits_its_own() {
+    // Fallback branch: no `feed_update_timestamp` on the feed, so the
+    // payload-level `verified.timestamp` is what freshness is checked on.
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    let payload = build_payload_with_feed_ts(FEED_ID, 10_000_00000000, -8, now * 1_000_000, None);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    client.record_price_checkpoint(&bytes);
+
+    let m = client.get_market();
+    assert_eq!(m.last_price_cents, 1_000_000);
+    assert_eq!(m.last_price_at, now);
+    assert_solvent(&h);
+}
+
+#[test]
+fn checkpoint_rejects_stale_payload_level_timestamp_when_feed_omits_its_own() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    let stale_ts = (now - PRICE_FRESHNESS_WINDOW_SECS - 1) * 1_000_000;
+    let payload = build_payload_with_feed_ts(FEED_ID, 10_000_00000000, -8, stale_ts, None);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    let res = client.try_record_price_checkpoint(&bytes);
+    assert_eq!(res, Err(Ok(Error::StalePrice)));
+    assert_eq!(client.get_market().last_price_cents, 0);
+}
+
+#[test]
 fn checkpoint_rejects_on_gross_lazer_reflector_divergence() {
     let h = setup(10_000, true);
     let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
@@ -427,6 +650,51 @@ fn checkpoint_succeeds_when_lazer_reflector_and_redstone_all_agree() {
     set_redstone_price_cents(&h, 1_000_000);
     client.record_price_checkpoint(&bytes);
     assert_eq!(client.get_market().last_price_cents, 1_000_000);
+}
+
+#[test]
+fn checkpoint_stores_the_feed_timestamp_not_ledger_time() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    // Feed timestamp deliberately behind ledger time (but still fresh).
+    let feed_ts = now - 60;
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, feed_ts * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+    client.record_price_checkpoint(&bytes);
+
+    let after = client.get_market();
+    assert_eq!(after.last_price_at, feed_ts, "stored timestamp must be the feed's own");
+    assert_ne!(after.last_price_at, now);
+}
+
+#[test]
+fn checkpoint_rejects_an_older_payload_after_a_newer_one() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+
+    let newer_ts = now - 10;
+    let newer = build_payload(FEED_ID, 10_000_00000000, -8, newer_ts * 1_000_000);
+    client.record_price_checkpoint(&Bytes::from_slice(&h.env, &newer));
+    assert_eq!(client.get_market().last_price_at, newer_ts);
+
+    // Older payload, still inside the freshness window — must be rejected
+    // rather than rolling the checkpoint backwards.
+    let older_ts = now - 120;
+    let older = build_payload(FEED_ID, 20_000_00000000, -8, older_ts * 1_000_000);
+    let res = client.try_record_price_checkpoint(&Bytes::from_slice(&h.env, &older));
+    assert_eq!(res, Err(Ok(Error::StaleCheckpoint)));
+
+    let after = client.get_market();
+    assert_eq!(after.last_price_at, newer_ts);
+    assert_eq!(after.last_price_cents, 1_000_000, "rejected checkpoint must not overwrite the price");
 }
 
 #[test]
@@ -476,6 +744,47 @@ fn checkpoint_rejects_when_redstones_decimals_drift_from_what_was_pinned_at_init
     let res = client.try_record_price_checkpoint(&bytes);
     assert_eq!(res, Err(Ok(Error::RedstoneDecimalsChanged)));
     assert_eq!(client.get_market().last_price_cents, 0);
+}
+
+// ---------- CPU/memory budget regression (all three oracle legs) ----------
+//
+// `record_price_checkpoint` is the perpetual's only oracle-reading
+// entrypoint, and it reads all three legs (Lazer payload, Reflector,
+// RedStone). These tests pin its measured cost below a recorded ceiling so
+// a future change can't quietly push it toward the network's per-transaction
+// limits. Numbers and limits are recorded in the README.
+
+/// 70% of Stellar mainnet's per-transaction limits (100M CPU instructions,
+/// 40MB memory) — see the README's "CPU & memory budget" section.
+const CPU_BUDGET_LIMIT: u64 = 70_000_000;
+const MEM_BUDGET_LIMIT: u64 = 28_000_000;
+
+fn assert_within_budget(env: &Env, label: &str) {
+    let budget = env.cost_estimate().budget();
+    let cpu = budget.cpu_instruction_cost();
+    let mem = budget.memory_bytes_cost();
+    std::println!("{label}: cpu={cpu} mem={mem}");
+    assert!(cpu < CPU_BUDGET_LIMIT, "{label} CPU {cpu} exceeds {CPU_BUDGET_LIMIT}");
+    assert!(mem < MEM_BUDGET_LIMIT, "{label} memory {mem} exceeds {MEM_BUDGET_LIMIT}");
+}
+
+#[test]
+fn checkpoint_with_all_three_oracle_legs_stays_within_budget() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let now = h.env.ledger().timestamp();
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, now * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    set_reflector_price_cents(&h, 1_000_000);
+    set_redstone_price_cents(&h, 1_000_000);
+
+    h.env.cost_estimate().budget().reset_unlimited();
+    client.record_price_checkpoint(&bytes);
+    assert_within_budget(&h.env, "perpetual::record_price_checkpoint");
+
+    assert_eq!(client.get_market().last_price_cents, 1_000_000);
+    assert_solvent(&h);
 }
 
 // ---------- terminate ----------
@@ -578,5 +887,52 @@ fn fee_starts_at_base_and_decays_toward_min_as_volume_grows() {
     assert_eq!(client.get_fee(), 100);
     client.split(&user, &10_000);
     assert_eq!(client.get_fee(), 60);
+    assert_solvent(&h);
+}
+
+#[test]
+fn flat_fee_curve_keeps_fee_constant_across_volume_growth() {
+    // min == base is a legal config: the (base - min) == 0 arm of the curve.
+    let h = setup_with_fees(10_000, true, 50, 50);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000);
+
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &10_000); // total_supply: 10_000 -> 20_000
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &30_000); // total_supply: 20_000 -> 50_000
+    assert_eq!(client.get_fee(), 50);
+    client.split(&user, &950_000); // total_supply: 50_000 -> 1_000_000
+    assert_eq!(client.get_fee(), 50);
+
+    assert_solvent(&h);
+}
+
+#[test]
+fn zero_fee_config_charges_nothing_and_round_trip_loses_only_slippage() {
+    // base == 0 forces min == 0: the all-zero arm of the curve, and
+    // apply_fee(amount, 0) must be a true no-op.
+    let h = setup_with_fees(10_000, true, 0, 0);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000_000);
+
+    assert_eq!(client.get_fee(), 0);
+    client.split(&user, &40_000); // total_supply: 10_000 -> 50_000
+    assert_eq!(client.get_fee(), 0);
+
+    let before = token::Client::new(&h.env, &h.token_id).balance(&user);
+    let shares = client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let back = client.sell(&user, &Prediction::Yes, &shares, &0);
+    let after = token::Client::new(&h.env, &h.token_id).balance(&user);
+
+    // Round trip is a loss (CPMM slippage) but never a fee: with zero fee the
+    // pool's k is unchanged by the pair of trades, so the loss is bounded by
+    // slippage alone and strictly less than any 1-bps fee would cost.
+    assert!(back < 1_000, "round trip must lose slippage, got {back}");
+    assert_eq!(after, before - 1_000 + back);
+    assert!(1_000 - back < 100, "loss must be slippage-only, got {}", 1_000 - back);
+
     assert_solvent(&h);
 }
