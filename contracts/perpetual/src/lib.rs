@@ -86,7 +86,7 @@ use pyth_lazer_stellar_sdk::PythLazerClient;
 use polaris_ctf_math::{
     apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps,
     sep40::Sep40Client,
-    to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig,
+    to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig, MAX_STALENESS_SECS,
 };
 
 /// Protocol fee ceiling: 1000 bps = 10%. Same figure as `polaris-market`.
@@ -426,7 +426,12 @@ impl PolarisPerpetual {
             // comment), so both must validate for the whole thing to be
             // accepted.
             let reflector_client = Sep40Client::new(&env, &oracle.reflector.contract);
-            if oracle.reflector.max_staleness_secs < reflector_client.resolution() as u64 {
+            // ...and neither leg may exceed `MAX_STALENESS_SECS`: the
+            // staleness check adds it to an oracle-supplied timestamp, so an
+            // unbounded window could overflow `u64` and trap every settle.
+            if oracle.reflector.max_staleness_secs > MAX_STALENESS_SECS
+                || oracle.reflector.max_staleness_secs < reflector_client.resolution() as u64
+            {
                 return Err(Error::InvalidReflectorConfig);
             }
             let reflector_decimals_at_init = reflector_client.decimals();
@@ -440,7 +445,9 @@ impl PolarisPerpetual {
             }
 
             let redstone_client = Sep40Client::new(&env, &oracle.redstone.contract);
-            if oracle.redstone.max_staleness_secs < redstone_client.resolution() as u64 {
+            if oracle.redstone.max_staleness_secs > MAX_STALENESS_SECS
+                || oracle.redstone.max_staleness_secs < redstone_client.resolution() as u64
+            {
                 return Err(Error::InvalidRedstoneConfig);
             }
             let redstone_decimals_at_init = redstone_client.decimals();
@@ -730,10 +737,10 @@ impl PolarisPerpetual {
         let feed_ts_micros = feed.feed_update_timestamp.unwrap_or(verified.timestamp);
         let feed_ts_secs = feed_ts_micros / 1_000_000;
 
-        if feed_ts_secs + PRICE_FRESHNESS_WINDOW_SECS < now {
+        if feed_ts_secs.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) < now {
             return Err(Error::StalePrice);
         }
-        if feed_ts_secs > now + PRICE_FRESHNESS_WINDOW_SECS {
+        if feed_ts_secs > now.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) {
             return Err(Error::FuturePrice);
         }
 

@@ -253,7 +253,10 @@ fn init_without_a_price_oracle_is_allowed() {
 }
 
 #[test]
-fn init_rejects_oracle_with_no_price_for_the_asset() {
+fn init_rejects_an_oversize_staleness_window_on_either_leg() {
+    // The staleness comparison adds `max_staleness_secs` to an
+    // oracle-supplied timestamp, so an unbounded window could overflow
+    // `u64` and trap every checkpoint — capped at `MAX_STALENESS_SECS`.
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(1_000_000);
@@ -265,32 +268,25 @@ fn init_rejects_oracle_with_no_price_for_the_asset() {
     let lazer_id = env.register(mock_lazer::MockLazer, ());
     let reflector_id = env.register(mock_sep40::MockSep40, ());
     let redstone_id = env.register(mock_sep40::MockSep40, ());
-    let price = 1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2);
-    let ts = env.ledger().timestamp();
 
-    // Reflector leg has no price at all.
-    let no_reflector_price = env.register(PolarisPerpetual, ());
-    let c = PolarisPerpetualClient::new(&env, &no_reflector_price);
+    let mut wide_reflector = default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id);
+    wide_reflector.reflector.max_staleness_secs = MAX_STALENESS_SECS + 1;
+    let market_id = env.register(PolarisPerpetual, ());
+    let client = PolarisPerpetualClient::new(&env, &market_id);
     assert_eq!(
-        c.try_initialize(
-            &admin, &token_id, &100u32, &20u32, &treasury, &10_000i128,
-            &Some(default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id)),
-        ),
-        Err(Ok(Error::ReflectorPriceUnavailable)),
-        "an oracle with no price for the configured asset must be rejected at init"
+        client.try_initialize(&admin, &token_id, &100u32, &20u32, &treasury, &10_000i128, &Some(wide_reflector)),
+        Err(Ok(Error::InvalidReflectorConfig)),
+        "a Reflector staleness window above MAX_STALENESS_SECS must be rejected"
     );
 
-    // Reflector priced, but the RedStone leg has no price.
-    mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(&price, &ts);
-    let no_redstone_price = env.register(PolarisPerpetual, ());
-    let c = PolarisPerpetualClient::new(&env, &no_redstone_price);
+    let mut wide_redstone = default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id);
+    wide_redstone.redstone.max_staleness_secs = u64::MAX;
+    let market_id = env.register(PolarisPerpetual, ());
+    let client = PolarisPerpetualClient::new(&env, &market_id);
     assert_eq!(
-        c.try_initialize(
-            &admin, &token_id, &100u32, &20u32, &treasury, &10_000i128,
-            &Some(default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id)),
-        ),
-        Err(Ok(Error::RedstonePriceUnavailable)),
-        "same check applies to the RedStone leg"
+        client.try_initialize(&admin, &token_id, &100u32, &20u32, &treasury, &10_000i128, &Some(wide_redstone)),
+        Err(Ok(Error::InvalidRedstoneConfig)),
+        "same oversize cap applies to the RedStone leg"
     );
 }
 

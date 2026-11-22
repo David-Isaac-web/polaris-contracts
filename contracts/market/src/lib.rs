@@ -91,6 +91,7 @@ use pyth_lazer_stellar_sdk::PythLazerClient;
 use polaris_ctf_math::{
     apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, reflector_price_to_cents,
     sep40::Sep40Client, to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig,
+    MAX_STALENESS_SECS,
 };
 
 /// Protocol fee ceiling: 1000 bps = 10%.
@@ -524,8 +525,13 @@ impl PolarisMarket {
         // An admin can't configure a staleness window narrower than
         // Reflector's own update cadence allows — that would reject every
         // settle attempt outright, not just unlucky ones.
+        // ...and can't exceed `MAX_STALENESS_SECS`: the staleness check adds
+        // this to an oracle-supplied timestamp, so an unbounded window could
+        // overflow `u64` and trap every settle.
         let reflector_client = Sep40Client::new(&env, &reflector.contract);
-        if reflector.max_staleness_secs < reflector_client.resolution() as u64 {
+        if reflector.max_staleness_secs > MAX_STALENESS_SECS
+            || reflector.max_staleness_secs < reflector_client.resolution() as u64
+        {
             return Err(Error::InvalidReflectorConfig);
         }
         // Pinned once here, re-checked on every `settle()` call — see
@@ -542,7 +548,9 @@ impl PolarisMarket {
 
         if let Some(cfg) = &redstone {
             let redstone_client = Sep40Client::new(&env, &cfg.contract);
-            if cfg.max_staleness_secs < redstone_client.resolution() as u64 {
+            if cfg.max_staleness_secs > MAX_STALENESS_SECS
+                || cfg.max_staleness_secs < redstone_client.resolution() as u64
+            {
                 return Err(Error::InvalidRedstoneConfig);
             }
             let redstone_decimals_at_init = redstone_client.decimals();
@@ -917,16 +925,10 @@ impl PolarisMarket {
         let feed_ts_micros = feed.feed_update_timestamp.unwrap_or(verified.timestamp);
         let feed_ts_secs = feed_ts_micros / 1_000_000;
 
-        // Deterministic settlement-price rule: the print must be at or
-        // before expiry (and no more than PRICE_FRESHNESS_WINDOW_SECS
-        // before it). A post-expiry print is rejected even though it is
-        // "fresher" — otherwise the caller of `settle()` could pick any
-        // signed update in `[expiry, expiry + 300s]` and choose the
-        // outcome. See the README's settlement section.
-        if feed_ts_secs + PRICE_FRESHNESS_WINDOW_SECS < m.expiry {
+        if feed_ts_secs.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) < m.expiry {
             return Err(Error::StalePrice);
         }
-        if feed_ts_secs > m.expiry {
+        if feed_ts_secs > m.expiry.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) {
             return Err(Error::FuturePrice);
         }
 
@@ -986,7 +988,9 @@ impl PolarisMarket {
 
         let client = Sep40Client::new(&env, &m.reflector.contract);
         let price = client.lastprice(&m.reflector.asset).ok_or(Error::ReflectorPriceUnavailable)?;
-        if price.timestamp + m.reflector.max_staleness_secs < now {
+        // Saturating, not `+`: `price.timestamp` is oracle-supplied and can
+        // sit near `u64::MAX`, which would otherwise trap the whole call.
+        if price.timestamp.saturating_add(m.reflector.max_staleness_secs) < now {
             return Err(Error::ReflectorPriceStale);
         }
         // Same "timestamped near expiry, not just not-stale-right-now"
@@ -994,7 +998,7 @@ impl PolarisMarket {
         // a price that's merely within max_staleness_secs of `now` could
         // still predate `expiry` by an unbounded amount if settle() is
         // called long after expiry on a stalled feed.
-        if price.timestamp + PRICE_FRESHNESS_WINDOW_SECS < m.expiry {
+        if price.timestamp.saturating_add(PRICE_FRESHNESS_WINDOW_SECS) < m.expiry {
             return Err(Error::StalePrice);
         }
         // Upper bound mirroring the Lazer path exactly: a price timestamped
