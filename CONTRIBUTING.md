@@ -30,13 +30,19 @@ sections for what that looks like in practice, and each issue's own
 references before starting; it usually explains *why* the current
 behavior is wrong, which matters more than the literal diff.
 
-Before contributing, build the workspace and run the tests (see the
-README's ["Building & testing"](./README.md#building--testing) section):
+Before contributing, build the workspace and run the tests with
+[`just`](https://github.com/casey/just) (see the README's ["Building &
+testing"](./README.md#building--testing) section):
 
 ```sh
-cargo test --workspace
-cargo build --release --target wasm32v1-none -p polaris-market
+just test
 ```
+
+`just test` builds the wasm in the required order (polaris-market first —
+`contractimport!` reads it as a file) and then runs `cargo test --workspace`.
+Don't call `cargo test` directly on a fresh clone: it fails without that
+build order. `just build-wasm`, `just hashes` and `just ci` are the other
+targets; CI runs the same ones.
 
 ## Communication
 
@@ -73,6 +79,8 @@ Prefix the PR title with the area it touches:
 - `vault` — `contracts/vault`
 - `wallet` — `contracts/smart-wallet` or `contracts/smart-wallet-factory`
 - `oracle` — the Reflector/RedStone/Lazer integration code (`ctf-math`'s `sep40` module, the mocks)
+- `interface` — `interface/` (the published `polaris-interface` crate) or `scripts/sync-interface-wasm.sh`
+- `tools` — `tools/` (e.g. `polaris-oracle-config`)
 - `docs` — README/comment-only changes
 - `test` — test-only changes
 - `ci`/`build` — workflow or Cargo config changes
@@ -87,6 +95,12 @@ it at a basic level, expect the PR to be closed rather than reviewed at
 length — this isn't punitive, it's the same standard this repo holds its
 own commits to (see the README's bug-hunting log for what "actually
 verified" looks like here).
+
+When you open a PR, GitHub pre-fills the description from
+[`.github/pull_request_template.md`](./.github/pull_request_template.md).
+Fill in the funds-critical checklist there if your change touches
+`contracts/*/src/lib.rs` — see [Funds-critical
+changes](#funds-critical-changes) below for what each item means.
 
 ## Pull request philosophy
 
@@ -105,6 +119,36 @@ PR touching this surface should expect thorough review, not a quick
 approve, and should preserve the solvency invariant
 (`collateral_token.balance(contract) == contract.total_supply`) under
 every ordering of calls.
+
+### Funds-critical changes
+
+Any change to `contracts/*/src/lib.rs` (or other code that moves balances,
+share accounting, or signature verification) must satisfy the checklist
+below. These steps are distilled from bugs that actually shipped — the
+Cancelled double count and the factory hijack both came from skipping one
+of them. The same list is in the PR template; tick each box in your PR
+description.
+
+- [ ] **Assert solvency for multi-holder flows.** The invariant
+  `collateral_token.balance(contract) == contract.total_supply` must hold
+  under every ordering of calls, and a test must exercise the multi-holder
+  path (not just a single depositor).
+- [ ] **Don't change stored struct shapes.** No fields added, removed, or
+  reordered in `#[contracttype]` structs that are already persisted
+  on-chain. If a shape change is unavoidable, document the migration and
+  test it against pre-existing state.
+- [ ] **Rebuild and update the WASM hash table.** Run
+  `cargo build --release --target wasm32v1-none` and update the recorded
+  WASM hash table so it matches the new artifact.
+- [ ] **Copy the WASM into `polaris-oracle/wasm/`.** The rebuilt artifact
+  must be copied to the oracle-side `wasm/` directory so both sides stay in
+  sync.
+- [ ] **Coordinate oracle-side argument changes.** If the arguments the
+  oracle passes (or expects) change, update the oracle side in the same PR
+  or a linked one — don't leave the two halves disagreeing.
+- [ ] **Add a regression test named after the bug.** The test must fail
+  without the fix and pass with it, and be named for the bug it guards
+  against (e.g. `test_cancelled_double_count`).
 
 ## Peer review
 
@@ -139,6 +183,41 @@ In general, a PR should:
   same bar this repo's own bug-hunting log holds itself to.
 - Not break `cargo test --workspace`.
 - Update the README/doc comments if it changes documented behavior.
+
+## State archival and restore
+
+Soroban persistent and instance storage entries expire if they are not
+bumped. This repo's contracts only extend TTLs on specific paths, so a
+contributor touching balances, positions, or the smart wallet should
+understand the archival model before changing anything in that area.
+
+- **Share balances** (`contracts/market` and `contracts/perpetual`) are
+  persistent entries. They get `extend_ttl(BUMP_THRESHOLD, BUMP_TO)`
+  (roughly 31 days) only when written — e.g. `set_balance`. Read paths
+  such as `balance_of` do **not** extend the TTL. A holder who buys and
+  then does nothing for ~31 days will have their balance entry archived.
+- **Smart-wallet instance storage** is only touched in `init` and on a
+  successful `__check_auth`. An idle passkey wallet can therefore be
+  archived after ~31 days of inactivity.
+
+When an entry is archived, calls that need it (`sell`, `redeem`, or
+`__check_auth`) fail until the entry is restored. **Funds are not lost** —
+the data is still on-chain, just archived. The restore procedure is to
+submit a Soroban `RestoreFootprint` operation for the archived entries
+before retrying the call. `polaris-oracle` is expected to prepend these
+restore operations automatically when simulation reports archived
+entries; until that lands, the backend (or the user) must submit them
+manually.
+
+On-chain mitigation is deliberately **not** implemented yet: neither
+`extend_ttl` on the `redeem`/`get_position` paths nor a permissionless
+`bump(user)` entrypoint exists today. The decision recorded for #147 is
+to handle restoration off-chain (oracle/backend) first and revisit an
+on-chain bump helper only if the off-chain flow proves insufficient —
+adding TTL bumps to read paths would make cheap reads cost writes, and a
+permissionless `bump(user)` needs its own griefing/cost analysis before
+it can be added safely. If you propose either, open an issue first and
+expect the same fund-safety review bar as any balance-touching change.
 
 ## Copyright
 
