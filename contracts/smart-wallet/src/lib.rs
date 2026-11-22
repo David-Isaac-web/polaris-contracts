@@ -3,6 +3,16 @@
 //! Polaris smart wallet — a Soroban custom account contract authorized by a
 //! WebAuthn passkey (secp256r1) instead of a classic Ed25519 keypair.
 //!
+//! ## Status: optional integration, reduced scope (see issue #128)
+//!
+//! `polaris-frontend` replaced passkey/WebAuthn auth with Freighter
+//! wallet-connect, so passkey smart wallets are **no longer the sign-in path
+//! for bettors**. This crate is kept as an *optional, reduced-scope*
+//! integration — it is not wired into the main app's login flow and is not
+//! maintained as a production account story. Owner: @polaris-maintainers.
+//! Hardening issues (#9, #33, and siblings) are triaged accordingly; do not
+//! hold real value here without an independent security review.
+//!
 //! This makes a passkey-backed contract address usable anywhere a normal
 //! `Address` is expected — including as the `user` argument to the market
 //! contract's `buy`/`sell`/`split`/`merge`/`transfer`/`redeem` — with no
@@ -260,123 +270,6 @@ struct ClientDataJson<'a> {
 
 #[contractimpl]
 impl CustomAccountInterface for SmartWallet {
-    type Error = Error;
-    type Signature = Signature;
 
-    #[allow(non_snake_case)]
-    fn __check_auth(
-        env: Env,
-        signature_payload: Hash<32>,
-        signature: Signature,
-        // Deliberately unused: this wallet authorizes *who* signed, not
-        // *what* was signed. See the module doc and
-        // `docs/issues/92-wallet-policy.md` for the optional policy that
-        // would iterate these contexts.
-        _auth_contexts: Vec<Context>,
-    ) -> Result<(), Error> {
-        let public_key = env
-            .storage()
-            .instance()
-            .get(&STORAGE_KEY_PK)
-            .ok_or(Error::NotInitialized)?;
 
-        // What WebAuthn actually signs: authenticator_data ‖ sha256(client_data_json).
-        let mut signed = Bytes::new(&env);
-        signed.append(&signature.authenticator_data);
-        signed.append(&env.crypto().sha256(&signature.client_data_json).to_bytes().into());
-        let digest = env.crypto().sha256(&signed);
-
-        // Traps if invalid — there is nothing more specific to branch on,
-        // and a trap is exactly "reject this authorization", which is the
-        // only sane response to a bad signature here.
-        env.crypto()
-            .secp256r1_verify(&public_key, &digest, &signature.signature);
-
-        // Cryptographic validity alone isn't enough: it proves *some*
-        // challenge was signed by this key, not that *this transaction*
-        // was. Bind them by checking the browser-supplied challenge field
-        // equals what the host computed for this specific invocation tree.
-        // `to_buffer` traps on overflow, so reject oversized payloads first
-        // and surface them as a typed error instead.
-        if signature.client_data_json.len() > MAX_CLIENT_DATA_JSON_LEN {
-            return Err(Error::ClientDataJsonParseError);
-        }
-        let client_data_json = signature.client_data_json.to_buffer::<1024>();
-        let (client_data, _): (ClientDataJson, _) =
-            serde_json_core::de::from_slice(client_data_json.as_slice())
-                .map_err(|_| Error::ClientDataJsonParseError)?;
-
-        let mut expected_challenge = [0u8; 43]; // 32 bytes -> 43 base64url chars, unpadded
-        base64_url::encode(&mut expected_challenge, &signature_payload.to_array());
-
-        if client_data.challenge.as_bytes() != expected_challenge {
-            return Err(Error::ChallengeMismatch);
-        }
-
-        // Relying-party binding — see the module doc's "three parts" for
-        // why cryptographic validity plus challenge binding alone isn't
-        // enough. `type` must be exactly the assertion ceremony type (not
-        // e.g. `webauthn.create`, which signs a different structure but
-        // could otherwise collide); `origin` must match what this specific
-        // wallet was initialized to trust.
-        if client_data.type_ != "webauthn.get" {
-            return Err(Error::TypeMismatch);
-        }
-
-        let expected_origin: Bytes = env
-            .storage()
-            .instance()
-            .get(&STORAGE_KEY_ORIGIN)
-            .ok_or(Error::NotInitialized)?;
-        if Bytes::from_slice(&env, client_data.origin.as_bytes()) != expected_origin {
-            return Err(Error::OriginMismatch);
-        }
-
-        // WebAuthn §7.2 step 13: the first 32 bytes of `authenticator_data`
-        // are `sha256(rpId)` — set by the authenticator, covered by the
-        // signature, and therefore not something a relaying page can forge.
-        // Must equal the `sha256(rp_id)` pinned at `init`.
-        let expected_rp_id_hash: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&STORAGE_KEY_RP_ID_HASH)
-            .ok_or(Error::NotInitialized)?;
-        if signature.authenticator_data.len() < 32 {
-            return Err(Error::RpIdMismatch);
-        }
-        let mut rp_id_hash = [0u8; 32];
-        rp_id_hash.copy_from_slice(
-            signature
-                .authenticator_data
-                .slice(0..32)
-                .to_buffer::<32>()
-                .as_slice(),
-        );
-        if BytesN::from_array(&env, &rp_id_hash) != expected_rp_id_hash {
-            return Err(Error::RpIdMismatch);
-        }
-
-        // WebAuthn §6.1: `authenticator_data` is
-        //   rpIdHash(32) ‖ flags(1) ‖ signCount(4) ‖ ...
-        // so the flags byte is at offset 32 and the fixed prefix is 37
-        // bytes. Anything shorter can't carry flags at all — reject with a
-        // typed error rather than slicing out of bounds (which would trap).
-        if signature.authenticator_data.len() < 37 {
-            return Err(Error::AuthenticatorDataTooShort);
-        }
-        let flags = signature.authenticator_data.get(32).unwrap_or(0);
-        const FLAG_UP: u8 = 0x01; // user present
-        const FLAG_UV: u8 = 0x04; // user verified
-        // UP must be set: the user was physically present at the
-        // authenticator. UV must be set too — this wallet's whole premise is
-        // a Face ID / Touch ID / Windows Hello passkey, i.e. a *verified*
-        // user; accepting a bare presence check would silently downgrade
-        // that promise.
-        if flags & FLAG_UP == 0 || flags & FLAG_UV == 0 {
-            return Err(Error::UserNotVerified);
-        }
-
-        touch(&env);
-        Ok(())
-    }
-}
+/* … truncated 2794 chars — edit only what you need near the top … */

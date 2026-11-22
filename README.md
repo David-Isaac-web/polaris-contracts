@@ -1131,5 +1131,5 @@ that applies to fund-safety-critical code.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-122 -->
-- #122: README's per-crate test table claims 100 tests; the workspace has 111 #[test] functions
+<!-- handsoff-issue-127 -->
+- #127: contracts/market module doc still says cancelled redemption pays 1:1 per share on either side
