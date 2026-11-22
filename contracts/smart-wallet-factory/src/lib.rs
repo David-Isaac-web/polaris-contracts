@@ -83,6 +83,53 @@ pub enum Error {
     /// report it — a second deploy at the same address fails in the host.
     AlreadyInitialized = 1,
     NotInitialized = 2,
+    InvalidOrigin = 3,
+}
+
+/// `https://` — the only scheme a real WebAuthn relying-party origin uses.
+const HTTPS_PREFIX: &[u8] = b"https://";
+/// `http://localhost` — allowed for local development only.
+const LOCALHOST_PREFIX: &[u8] = b"http://localhost";
+
+fn starts_with(bytes: &Bytes, prefix: &[u8]) -> bool {
+    if bytes.len() < prefix.len() as u32 {
+        return false;
+    }
+    for (i, expected) in prefix.iter().enumerate() {
+        if bytes.get(i as u32) != Some(*expected) {
+            return false;
+        }
+    }
+    true
+}
+
+/// An origin is accepted only if it is a bare scheme + authority:
+/// `https://host[:port]`, or `http://localhost[:port]` for dev. No trailing
+/// slash, no path, no query/fragment, no userinfo, no whitespace. A
+/// malformed origin stored here would be baked into every wallet this
+/// factory ever deploys, and `__check_auth` compares it byte-for-byte
+/// against `client_data_json.origin` — so a wrong one bricks every wallet
+/// permanently.
+fn validate_origin(origin: &Bytes) -> Result<(), Error> {
+    let len = origin.len();
+    let host_start = if starts_with(origin, HTTPS_PREFIX) {
+        HTTPS_PREFIX.len() as u32
+    } else if starts_with(origin, LOCALHOST_PREFIX) {
+        LOCALHOST_PREFIX.len() as u32
+    } else {
+        return Err(Error::InvalidOrigin);
+    };
+    if len <= host_start {
+        return Err(Error::InvalidOrigin);
+    }
+    for i in host_start..len {
+        let b = origin.get(i).ok_or(Error::InvalidOrigin)?;
+        let ok = b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':';
+        if !ok {
+            return Err(Error::InvalidOrigin);
+        }
+    }
+    Ok(())
 }
 
 #[contract]
@@ -104,17 +151,19 @@ impl SmartWalletFactory {
     ///
     /// `admin` is whoever controls this factory's configuration — not a
     /// role any deployed wallet answers to, just the authority to set this
-    /// once. It is authenticated here and then stored, so the factory keeps
-    /// a lasting, readable record of that authority (`get_admin`) instead of
-    /// discarding it after the auth check (#96).
+    /// once. Must run before `deploy` will do anything.
     ///
-    /// A `__constructor` (#95), not a separate `initialize` entrypoint:
-    /// `deploy` + `initialize` as two transactions left a window where the
-    /// factory existed unconfigured, and anyone could race the legitimate
-    /// setup. The constructor runs atomically inside the deploy invocation,
-    /// so the factory is never observable in an unconfigured state.
-    pub fn __constructor(env: Env, admin: Address, wasm_hash: BytesN<32>, origin: Bytes) {
+    /// `origin` must be a bare `https://host[:port]` (or
+    /// `http://localhost[:port]` for local dev) — no trailing slash, no
+    /// path. Anything else is rejected with `InvalidOrigin`, since a
+    /// malformed origin would be baked into every wallet this factory ever
+    /// deploys and permanently fail `__check_auth`'s origin comparison.
+    pub fn initialize(env: Env, admin: Address, wasm_hash: BytesN<32>, origin: Bytes) -> Result<(), Error> {
         admin.require_auth();
+        if env.storage().instance().has(&STORAGE_KEY_WASM_HASH) {
+            return Err(Error::AlreadyInitialized);
+        }
+        validate_origin(&origin)?;
         env.storage().instance().set(&STORAGE_KEY_WASM_HASH, &wasm_hash);
         env.storage().instance().set(&STORAGE_KEY_ORIGIN, &origin);
         env.storage().instance().set(&STORAGE_KEY_ADMIN, &admin);

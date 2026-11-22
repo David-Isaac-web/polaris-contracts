@@ -187,15 +187,12 @@ pub enum Error {
     /// by this, only the AMM-math-dependent entrypoints a pause exists to
     /// protect against.
     Paused = 35,
-    /// `initialize`-time validation: the `collateral` address is not a
-    /// standard SEP-41 token — its `decimals()` call failed or returned a
-    /// value outside `0..=18`. See the module doc's "Collateral token
-    /// requirements" section: the solvency invariant assumes standard
-    /// SEP-41 transfer semantics, and this is the one cheap on-chain probe
-    /// that rejects the most common non-conforming address (a plain
-    /// account, a contract with no token interface, or a token with
-    /// nonsensical precision) before any liquidity is pulled.
-    InvalidCollateral = 36,
+    /// `accept_admin` called with no `propose_admin` ever having been
+    /// called (or one already consumed by a prior `accept_admin`).
+    NoPendingAdmin = 36,
+    /// An admin-gated entrypoint was called by an address other than the
+    /// stored admin — see `require_admin`.
+    Unauthorized = 37,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,6 +294,11 @@ pub enum DataKey {
     /// additive for old and new instances alike. See #4's identical
     /// reasoning for `vault`'s `PendingAdmin` key.
     Paused,
+    /// Set only between a `propose_admin` and the matching `accept_admin` —
+    /// absent the rest of the time. Own key, not a `Market` field, for the
+    /// same additive-only reason as `Paused` above; mirrors `polaris-vault`'s
+    /// `PendingAdmin` (#4, ported here by #86).
+    PendingAdmin,
 }
 
 fn touch(env: &Env) {
@@ -323,6 +325,18 @@ fn load_redstone_oracle(env: &Env) -> Option<RedstoneOracle> {
 
 fn is_paused(env: &Env) -> bool {
     env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+}
+
+/// Identity check first, then `require_auth` — same pattern as
+/// `polaris-vault`'s `require_admin`: a mismatched caller gets a clear typed
+/// error rather than an auth trap.
+fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    let m = load_market(env)?;
+    if m.admin != *admin {
+        return Err(Error::Unauthorized);
+    }
+    admin.require_auth();
+    Ok(())
 }
 
 fn balance_of(env: &Env, side: Prediction, addr: &Address) -> i128 {
@@ -605,7 +619,7 @@ impl PolarisMarket {
     /// waiting for natural expiry.
     pub fn pause(env: Env) -> Result<(), Error> {
         let m = load_market(&env)?;
-        m.admin.require_auth();
+        require_admin(&env, &m.admin)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         touch(&env);
         env.events().publish((symbol_short!("paused"),), ());
@@ -614,7 +628,7 @@ impl PolarisMarket {
 
     pub fn unpause(env: Env) -> Result<(), Error> {
         let m = load_market(&env)?;
-        m.admin.require_auth();
+        require_admin(&env, &m.admin)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         touch(&env);
         env.events().publish((symbol_short!("unpaused"),), ());
@@ -625,46 +639,51 @@ impl PolarisMarket {
         is_paused(&env)
     }
 
-    /// Admin-gated fee-curve adjustment for a live market (#42) —
-    /// **decrease-only**. Neither `base_fee_bps` nor `min_fee_bps` may rise
-    /// above its current value; either or both may fall, as long as
-    /// `min_fee_bps <= base_fee_bps` still holds.
-    ///
-    /// Why decrease-only rather than freely adjustable: an admin who can
-    /// raise fees on an already-live market could add a house edge after
-    /// people have bought in, which contradicts the "trustless, no house
-    /// edge" framing. Lowering both bounds is safe for traders because
-    /// `effective_fee_bps = floor(base * r + min * (1 - r))` with
-    /// `r = initial_liquidity / total_supply` in `(0, 1]` is non-decreasing
-    /// in both `base` and `min`. Every future trade, at every
-    /// `total_supply`, is charged at most what the old curve would have
-    /// charged. Past trades are already settled and unaffected. The cost of
-    /// a reduction falls only on the treasury, since fees stay in the pool
-    /// that is swept to it at settlement.
-    ///
-    /// Emits `fee_set` with both the old and new values, so the change is
-    /// visible on-chain rather than reconstructed from a `get_fee()` diff.
-    pub fn set_fee_curve(env: Env, base_fee_bps: u32, min_fee_bps: u32) -> Result<(), Error> {
-        let mut m = load_market(&env)?;
-        m.admin.require_auth();
-        if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
-        }
-        if min_fee_bps > base_fee_bps {
-            return Err(Error::InvalidFeeBps);
-        }
-        if base_fee_bps > m.base_fee_bps || min_fee_bps > m.min_fee_bps {
-            return Err(Error::FeeIncreaseNotAllowed);
-        }
-        let (old_base, old_min) = (m.base_fee_bps, m.min_fee_bps);
-        m.base_fee_bps = base_fee_bps;
-        m.min_fee_bps = min_fee_bps;
-        save_market(&env, &m);
-        env.events().publish(
-            (symbol_short!("fee_set"),),
-            (old_base, old_min, base_fee_bps, min_fee_bps),
-        );
+    /// Step 1 of a two-step admin rotation — ported verbatim from
+    /// `polaris-vault` (#4, see #86). Deliberately not a single-call
+    /// `set_admin`: a typo'd/unreachable `proposed` address would
+    /// permanently brick the market out of its admin-gated entrypoints, so
+    /// the new admin has to actually show up and sign `accept_admin` with
+    /// its own key before the swap takes effect — a bad proposal is
+    /// harmless and reversible (just propose again).
+    pub fn propose_admin(env: Env, current_admin: Address, proposed: Address) -> Result<(), Error> {
+        require_admin(&env, &current_admin)?;
+        env.storage().instance().set(&DataKey::PendingAdmin, &proposed);
+        touch(&env);
+        env.events().publish((symbol_short!("propose"),), proposed.clone());
         Ok(())
+    }
+
+    /// Step 2: the proposed admin confirms with their own signature. Only
+    /// the exact address `propose_admin` named can call this successfully —
+    /// not the current admin, not anyone else — which is what actually
+    /// proves the new key is live, held, and able to sign before it becomes
+    /// the only key that can pause/unpause.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+        if pending != new_admin {
+            return Err(Error::Unauthorized);
+        }
+        new_admin.require_auth();
+        let mut m = load_market(&env)?;
+        m.admin = new_admin.clone();
+        save_market(&env, &m);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        touch(&env);
+        env.events().publish((symbol_short!("newadmin"),), new_admin);
+        Ok(())
+    }
+
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        Ok(load_market(&env)?.admin)
     }
 
     /// Lock `amount` collateral, mint `amount` YES + `amount` NO to `user`.
