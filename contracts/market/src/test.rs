@@ -2293,6 +2293,76 @@ fn resolved_no_redeem_stays_solvent_for_every_holder_including_treasury() {
     resolved_redeem_stays_solvent_for_every_holder(false);
 }
 
+// ---------- full lifecycle acceptance (#51) ----------
+
+/// The whole user journey, chained on one market instance: initialize →
+/// split → buy → sell → settle → redeem. The solvency invariant is
+/// asserted after every step, not only at the end. Every other test here
+/// exercises one or two of these operations in isolation.
+#[test]
+fn full_lifecycle_initialize_split_buy_sell_settle_redeem_stays_solvent_at_every_step() {
+    // 1. initialize
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let token = token::Client::new(&h.env, &h.token_id);
+    assert_eq!(client.get_market().total_supply, 10_000);
+    assert_solvent(&h);
+
+    let alice = Address::generate(&h.env); // splits, then sells some NO
+    let bob = Address::generate(&h.env); // directional YES buyer
+    fund(&h, &alice, 5_000);
+    fund(&h, &bob, 5_000);
+
+    // 2. split
+    client.split(&alice, &2_000);
+    assert_eq!(client.get_position(&alice), (2_000, 2_000));
+    assert_solvent(&h);
+
+    // 3. buy
+    let bob_yes = client.buy(&bob, &Prediction::Yes, &1_000, &0);
+    assert!(bob_yes > 1_000, "the swap leg must add YES on top of the split");
+    assert_eq!(client.get_position(&bob), (bob_yes, 0));
+    assert_solvent(&h);
+
+    // 4. sell
+    let alice_out = client.sell(&alice, &Prediction::No, &500, &0);
+    assert!(alice_out > 0);
+    assert_eq!(token.balance(&alice), 5_000 - 2_000 + alice_out);
+    assert_eq!(client.get_position(&alice), (2_000, 1_500));
+    assert_solvent(&h);
+
+    // 5. settle: $10,000.00 == strike, so YES wins
+    h.env.ledger().set_timestamp(h.expiry);
+    set_reflector_price_cents(&h, 1_000_000);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    client.settle(&Bytes::from_slice(&h.env, &payload));
+    let settled = client.get_market();
+    assert_eq!(settled.status, MarketStatus::ResolvedYes);
+    assert_eq!((settled.pool_yes, settled.pool_no), (0, 0));
+    assert_solvent(&h);
+
+    // 6. redeem: every YES holder (the treasury holds the swept pool), one
+    // at a time, with solvency checked between each.
+    let treasury_yes = client.get_position(&h.treasury).0;
+    let mut paid = 0;
+    for (who, yes) in [(&bob, bob_yes), (&alice, 2_000), (&h.treasury, treasury_yes)] {
+        let before = token.balance(who);
+        assert_eq!(client.redeem(who), yes);
+        assert_eq!(token.balance(who) - before, yes);
+        assert_eq!(client.get_position(who), (0, 0));
+        paid += yes;
+        assert_solvent(&h);
+    }
+
+    // Every outstanding YES share was paid exactly 1:1 and nothing is left
+    // behind. Alice's NO was burned with her YES, worth nothing.
+    assert_eq!(paid, settled.total_supply);
+    assert_eq!(client.get_market().total_supply, 0);
+    assert_eq!(token.balance(&h.market_id), 0);
+    assert_eq!(client.try_redeem(&alice), Err(Ok(Error::NothingToRedeem)));
+    assert_solvent(&h);
+}
+
 // ---------- fee-driven vs price-driven pool growth (#31) ----------
 
 fn assert_growth_identity(g: &PoolGrowth) {
