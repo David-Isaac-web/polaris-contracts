@@ -178,14 +178,38 @@ impl SmartWalletFactory {
             vec![&env, public_key.to_val(), origin.to_val()],
         );
         touch(&env);
+        // On-chain index of deployed wallets: topic (deploy, wallet address),
+        // data = the passkey public key the wallet is bound to.
+        env.events()
+            .publish((symbol_short!("deploy"), address.clone()), public_key);
         Ok(address)
     }
 
     /// The address `deploy(public_key)` would produce, computed without
-    /// deploying anything — a pure read, safe to call speculatively.
+    /// deploying anything — a pure read, safe to call speculatively. Note
+    /// this only derives the address; it does not report whether a wallet
+    /// exists there. Use `is_deployed` for that.
     pub fn resolve(env: Env, public_key: BytesN<65>) -> Address {
         let salt = env.crypto().sha256(&public_key.into());
         env.deployer().with_current_contract(salt).deployed_address()
+    }
+
+    /// Whether a wallet has actually been deployed for `public_key` at the
+    /// address `resolve` computes. `resolve` alone can't tell an existing
+    /// wallet from an empty address — it's a pure derivation — so callers
+    /// that need to know whether a "create wallet" flow is still required
+    /// should use this (or `resolve_with_status`) instead.
+    pub fn is_deployed(env: Env, public_key: BytesN<65>) -> bool {
+        let salt = env.crypto().sha256(&public_key.into());
+        let address = env.deployer().with_current_contract(salt).deployed_address();
+        env.deployer().get_contract_instance_wasm_hash(&address).is_some()
+    }
+
+    /// `resolve` plus `is_deployed` in one call: the deterministic address
+    /// for `public_key`, and whether a wallet already exists there.
+    pub fn resolve_with_status(env: Env, public_key: BytesN<65>) -> (Address, bool) {
+        let address = Self::resolve(env.clone(), public_key.clone());
+        (address, Self::is_deployed(env, public_key))
     }
 }
 
