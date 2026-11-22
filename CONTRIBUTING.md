@@ -30,13 +30,19 @@ sections for what that looks like in practice, and each issue's own
 references before starting; it usually explains *why* the current
 behavior is wrong, which matters more than the literal diff.
 
-Before contributing, build the workspace and run the tests (see the
-README's ["Building & testing"](./README.md#building--testing) section):
+Before contributing, build the workspace and run the tests with
+[`just`](https://github.com/casey/just) (see the README's ["Building &
+testing"](./README.md#building--testing) section):
 
 ```sh
-cargo test --workspace
-cargo build --release --target wasm32v1-none -p polaris-market
+just test
 ```
+
+`just test` builds the wasm in the required order (polaris-market first —
+`contractimport!` reads it as a file) and then runs `cargo test --workspace`.
+Don't call `cargo test` directly on a fresh clone: it fails without that
+build order. `just build-wasm`, `just hashes` and `just ci` are the other
+targets; CI runs the same ones.
 
 ## Communication
 
@@ -73,6 +79,8 @@ Prefix the PR title with the area it touches:
 - `vault` — `contracts/vault`
 - `wallet` — `contracts/smart-wallet` or `contracts/smart-wallet-factory`
 - `oracle` — the Reflector/RedStone/Lazer integration code (`ctf-math`'s `sep40` module, the mocks)
+- `interface` — `interface/` (the published `polaris-interface` crate) or `scripts/sync-interface-wasm.sh`
+- `tools` — `tools/` (e.g. `polaris-oracle-config`)
 - `docs` — README/comment-only changes
 - `test` — test-only changes
 - `ci`/`build` — workflow or Cargo config changes
