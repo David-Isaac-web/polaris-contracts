@@ -134,8 +134,22 @@ pub enum Error {
     InvalidFeedId = 6,
     InvalidFeeBps = 7,
     InvalidLiquidity = 8,
-    MarketNotOpen = 9,
-    TradingClosed = 10,
+    /// `status` is no longer `Open`: the market already resolved
+    /// (`ResolvedYes`/`ResolvedNo`) or was cancelled. Nothing but `redeem`
+    /// and `transfer` will ever succeed again. Was `MarketNotOpen` before
+    /// #58 (same code, `9`).
+    ///
+    /// Not to be confused with `MarketExpiredAwaitingSettlement`, where
+    /// `status` is still `Open` but `expiry` has passed.
+    MarketSettledOrCancelled = 9,
+    /// `buy`/`sell` after `expiry` on a market that is still `Open`, i.e.
+    /// waiting for `settle`/`settle_via_reflector` (or, past the grace
+    /// period, `cancel`). `split`/`merge` stay available until it is
+    /// finalized. Was `TradingClosed` before #58 (same code, `10`).
+    ///
+    /// Not to be confused with `MarketSettledOrCancelled`, where the
+    /// market is already finalized.
+    MarketExpiredAwaitingSettlement = 10,
     InvalidAmount = 11,
     InsufficientBalance = 12,
     SlippageExceeded = 13,
@@ -163,9 +177,14 @@ pub enum Error {
     ReflectorPriceUnavailable = 24,
     /// Reflector's most recent price is older than `reflector.max_staleness_secs`.
     ReflectorPriceStale = 25,
-    /// Reflector's `decimals()` returned something outside a sane range —
-    /// guards the `10^decimals` scaling math from overflow/underflow.
-    ReflectorDecimalsInvalid = 26,
+    /// Reflector's live `decimals()` is outside `2..=30`, the range the
+    /// `10^decimals` cents scaling supports without overflow/underflow.
+    /// Checked at `initialize` and again on every settle. Was
+    /// `ReflectorDecimalsInvalid` before #58 (same code, `26`).
+    ///
+    /// Not to be confused with `ReflectorDecimalsDriftedSinceInit`, which
+    /// is an in-range value that differs from the one pinned at init.
+    ReflectorDecimalsOutOfRange = 26,
     /// Lazer's and Reflector's prices diverge by more than
     /// `reflector.tolerance_bps` — the on-chain N-of-2 enforcement itself.
     OracleDivergence = 27,
@@ -175,19 +194,24 @@ pub enum Error {
     InvalidReflectorConfig = 28,
     /// Reflector's live `decimals()` no longer matches the value pinned at
     /// `initialize()` — see `polaris_ctf_math::OracleCheckError::DecimalsChanged`.
-    ReflectorDecimalsChanged = 29,
+    /// Settle-time only. Was `ReflectorDecimalsChanged` before #58 (same
+    /// code, `29`).
+    ReflectorDecimalsDriftedSinceInit = 29,
     /// RedStone's `lastprice` returned `None` for this market's asset —
     /// same fail-closed treatment as the Reflector leg. Only reachable if
     /// this market was configured with a `redstone` oracle at `initialize`.
     RedstonePriceUnavailable = 30,
     RedstonePriceStale = 31,
-    RedstoneDecimalsInvalid = 32,
+    /// RedStone leg's equivalent of `ReflectorDecimalsOutOfRange`. Was
+    /// `RedstoneDecimalsInvalid` before #58 (same code, `32`).
+    RedstoneDecimalsOutOfRange = 32,
     /// RedStone's live `decimals()` no longer matches the value pinned at
     /// `initialize()` — the specific landmine RedStone's own SEP-40
     /// wrapper contract documents (its `decimals()` is the max across
     /// *every* asset it has registered, not this asset's own precision,
     /// and can change): see this repo's README for how this was found.
-    RedstoneDecimalsChanged = 33,
+    /// Was `RedstoneDecimalsChanged` before #58 (same code, `33`).
+    RedstoneDecimalsDriftedSinceInit = 33,
     /// `initialize`-time validation for the `redstone` leg, mirroring
     /// `InvalidReflectorConfig`. A RedStone-vs-Lazer divergence beyond
     /// `redstone.tolerance_bps` reuses the shared `OracleDivergence`
@@ -463,10 +487,10 @@ impl PolarisMarket {
     /// - `InvalidReflectorConfig` / `InvalidRedstoneConfig` — that leg's
     ///   `max_staleness_secs` is narrower than the oracle's own live
     ///   `resolution()`, so every settle attempt would be stale.
-    /// - `ReflectorDecimalsInvalid` / `RedstoneDecimalsInvalid` — that
+    /// - `ReflectorDecimalsOutOfRange` / `RedstoneDecimalsOutOfRange` — that
     ///   leg's live `decimals()` is outside `2..=30`. The value read here
     ///   is pinned and re-checked on every `settle` (see
-    ///   `ReflectorDecimalsChanged`/`RedstoneDecimalsChanged`).
+    ///   `ReflectorDecimalsDriftedSinceInit`/`RedstoneDecimalsDriftedSinceInit`).
     ///
     /// Not validated here, and failing as a trap rather than a typed
     /// error: an oracle `contract` that doesn't implement SEP-40's
@@ -552,7 +576,7 @@ impl PolarisMarket {
         // `Market::reflector_decimals_at_init`'s doc comment.
         let reflector_decimals_at_init = reflector_client.decimals();
         if !(2..=30).contains(&reflector_decimals_at_init) {
-            return Err(Error::ReflectorDecimalsInvalid);
+            return Err(Error::ReflectorDecimalsOutOfRange);
         }
         // Fail closed at init, not at first settle: an oracle that has no
         // price for the configured asset can never settle this market.
@@ -575,7 +599,7 @@ impl PolarisMarket {
                 return Err(Error::RedstonePriceUnavailable);
             }
             if !(2..=30).contains(&redstone_decimals_at_init) {
-                return Err(Error::RedstoneDecimalsInvalid);
+                return Err(Error::RedstoneDecimalsOutOfRange);
             }
             env.storage().instance().set(
                 &DataKey::Redstone,
@@ -716,7 +740,7 @@ impl PolarisMarket {
         user.require_auth();
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -741,7 +765,7 @@ impl PolarisMarket {
         user.require_auth();
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -777,10 +801,10 @@ impl PolarisMarket {
         }
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         if env.ledger().timestamp() >= m.expiry {
-            return Err(Error::TradingClosed);
+            return Err(Error::MarketExpiredAwaitingSettlement);
         }
         if collateral_amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -846,10 +870,10 @@ impl PolarisMarket {
         }
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         if env.ledger().timestamp() >= m.expiry {
-            return Err(Error::TradingClosed);
+            return Err(Error::MarketExpiredAwaitingSettlement);
         }
         if shares_in <= 0 {
             return Err(Error::InvalidAmount);
@@ -971,8 +995,8 @@ impl PolarisMarket {
             |e| match e {
                 OracleCheckError::Unavailable => Error::ReflectorPriceUnavailable,
                 OracleCheckError::Stale => Error::ReflectorPriceStale,
-                OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
-                OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsOutOfRange,
+                OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsDriftedSinceInit,
                 OracleCheckError::FutureDated => Error::ReflectorPriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             },
@@ -1041,7 +1065,7 @@ impl PolarisMarket {
         }
         let decimals = client.decimals();
         if decimals != m.reflector_decimals_at_init {
-            return Err(Error::ReflectorDecimalsChanged);
+            return Err(Error::ReflectorDecimalsDriftedSinceInit);
         }
         let final_cents = reflector_price_to_cents(price.price, decimals);
 
@@ -1067,8 +1091,8 @@ impl PolarisMarket {
         match e {
             OracleCheckError::Unavailable => Error::RedstonePriceUnavailable,
             OracleCheckError::Stale => Error::RedstonePriceStale,
-            OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
-            OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+            OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsOutOfRange,
+            OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsDriftedSinceInit,
             OracleCheckError::FutureDated => Error::RedstonePriceFutureDated,
             OracleCheckError::Divergent => Error::OracleDivergence,
         }
@@ -1214,7 +1238,7 @@ impl PolarisMarket {
     pub fn get_price(env: Env) -> Result<(u32, u32), Error> {
         let m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         let total = m.pool_yes + m.pool_no;
         let yes_bps = (m.pool_no * 10_000 / total) as u32;

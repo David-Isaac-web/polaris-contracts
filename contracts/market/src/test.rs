@@ -852,7 +852,7 @@ fn buy_after_expiry_rejected() {
     h.env.ledger().set_timestamp(h.expiry);
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     let res = client.try_buy(&user, &Prediction::Yes, &1_000, &0);
-    assert_eq!(res, Err(Ok(Error::TradingClosed)));
+    assert_eq!(res, Err(Ok(Error::MarketExpiredAwaitingSettlement)));
 }
 
 // ---------- transfer ----------
@@ -1470,7 +1470,7 @@ fn settle_via_reflector_rejects_decimals_drift_since_initialize() {
     reflector_client.set_decimals(&(REFLECTOR_DECIMALS + 1));
     reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &h.expiry);
     let res = client.try_settle_via_reflector();
-    assert_eq!(res, Err(Ok(Error::ReflectorDecimalsChanged)));
+    assert_eq!(res, Err(Ok(Error::ReflectorDecimalsDriftedSinceInit)));
 }
 
 #[test]
@@ -1689,7 +1689,7 @@ fn settle_rejects_when_redstones_decimals_drift_from_what_was_pinned_at_init() {
     mock_sep40::MockSep40Client::new(&h.env, &redstone_id).set_decimals(&(REFLECTOR_DECIMALS + 4));
 
     let res = client.try_settle(&bytes);
-    assert_eq!(res, Err(Ok(Error::RedstoneDecimalsChanged)));
+    assert_eq!(res, Err(Ok(Error::RedstoneDecimalsDriftedSinceInit)));
     assert_eq!(client.get_market().status, MarketStatus::Open);
 }
 
@@ -2291,4 +2291,45 @@ fn resolved_yes_redeem_stays_solvent_for_every_holder_including_treasury() {
 #[test]
 fn resolved_no_redeem_stays_solvent_for_every_holder_including_treasury() {
     resolved_redeem_stays_solvent_for_every_holder(false);
+}
+
+// ---------- unambiguous error names (#58) ----------
+
+/// The #58 renames are names only. Every code a deployed caller might
+/// already be matching on stays where it was.
+#[test]
+fn renamed_error_variants_keep_their_wire_codes() {
+    assert_eq!(Error::MarketSettledOrCancelled as u32, 9);
+    assert_eq!(Error::MarketExpiredAwaitingSettlement as u32, 10);
+    assert_eq!(Error::ReflectorDecimalsOutOfRange as u32, 26);
+    assert_eq!(Error::ReflectorDecimalsDriftedSinceInit as u32, 29);
+    assert_eq!(Error::RedstoneDecimalsOutOfRange as u32, 32);
+    assert_eq!(Error::RedstoneDecimalsDriftedSinceInit as u32, 33);
+}
+
+/// The pair that used to read as synonyms (`MarketNotOpen` vs
+/// `TradingClosed`) on the same market, either side of `settle`.
+#[test]
+fn an_expired_open_market_and_a_settled_one_report_different_errors() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    client.buy(&user, &Prediction::Yes, &1_000, &0);
+
+    // Past expiry, not yet settled: trading is over, but split/merge are not.
+    h.env.ledger().set_timestamp(h.expiry);
+    assert_eq!(client.try_buy(&user, &Prediction::Yes, &100, &0), Err(Ok(Error::MarketExpiredAwaitingSettlement)));
+    assert_eq!(client.try_sell(&user, &Prediction::Yes, &100, &0), Err(Ok(Error::MarketExpiredAwaitingSettlement)));
+    client.split(&user, &100);
+    client.merge(&user, &100);
+
+    // Settled: now everything but redeem/transfer reports the other code.
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle_via_reflector();
+    assert_eq!(client.try_buy(&user, &Prediction::Yes, &100, &0), Err(Ok(Error::MarketSettledOrCancelled)));
+    assert_eq!(client.try_sell(&user, &Prediction::Yes, &100, &0), Err(Ok(Error::MarketSettledOrCancelled)));
+    assert_eq!(client.try_split(&user, &100), Err(Ok(Error::MarketSettledOrCancelled)));
+    assert_eq!(client.try_merge(&user, &100), Err(Ok(Error::MarketSettledOrCancelled)));
+    assert_solvent(&h);
 }

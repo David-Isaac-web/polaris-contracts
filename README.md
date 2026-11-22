@@ -235,6 +235,31 @@ enum rather than trapping. A failed call still reverts the whole
 transaction — atomicity isn't lost — but callers get a structured reason
 instead of an opaque panic.
 
+Errors cross the wasm boundary as bare `u32` codes, so a caller without
+the source sees only a number and a variant name. The name alone has to say
+which condition fired. Two pairs in `contracts/market` used to read as
+synonyms. They were renamed in
+[#58](https://github.com/PolarisQ-xyz/polaris-contracts/issues/58):
+
+| Code | Old name | New name | Fires when |
+|---|---|---|---|
+| 9 | `MarketNotOpen` | `MarketSettledOrCancelled` | `status` is `ResolvedYes`/`ResolvedNo`/`Cancelled` |
+| 10 | `TradingClosed` | `MarketExpiredAwaitingSettlement` | `buy`/`sell` past `expiry`, `status` still `Open` |
+| 26 | `ReflectorDecimalsInvalid` | `ReflectorDecimalsOutOfRange` | live `decimals()` outside `2..=30` (init or settle) |
+| 29 | `ReflectorDecimalsChanged` | `ReflectorDecimalsDriftedSinceInit` | live `decimals()` differs from the value pinned at init |
+| 32 | `RedstoneDecimalsInvalid` | `RedstoneDecimalsOutOfRange` | as 26, RedStone leg |
+| 33 | `RedstoneDecimalsChanged` | `RedstoneDecimalsDriftedSinceInit` | as 29, RedStone leg |
+
+**Breaking change to the error ABI (names, not codes).** Every code is
+unchanged (`renamed_error_variants_keep_their_wire_codes` pins them), so a
+deployed instance and anything matching on numbers is unaffected. The
+contract spec's variant names did change, so generated bindings (Rust via
+`polaris-interface`, TypeScript via `stellar contract bindings`) and any
+client matching on the old names must be regenerated or updated. That makes
+the next `polaris-interface` release a minor-version bump (0.2.0). See
+`interface/README.md`. `contracts/perpetual` has the same two decimals
+pairs under its own codes and is not renamed here.
+
 ## Emergency pause
 
 Neither `market` nor `perpetual` used to have any way to stop trading
