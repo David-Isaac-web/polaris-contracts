@@ -89,7 +89,7 @@ use pyth_lazer_stellar_sdk::PythLazerClient;
 // this crate's full test suite after touching this file; every number
 // must come out identical).
 use polaris_ctf_math::{
-    apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, reflector_price_to_cents,
+    apply_fee, cpmm_out, cpmm_sell_out, effective_fee_bps as shared_effective_fee_bps, isqrt, reflector_price_to_cents,
     sep40::Sep40Client, to_cents, verify_oracle_corroboration, OracleCheckError, OracleFeedConfig,
     MAX_STALENESS_SECS,
 };
@@ -134,8 +134,22 @@ pub enum Error {
     InvalidFeedId = 6,
     InvalidFeeBps = 7,
     InvalidLiquidity = 8,
-    MarketNotOpen = 9,
-    TradingClosed = 10,
+    /// `status` is no longer `Open`: the market already resolved
+    /// (`ResolvedYes`/`ResolvedNo`) or was cancelled. Nothing but `redeem`
+    /// and `transfer` will ever succeed again. Was `MarketNotOpen` before
+    /// #58 (same code, `9`).
+    ///
+    /// Not to be confused with `MarketExpiredAwaitingSettlement`, where
+    /// `status` is still `Open` but `expiry` has passed.
+    MarketSettledOrCancelled = 9,
+    /// `buy`/`sell` after `expiry` on a market that is still `Open`, i.e.
+    /// waiting for `settle`/`settle_via_reflector` (or, past the grace
+    /// period, `cancel`). `split`/`merge` stay available until it is
+    /// finalized. Was `TradingClosed` before #58 (same code, `10`).
+    ///
+    /// Not to be confused with `MarketSettledOrCancelled`, where the
+    /// market is already finalized.
+    MarketExpiredAwaitingSettlement = 10,
     InvalidAmount = 11,
     InsufficientBalance = 12,
     SlippageExceeded = 13,
@@ -163,9 +177,14 @@ pub enum Error {
     ReflectorPriceUnavailable = 24,
     /// Reflector's most recent price is older than `reflector.max_staleness_secs`.
     ReflectorPriceStale = 25,
-    /// Reflector's `decimals()` returned something outside a sane range —
-    /// guards the `10^decimals` scaling math from overflow/underflow.
-    ReflectorDecimalsInvalid = 26,
+    /// Reflector's live `decimals()` is outside `2..=30`, the range the
+    /// `10^decimals` cents scaling supports without overflow/underflow.
+    /// Checked at `initialize` and again on every settle. Was
+    /// `ReflectorDecimalsInvalid` before #58 (same code, `26`).
+    ///
+    /// Not to be confused with `ReflectorDecimalsDriftedSinceInit`, which
+    /// is an in-range value that differs from the one pinned at init.
+    ReflectorDecimalsOutOfRange = 26,
     /// Lazer's and Reflector's prices diverge by more than
     /// `reflector.tolerance_bps` — the on-chain N-of-2 enforcement itself.
     OracleDivergence = 27,
@@ -175,19 +194,24 @@ pub enum Error {
     InvalidReflectorConfig = 28,
     /// Reflector's live `decimals()` no longer matches the value pinned at
     /// `initialize()` — see `polaris_ctf_math::OracleCheckError::DecimalsChanged`.
-    ReflectorDecimalsChanged = 29,
+    /// Settle-time only. Was `ReflectorDecimalsChanged` before #58 (same
+    /// code, `29`).
+    ReflectorDecimalsDriftedSinceInit = 29,
     /// RedStone's `lastprice` returned `None` for this market's asset —
     /// same fail-closed treatment as the Reflector leg. Only reachable if
     /// this market was configured with a `redstone` oracle at `initialize`.
     RedstonePriceUnavailable = 30,
     RedstonePriceStale = 31,
-    RedstoneDecimalsInvalid = 32,
+    /// RedStone leg's equivalent of `ReflectorDecimalsOutOfRange`. Was
+    /// `RedstoneDecimalsInvalid` before #58 (same code, `32`).
+    RedstoneDecimalsOutOfRange = 32,
     /// RedStone's live `decimals()` no longer matches the value pinned at
     /// `initialize()` — the specific landmine RedStone's own SEP-40
     /// wrapper contract documents (its `decimals()` is the max across
     /// *every* asset it has registered, not this asset's own precision,
     /// and can change): see this repo's README for how this was found.
-    RedstoneDecimalsChanged = 33,
+    /// Was `RedstoneDecimalsChanged` before #58 (same code, `33`).
+    RedstoneDecimalsDriftedSinceInit = 33,
     /// `initialize`-time validation for the `redstone` leg, mirroring
     /// `InvalidReflectorConfig`. A RedStone-vs-Lazer divergence beyond
     /// `redstone.tolerance_bps` reuses the shared `OracleDivergence`
@@ -285,6 +309,50 @@ pub struct Market {
 pub struct RedstoneOracle {
     pub config: OracleFeedConfig,
     pub decimals_at_init: u32,
+}
+
+/// `get_pool_growth()`'s answer to "how much of the AMM pool is fee yield,
+/// and how much is the seed plus price movement?" (#31). Every field is
+/// derived from `Market`'s existing `pool_yes`/`pool_no`/`initial_liquidity`
+/// on each call. Nothing extra is stored, and the stored `Market` shape
+/// is unchanged.
+///
+/// Why the split is clean: `buy`/`sell` without a fee would keep the
+/// constant product `k = pool_yes * pool_no` fixed while moving the price.
+/// Up to integer rounding, the fee is the only thing that grows `k`,
+/// because the pool keeps the full input but pays out only against the
+/// fee-reduced `effective_in`. So `sqrt(k)` is a price-independent measure
+/// of depth, and its growth over the seed is fee accrual. What's left in
+/// the pool's marked value is the price-driven part.
+///
+/// Exact identity, in collateral units (integer floors included):
+/// `pool_value == initial_liquidity + fee_growth + price_effect`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PoolGrowth {
+    /// Seed collateral, which is also each reserve's starting depth.
+    pub initial_liquidity: i128,
+    pub pool_yes: i128,
+    pub pool_no: i128,
+    /// `floor(sqrt(pool_yes * pool_no))`: depth with the price effect
+    /// removed. Equals `initial_liquidity` on a fresh market.
+    pub invariant_liquidity: i128,
+    /// `invariant_liquidity - initial_liquidity`. Fee accrual, plus the
+    /// integer rounding in `cpmm_out`/`cpmm_sell_out`, which can go either
+    /// way by about one unit of `sqrt(k)` per trade. With a nonzero fee the
+    /// fee dominates, so this only goes negative on a market whose fee
+    /// curve is at `0` bps, and then only by that rounding.
+    pub fee_growth: i128,
+    /// The pool's YES + NO shares marked at the current implied price, the
+    /// same price `get_price` reports: `pool_yes * p_yes + pool_no * p_no`
+    /// with `p_yes = pool_no / (pool_yes + pool_no)`, which simplifies to
+    /// `floor(2 * pool_yes * pool_no / (pool_yes + pool_no))`.
+    pub pool_value: i128,
+    /// `pool_value - invariant_liquidity`: the price-driven part. Always
+    /// `<= 0` (a harmonic mean never exceeds the geometric mean). This is
+    /// the AMM's impermanent loss. It is `0` when the price is 50/50, so a
+    /// round trip back to even odds leaves only fee growth.
+    pub price_effect: i128,
 }
 
 #[derive(Clone)]
@@ -463,10 +531,10 @@ impl PolarisMarket {
     /// - `InvalidReflectorConfig` / `InvalidRedstoneConfig` — that leg's
     ///   `max_staleness_secs` is narrower than the oracle's own live
     ///   `resolution()`, so every settle attempt would be stale.
-    /// - `ReflectorDecimalsInvalid` / `RedstoneDecimalsInvalid` — that
+    /// - `ReflectorDecimalsOutOfRange` / `RedstoneDecimalsOutOfRange` — that
     ///   leg's live `decimals()` is outside `2..=30`. The value read here
     ///   is pinned and re-checked on every `settle` (see
-    ///   `ReflectorDecimalsChanged`/`RedstoneDecimalsChanged`).
+    ///   `ReflectorDecimalsDriftedSinceInit`/`RedstoneDecimalsDriftedSinceInit`).
     ///
     /// Not validated here, and failing as a trap rather than a typed
     /// error: an oracle `contract` that doesn't implement SEP-40's
@@ -552,7 +620,7 @@ impl PolarisMarket {
         // `Market::reflector_decimals_at_init`'s doc comment.
         let reflector_decimals_at_init = reflector_client.decimals();
         if !(2..=30).contains(&reflector_decimals_at_init) {
-            return Err(Error::ReflectorDecimalsInvalid);
+            return Err(Error::ReflectorDecimalsOutOfRange);
         }
         // Fail closed at init, not at first settle: an oracle that has no
         // price for the configured asset can never settle this market.
@@ -575,7 +643,7 @@ impl PolarisMarket {
                 return Err(Error::RedstonePriceUnavailable);
             }
             if !(2..=30).contains(&redstone_decimals_at_init) {
-                return Err(Error::RedstoneDecimalsInvalid);
+                return Err(Error::RedstoneDecimalsOutOfRange);
             }
             env.storage().instance().set(
                 &DataKey::Redstone,
@@ -716,7 +784,7 @@ impl PolarisMarket {
         user.require_auth();
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -741,7 +809,7 @@ impl PolarisMarket {
         user.require_auth();
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -777,10 +845,10 @@ impl PolarisMarket {
         }
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         if env.ledger().timestamp() >= m.expiry {
-            return Err(Error::TradingClosed);
+            return Err(Error::MarketExpiredAwaitingSettlement);
         }
         if collateral_amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -846,10 +914,10 @@ impl PolarisMarket {
         }
         let mut m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         if env.ledger().timestamp() >= m.expiry {
-            return Err(Error::TradingClosed);
+            return Err(Error::MarketExpiredAwaitingSettlement);
         }
         if shares_in <= 0 {
             return Err(Error::InvalidAmount);
@@ -971,8 +1039,8 @@ impl PolarisMarket {
             |e| match e {
                 OracleCheckError::Unavailable => Error::ReflectorPriceUnavailable,
                 OracleCheckError::Stale => Error::ReflectorPriceStale,
-                OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
-                OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsOutOfRange,
+                OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsDriftedSinceInit,
                 OracleCheckError::FutureDated => Error::ReflectorPriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             },
@@ -1041,7 +1109,7 @@ impl PolarisMarket {
         }
         let decimals = client.decimals();
         if decimals != m.reflector_decimals_at_init {
-            return Err(Error::ReflectorDecimalsChanged);
+            return Err(Error::ReflectorDecimalsDriftedSinceInit);
         }
         let final_cents = reflector_price_to_cents(price.price, decimals);
 
@@ -1067,8 +1135,8 @@ impl PolarisMarket {
         match e {
             OracleCheckError::Unavailable => Error::RedstonePriceUnavailable,
             OracleCheckError::Stale => Error::RedstonePriceStale,
-            OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
-            OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+            OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsOutOfRange,
+            OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsDriftedSinceInit,
             OracleCheckError::FutureDated => Error::RedstonePriceFutureDated,
             OracleCheckError::Divergent => Error::OracleDivergence,
         }
@@ -1214,7 +1282,7 @@ impl PolarisMarket {
     pub fn get_price(env: Env) -> Result<(u32, u32), Error> {
         let m = load_market(&env)?;
         if m.status != MarketStatus::Open {
-            return Err(Error::MarketNotOpen);
+            return Err(Error::MarketSettledOrCancelled);
         }
         let total = m.pool_yes + m.pool_no;
         let yes_bps = (m.pool_no * 10_000 / total) as u32;
@@ -1229,6 +1297,41 @@ impl PolarisMarket {
     pub fn get_fee(env: Env) -> Result<u32, Error> {
         let m = load_market(&env)?;
         Ok(effective_fee_bps(&m))
+    }
+
+    /// Splits the AMM pool's current size into the seed, fee-accrued
+    /// growth, and the price-driven part (#31). See `PoolGrowth` for the
+    /// definitions and the identity they satisfy. Read-only; it doesn't
+    /// need per-share LP accounting, because it describes the whole pool,
+    /// which today has one LP (the treasury/vault).
+    ///
+    /// Open markets only, the same as `get_price`: `settle`/`cancel` sweep
+    /// both reserves to the treasury and zero them, so there is no pool
+    /// left to describe. Returns `MarketSettledOrCancelled` then. The swept
+    /// amounts are exactly the treasury's credited YES/NO shares (and are
+    /// in the `cancel` event), so the same formulas applied to them give
+    /// the pool's final breakdown.
+    ///
+    /// Arithmetic is the same magnitude class as `buy`/`sell`'s own
+    /// (`pool_yes * pool_no` must fit in `i128`), so any pool those
+    /// entrypoints can produce is covered.
+    pub fn get_pool_growth(env: Env) -> Result<PoolGrowth, Error> {
+        let m = load_market(&env)?;
+        if m.status != MarketStatus::Open {
+            return Err(Error::MarketSettledOrCancelled);
+        }
+        let product = m.pool_yes * m.pool_no;
+        let invariant_liquidity = isqrt(product);
+        let pool_value = 2 * product / (m.pool_yes + m.pool_no);
+        Ok(PoolGrowth {
+            initial_liquidity: m.initial_liquidity,
+            pool_yes: m.pool_yes,
+            pool_no: m.pool_no,
+            invariant_liquidity,
+            fee_growth: invariant_liquidity - m.initial_liquidity,
+            pool_value,
+            price_effect: pool_value - invariant_liquidity,
+        })
     }
 }
 

@@ -235,6 +235,31 @@ enum rather than trapping. A failed call still reverts the whole
 transaction — atomicity isn't lost — but callers get a structured reason
 instead of an opaque panic.
 
+Errors cross the wasm boundary as bare `u32` codes, so a caller without
+the source sees only a number and a variant name. The name alone has to say
+which condition fired. Two pairs in `contracts/market` used to read as
+synonyms. They were renamed in
+[#58](https://github.com/PolarisQ-xyz/polaris-contracts/issues/58):
+
+| Code | Old name | New name | Fires when |
+|---|---|---|---|
+| 9 | `MarketNotOpen` | `MarketSettledOrCancelled` | `status` is `ResolvedYes`/`ResolvedNo`/`Cancelled` |
+| 10 | `TradingClosed` | `MarketExpiredAwaitingSettlement` | `buy`/`sell` past `expiry`, `status` still `Open` |
+| 26 | `ReflectorDecimalsInvalid` | `ReflectorDecimalsOutOfRange` | live `decimals()` outside `2..=30` (init or settle) |
+| 29 | `ReflectorDecimalsChanged` | `ReflectorDecimalsDriftedSinceInit` | live `decimals()` differs from the value pinned at init |
+| 32 | `RedstoneDecimalsInvalid` | `RedstoneDecimalsOutOfRange` | as 26, RedStone leg |
+| 33 | `RedstoneDecimalsChanged` | `RedstoneDecimalsDriftedSinceInit` | as 29, RedStone leg |
+
+**Breaking change to the error ABI (names, not codes).** Every code is
+unchanged (`renamed_error_variants_keep_their_wire_codes` pins them), so a
+deployed instance and anything matching on numbers is unaffected. The
+contract spec's variant names did change, so generated bindings (Rust via
+`polaris-interface`, TypeScript via `stellar contract bindings`) and any
+client matching on the old names must be regenerated or updated. That makes
+the next `polaris-interface` release a minor-version bump (0.2.0). See
+`interface/README.md`. `contracts/perpetual` has the same two decimals
+pairs under its own codes and is not renamed here.
+
 ## Emergency pause
 
 Neither `market` nor `perpetual` used to have any way to stop trading
@@ -316,6 +341,41 @@ which has no expiry, so "wait for it to resolve" never comes.
 `a_decrease_only_change_never_charges_more_at_any_total_supply`, which
 brute-forces the monotonicity claim, floor rounding included, against the
 shared curve.)
+
+## Fee yield vs. price movement in the pool
+
+Swap fees never leave the pool. They accrue into its depth and reach the
+treasury at settlement. `get_market()`'s raw `pool_yes`/`pool_no` can't
+separate that yield from the seed or from the pool simply going lopsided
+as the price moves. `get_pool_growth()` (read-only, `Open` markets only,
+nothing new stored) does:
+
+| Field | Meaning |
+|---|---|
+| `initial_liquidity` | the seed |
+| `invariant_liquidity` | `floor(sqrt(pool_yes · pool_no))`: depth with the price effect removed |
+| `fee_growth` | `invariant_liquidity − initial_liquidity`: fee accrual |
+| `pool_value` | pool shares marked at `get_price`'s odds, `floor(2·pool_yes·pool_no / (pool_yes + pool_no))` |
+| `price_effect` | `pool_value − invariant_liquidity`, always `≤ 0`: the AMM's impermanent loss |
+
+`pool_value == initial_liquidity + fee_growth + price_effect` holds exactly.
+The split works because a fee-free constant-product swap leaves `k =
+pool_yes · pool_no` unchanged, and only the fee grows it. Price movement
+shows up only in `price_effect`, and it unwinds as odds return to 50/50.
+`fee_growth` only grows. The one exception is integer rounding of about one
+unit per trade, which can go either way, so it is visible only on a 0 bps
+curve. Once a market settles or is cancelled, the reserves are swept to the
+treasury and zeroed. The swept amounts are the treasury's credited YES/NO
+shares (and are in the `cancel` event), so the same formulas give the final
+breakdown.
+
+It describes the whole pool, not a per-LP share. That's enough while the
+treasury/vault is the only LP. Fractional LP shares
+([#2](https://github.com/PolarisQ-xyz/polaris-contracts/issues/2)) would
+divide these numbers by shares rather than replace them.
+([#31](https://github.com/PolarisQ-xyz/polaris-contracts/issues/31), tests:
+`pool_growth_separates_fee_accrual_from_price_movement`,
+`fee_growth_accumulates_across_trades_while_the_price_effect_can_unwind`.)
 
 ## Event schema
 

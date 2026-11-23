@@ -37,6 +37,25 @@ The crate version is the contract release whose wasm is vendored in
 on-chain wasm hash of any instance deployed from that release, so you can
 check that a contract you're calling runs the code this crate describes.
 
+### Unreleased (next: 0.2.0)
+
+Breaking for anything matching on `market::Error` variant *names*. The
+`u32` codes are unchanged, so deployed instances and code-based matching
+are not affected. Renamed in #58:
+
+- `MarketNotOpen` → `MarketSettledOrCancelled` (9)
+- `TradingClosed` → `MarketExpiredAwaitingSettlement` (10)
+- `ReflectorDecimalsInvalid` → `ReflectorDecimalsOutOfRange` (26)
+- `ReflectorDecimalsChanged` → `ReflectorDecimalsDriftedSinceInit` (29)
+- `RedstoneDecimalsInvalid` → `RedstoneDecimalsOutOfRange` (32)
+- `RedstoneDecimalsChanged` → `RedstoneDecimalsDriftedSinceInit` (33)
+
+Added: `market::Client::get_pool_growth` and the `market::PoolGrowth` type
+(#31).
+
+Bump `version` to 0.2.0 when `wasm/` is next re-synced with
+`scripts/sync-interface-wasm.sh` (see Releasing below).
+
 ## How it's built, and what CI checks
 
 The convention matches other published Soroban SDK crates, e.g. Blend's

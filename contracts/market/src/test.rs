@@ -852,7 +852,7 @@ fn buy_after_expiry_rejected() {
     h.env.ledger().set_timestamp(h.expiry);
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     let res = client.try_buy(&user, &Prediction::Yes, &1_000, &0);
-    assert_eq!(res, Err(Ok(Error::TradingClosed)));
+    assert_eq!(res, Err(Ok(Error::MarketExpiredAwaitingSettlement)));
 }
 
 // ---------- transfer ----------
@@ -1470,7 +1470,7 @@ fn settle_via_reflector_rejects_decimals_drift_since_initialize() {
     reflector_client.set_decimals(&(REFLECTOR_DECIMALS + 1));
     reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &h.expiry);
     let res = client.try_settle_via_reflector();
-    assert_eq!(res, Err(Ok(Error::ReflectorDecimalsChanged)));
+    assert_eq!(res, Err(Ok(Error::ReflectorDecimalsDriftedSinceInit)));
 }
 
 #[test]
@@ -1689,7 +1689,7 @@ fn settle_rejects_when_redstones_decimals_drift_from_what_was_pinned_at_init() {
     mock_sep40::MockSep40Client::new(&h.env, &redstone_id).set_decimals(&(REFLECTOR_DECIMALS + 4));
 
     let res = client.try_settle(&bytes);
-    assert_eq!(res, Err(Ok(Error::RedstoneDecimalsChanged)));
+    assert_eq!(res, Err(Ok(Error::RedstoneDecimalsDriftedSinceInit)));
     assert_eq!(client.get_market().status, MarketStatus::Open);
 }
 
@@ -2291,4 +2291,238 @@ fn resolved_yes_redeem_stays_solvent_for_every_holder_including_treasury() {
 #[test]
 fn resolved_no_redeem_stays_solvent_for_every_holder_including_treasury() {
     resolved_redeem_stays_solvent_for_every_holder(false);
+}
+
+// ---------- full lifecycle acceptance (#51) ----------
+
+/// The whole user journey, chained on one market instance: initialize →
+/// split → buy → sell → settle → redeem. The solvency invariant is
+/// asserted after every step, not only at the end. Every other test here
+/// exercises one or two of these operations in isolation.
+#[test]
+fn full_lifecycle_initialize_split_buy_sell_settle_redeem_stays_solvent_at_every_step() {
+    // 1. initialize
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let token = token::Client::new(&h.env, &h.token_id);
+    assert_eq!(client.get_market().total_supply, 10_000);
+    assert_solvent(&h);
+
+    let alice = Address::generate(&h.env); // splits, then sells some NO
+    let bob = Address::generate(&h.env); // directional YES buyer
+    fund(&h, &alice, 5_000);
+    fund(&h, &bob, 5_000);
+
+    // 2. split
+    client.split(&alice, &2_000);
+    assert_eq!(client.get_position(&alice), (2_000, 2_000));
+    assert_solvent(&h);
+
+    // 3. buy
+    let bob_yes = client.buy(&bob, &Prediction::Yes, &1_000, &0);
+    assert!(bob_yes > 1_000, "the swap leg must add YES on top of the split");
+    assert_eq!(client.get_position(&bob), (bob_yes, 0));
+    assert_solvent(&h);
+
+    // 4. sell
+    let alice_out = client.sell(&alice, &Prediction::No, &500, &0);
+    assert!(alice_out > 0);
+    assert_eq!(token.balance(&alice), 5_000 - 2_000 + alice_out);
+    assert_eq!(client.get_position(&alice), (2_000, 1_500));
+    assert_solvent(&h);
+
+    // 5. settle: $10,000.00 == strike, so YES wins
+    h.env.ledger().set_timestamp(h.expiry);
+    set_reflector_price_cents(&h, 1_000_000);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    client.settle(&Bytes::from_slice(&h.env, &payload));
+    let settled = client.get_market();
+    assert_eq!(settled.status, MarketStatus::ResolvedYes);
+    assert_eq!((settled.pool_yes, settled.pool_no), (0, 0));
+    assert_solvent(&h);
+
+    // 6. redeem: every YES holder (the treasury holds the swept pool), one
+    // at a time, with solvency checked between each.
+    let treasury_yes = client.get_position(&h.treasury).0;
+    let mut paid = 0;
+    for (who, yes) in [(&bob, bob_yes), (&alice, 2_000), (&h.treasury, treasury_yes)] {
+        let before = token.balance(who);
+        assert_eq!(client.redeem(who), yes);
+        assert_eq!(token.balance(who) - before, yes);
+        assert_eq!(client.get_position(who), (0, 0));
+        paid += yes;
+        assert_solvent(&h);
+    }
+
+    // Every outstanding YES share was paid exactly 1:1 and nothing is left
+    // behind. Alice's NO was burned with her YES, worth nothing.
+    assert_eq!(paid, settled.total_supply);
+    assert_eq!(client.get_market().total_supply, 0);
+    assert_eq!(token.balance(&h.market_id), 0);
+    assert_eq!(client.try_redeem(&alice), Err(Ok(Error::NothingToRedeem)));
+    assert_solvent(&h);
+}
+
+// ---------- fee-driven vs price-driven pool growth (#31) ----------
+
+fn assert_growth_identity(g: &PoolGrowth) {
+    assert_eq!(g.pool_value, g.initial_liquidity + g.fee_growth + g.price_effect, "{g:?}");
+    assert_eq!(g.fee_growth, g.invariant_liquidity - g.initial_liquidity, "{g:?}");
+    assert!(g.price_effect <= 0, "price movement can only cost the pool, never add to it: {g:?}");
+}
+
+#[test]
+fn pool_growth_on_a_fresh_market_is_all_seed() {
+    let h = setup(1_000_000, 10_000);
+    let g = PolarisMarketClient::new(&h.env, &h.market_id).get_pool_growth();
+    assert_eq!(
+        g,
+        PoolGrowth {
+            initial_liquidity: 10_000,
+            pool_yes: 10_000,
+            pool_no: 10_000,
+            invariant_liquidity: 10_000,
+            fee_growth: 0,
+            pool_value: 10_000,
+            price_effect: 0,
+        }
+    );
+}
+
+#[test]
+fn pool_growth_separates_fee_accrual_from_price_movement() {
+    // The same trade on two identical markets, except one charges no fee
+    // at all. The price moves the same way on both; only one of them earns
+    // fees.
+    let with_fee = setup(1_000_000, 100_000);
+    let no_fee = setup_with_fees(1_000_000, 100_000, 0, 0);
+
+    let mut results = std::vec::Vec::new();
+    for h in [&with_fee, &no_fee] {
+        let user = Address::generate(&h.env);
+        fund(h, &user, 20_000);
+        let client = PolarisMarketClient::new(&h.env, &h.market_id);
+        client.buy(&user, &Prediction::Yes, &10_000, &0);
+        let g = client.get_pool_growth();
+        assert_growth_identity(&g);
+        results.push(g);
+    }
+    let (fee_g, free_g) = (&results[0], &results[1]);
+
+    // Both pools are now lopsided toward NO (YES got dearer). That shows
+    // up as a negative price effect on both, not as growth.
+    assert!(fee_g.price_effect < 0 && free_g.price_effect < 0);
+    // Without a fee the invariant is unchanged up to rounding...
+    assert!(free_g.fee_growth.abs() <= 1, "a zero-fee trade is not fee growth: {free_g:?}");
+    // ...and with one, the 1% fee on 10_000 shows up as real growth.
+    assert!(fee_g.fee_growth > 1, "{fee_g:?}");
+    // The total pool size alone can't tell the two apart this cleanly:
+    // both pools "grew" in raw share count from the same trade.
+    assert!(fee_g.pool_yes + fee_g.pool_no > 200_000 && free_g.pool_yes + free_g.pool_no > 200_000);
+}
+
+#[test]
+fn fee_growth_accumulates_across_trades_while_the_price_effect_can_unwind() {
+    let h = setup(1_000_000, 100_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let bob = Address::generate(&h.env);
+    let carol = Address::generate(&h.env);
+    fund(&h, &bob, 50_000);
+    fund(&h, &carol, 50_000);
+
+    client.buy(&bob, &Prediction::Yes, &10_000, &0);
+    let after_yes = client.get_pool_growth();
+    assert_growth_identity(&after_yes);
+
+    // An opposite trade of the same size pulls the price back toward
+    // 50/50: most of the price effect unwinds, but fees only ever add up.
+    client.buy(&carol, &Prediction::No, &10_000, &0);
+    let after_no = client.get_pool_growth();
+    assert_growth_identity(&after_no);
+    assert!(after_no.fee_growth > after_yes.fee_growth);
+    assert!(after_no.price_effect.abs() < after_yes.price_effect.abs() / 10, "{after_yes:?} {after_no:?}");
+
+    // Selling also pays a fee into the pool.
+    let (bob_yes, _) = client.get_position(&bob);
+    client.sell(&bob, &Prediction::Yes, &(bob_yes / 2), &0);
+    let after_sell = client.get_pool_growth();
+    assert_growth_identity(&after_sell);
+    assert!(after_sell.fee_growth > after_no.fee_growth);
+    assert_solvent(&h);
+}
+
+#[test]
+fn split_and_merge_never_touch_pool_growth() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    client.buy(&user, &Prediction::No, &1_000, &0);
+    let before = client.get_pool_growth();
+
+    client.split(&user, &2_000);
+    assert_eq!(client.get_pool_growth(), before);
+    client.merge(&user, &1_500);
+    assert_eq!(client.get_pool_growth(), before);
+}
+
+#[test]
+fn pool_growth_is_unavailable_once_settled_and_the_treasury_holds_the_final_pool() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    client.buy(&user, &Prediction::Yes, &1_000, &0);
+    let last_open = client.get_pool_growth();
+
+    h.env.ledger().set_timestamp(h.expiry);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle_via_reflector();
+
+    // The pool was swept to the treasury, so there's nothing left to split.
+    assert_eq!(client.try_get_pool_growth(), Err(Ok(Error::MarketSettledOrCancelled)));
+    // The swept reserves are exactly the treasury's shares, so the final
+    // breakdown is still recoverable with the same formulas.
+    assert_eq!(client.get_position(&h.treasury), (last_open.pool_yes, last_open.pool_no));
+}
+
+// ---------- unambiguous error names (#58) ----------
+
+/// The #58 renames are names only. Every code a deployed caller might
+/// already be matching on stays where it was.
+#[test]
+fn renamed_error_variants_keep_their_wire_codes() {
+    assert_eq!(Error::MarketSettledOrCancelled as u32, 9);
+    assert_eq!(Error::MarketExpiredAwaitingSettlement as u32, 10);
+    assert_eq!(Error::ReflectorDecimalsOutOfRange as u32, 26);
+    assert_eq!(Error::ReflectorDecimalsDriftedSinceInit as u32, 29);
+    assert_eq!(Error::RedstoneDecimalsOutOfRange as u32, 32);
+    assert_eq!(Error::RedstoneDecimalsDriftedSinceInit as u32, 33);
+}
+
+/// The pair that used to read as synonyms (`MarketNotOpen` vs
+/// `TradingClosed`) on the same market, either side of `settle`.
+#[test]
+fn an_expired_open_market_and_a_settled_one_report_different_errors() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+    client.buy(&user, &Prediction::Yes, &1_000, &0);
+
+    // Past expiry, not yet settled: trading is over, but split/merge are not.
+    h.env.ledger().set_timestamp(h.expiry);
+    assert_eq!(client.try_buy(&user, &Prediction::Yes, &100, &0), Err(Ok(Error::MarketExpiredAwaitingSettlement)));
+    assert_eq!(client.try_sell(&user, &Prediction::Yes, &100, &0), Err(Ok(Error::MarketExpiredAwaitingSettlement)));
+    client.split(&user, &100);
+    client.merge(&user, &100);
+
+    // Settled: now everything but redeem/transfer reports the other code.
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle_via_reflector();
+    assert_eq!(client.try_buy(&user, &Prediction::Yes, &100, &0), Err(Ok(Error::MarketSettledOrCancelled)));
+    assert_eq!(client.try_sell(&user, &Prediction::Yes, &100, &0), Err(Ok(Error::MarketSettledOrCancelled)));
+    assert_eq!(client.try_split(&user, &100), Err(Ok(Error::MarketSettledOrCancelled)));
+    assert_eq!(client.try_merge(&user, &100), Err(Ok(Error::MarketSettledOrCancelled)));
+    assert_solvent(&h);
 }
