@@ -254,6 +254,38 @@ pub enum SettlementSource {
     Reflector,
 }
 
+/// The read-only answer from `preview_settlement` /
+/// `preview_settlement_via_reflector`: what settlement would write if called
+/// right now. Never stored — no market fields are touched by a preview.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SettlementPreview {
+    /// The price settlement would finalize at, in cents.
+    pub final_price: i128,
+    /// `ResolvedYes` iff `final_price >= strike_price`, else `ResolvedNo`.
+    /// A successful preview never returns `Open` or `Cancelled`.
+    pub outcome: MarketStatus,
+}
+
+impl SettlementPreview {
+    fn new(final_price: i128, strike_price: i128) -> Self {
+        Self {
+            final_price,
+            outcome: outcome_for(final_price, strike_price),
+        }
+    }
+}
+
+/// The single source of truth for the price-to-outcome rule, shared by both
+/// settlement paths and both previews so they cannot drift apart.
+fn outcome_for(final_price: i128, strike_price: i128) -> MarketStatus {
+    if final_price >= strike_price {
+        MarketStatus::ResolvedYes
+    } else {
+        MarketStatus::ResolvedNo
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum MarketStatus {
@@ -995,17 +1027,57 @@ impl PolarisMarket {
     /// Permissionlessly settle with an oracle-signed payload once expiry has passed.
     pub fn settle(env: Env, payload: Bytes) -> Result<(), Error> {
         let mut m = load_market(&env)?;
+        Self::check_settlement_ready(&env, &m)?;
+        let final_cents = Self::lazer_settlement_price(&env, &m, &payload)?;
+        Self::finalize_settlement(&env, &mut m, final_cents, SettlementSource::Lazer);
+        Ok(())
+    }
+
+    /// Read-only counterpart of `settle`: the outcome it would produce using
+    /// the caller's signed Lazer payload, without finalizing or emitting any
+    /// event. Runs the exact same readiness, verification, freshness and
+    /// corroboration checks as `settle` (via the shared helpers), so a
+    /// successful preview is a promise about what `settle(payload)` would do;
+    /// an `Err` is the same reason `settle` would fail right now.
+    pub fn preview_settlement(env: Env, payload: Bytes) -> Result<SettlementPreview, Error> {
+        let m = load_market(&env)?;
+        Self::check_settlement_ready(&env, &m)?;
+        Ok(SettlementPreview::new(
+            Self::lazer_settlement_price(&env, &m, &payload)?,
+            m.strike_price,
+        ))
+    }
+
+    /// Read-only counterpart of `settle_via_reflector`, for frontends that
+    /// have no signed Lazer payload. Same shared logic, zero state change.
+    pub fn preview_settlement_via_reflector(env: Env) -> Result<SettlementPreview, Error> {
+        let m = load_market(&env)?;
+        Self::check_settlement_ready(&env, &m)?;
+        Ok(SettlementPreview::new(
+            Self::reflector_settlement_price(&env, &m)?,
+            m.strike_price,
+        ))
+    }
+
+    /// Preconditions common to both settlement paths and both previews.
+    fn check_settlement_ready(env: &Env, m: &Market) -> Result<(), Error> {
         if m.status != MarketStatus::Open {
             return Err(Error::AlreadyFinalized);
         }
-        let now = env.ledger().timestamp();
-        if now < m.expiry {
+        if env.ledger().timestamp() < m.expiry {
             return Err(Error::ExpiryNotReached);
         }
+        Ok(())
+    }
 
-        let client = PythLazerClient::new(&env, &m.lazer_contract);
+    /// Lazer verification + freshness + all corroboration legs, extracted
+    /// verbatim from `settle`. Returns the would-be final price in cents;
+    /// mutation happens only in `finalize_settlement`.
+    fn lazer_settlement_price(env: &Env, m: &Market, payload: &Bytes) -> Result<i128, Error> {
+        let now = env.ledger().timestamp();
+        let client = PythLazerClient::new(env, &m.lazer_contract);
         let verified = client
-            .verify_update(&payload)
+            .verify_update(payload)
             .map_err(|_| Error::InvalidPayload)?;
 
         let feed = verified
@@ -1035,7 +1107,7 @@ impl PolarisMarket {
         // `m` has happened yet at this point, so every early return below
         // is a clean revert. Unanimous: any configured leg disagreeing or
         // unavailable rejects the whole call, never a majority vote.
-        verify_oracle_corroboration(&env, &m.reflector, m.reflector_decimals_at_init, now, final_cents).map_err(
+        verify_oracle_corroboration(env, &m.reflector, m.reflector_decimals_at_init, now, final_cents).map_err(
             |e| match e {
                 OracleCheckError::Unavailable => Error::ReflectorPriceUnavailable,
                 OracleCheckError::Stale => Error::ReflectorPriceStale,
@@ -1045,13 +1117,12 @@ impl PolarisMarket {
                 OracleCheckError::Divergent => Error::OracleDivergence,
             },
         )?;
-        if let Some(redstone) = load_redstone_oracle(&env) {
-            verify_oracle_corroboration(&env, &redstone.config, redstone.decimals_at_init, now, final_cents)
+        if let Some(redstone) = load_redstone_oracle(env) {
+            verify_oracle_corroboration(env, &redstone.config, redstone.decimals_at_init, now, final_cents)
                 .map_err(Self::map_redstone_error)?;
         }
 
-        Self::finalize_settlement(&env, &mut m, final_cents, SettlementSource::Lazer);
-        Ok(())
+        Ok(final_cents)
     }
 
     /// A second, independent settlement path for when no Pyth Lazer
@@ -1075,15 +1146,18 @@ impl PolarisMarket {
     /// behavior on stale/unavailable/drifted data as the Lazer path.
     pub fn settle_via_reflector(env: Env) -> Result<(), Error> {
         let mut m = load_market(&env)?;
-        if m.status != MarketStatus::Open {
-            return Err(Error::AlreadyFinalized);
-        }
-        let now = env.ledger().timestamp();
-        if now < m.expiry {
-            return Err(Error::ExpiryNotReached);
-        }
+        Self::check_settlement_ready(&env, &m)?;
+        let final_cents = Self::reflector_settlement_price(&env, &m)?;
+        Self::finalize_settlement(&env, &mut m, final_cents, SettlementSource::Reflector);
+        Ok(())
+    }
 
-        let client = Sep40Client::new(&env, &m.reflector.contract);
+    /// Reflector read + freshness + decimals-pin + RedStone corroboration,
+    /// extracted verbatim from `settle_via_reflector`. Returns the would-be
+    /// final price in cents; no state is touched until `finalize_settlement`.
+    fn reflector_settlement_price(env: &Env, m: &Market) -> Result<i128, Error> {
+        let now = env.ledger().timestamp();
+        let client = Sep40Client::new(env, &m.reflector.contract);
         let price = client.lastprice(&m.reflector.asset).ok_or(Error::ReflectorPriceUnavailable)?;
         // Saturating, not `+`: `price.timestamp` is oracle-supplied and can
         // sit near `u64::MAX`, which would otherwise trap the whole call.
@@ -1118,13 +1192,12 @@ impl PolarisMarket {
         // promoted to primary." Mirrors settle()'s own RedStone check
         // exactly, just corroborating against Reflector's price instead
         // of Lazer's.
-        if let Some(redstone) = load_redstone_oracle(&env) {
-            verify_oracle_corroboration(&env, &redstone.config, redstone.decimals_at_init, now, final_cents)
+        if let Some(redstone) = load_redstone_oracle(env) {
+            verify_oracle_corroboration(env, &redstone.config, redstone.decimals_at_init, now, final_cents)
                 .map_err(Self::map_redstone_error)?;
         }
 
-        Self::finalize_settlement(&env, &mut m, final_cents, SettlementSource::Reflector);
-        Ok(())
+        Ok(final_cents)
     }
 
     /// Maps the optional RedStone leg's `OracleCheckError` to this
@@ -1152,11 +1225,7 @@ impl PolarisMarket {
         source: SettlementSource,
     ) {
         m.final_price = final_cents;
-        m.status = if final_cents >= m.strike_price {
-            MarketStatus::ResolvedYes
-        } else {
-            MarketStatus::ResolvedNo
-        };
+        m.status = outcome_for(final_cents, m.strike_price);
 
         let (swept_yes, swept_no) = (m.pool_yes, m.pool_no);
         credit(env, Prediction::Yes, &m.treasury, swept_yes);
