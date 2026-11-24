@@ -81,11 +81,13 @@ fn default_reflector_config(env: &Env, reflector_id: &Address) -> OracleFeedConf
 /// `Asset::Stellar(<native XLM SAC address>)`, not `Asset::Other("XLM")`
 /// like Reflector — confirmed live against the real mainnet contract, see
 /// this repo's README. The mock keys prices by asset, so this must match
-/// exactly what `set_redstone_price_cents` prices.
-fn default_redstone_config(env: &Env, redstone_id: &Address) -> OracleFeedConfig {
+/// exactly what `set_redstone_price_cents` prices. Use the mock's own
+/// contract address as a deterministic stand-in for that SAC address so
+/// every `default_redstone_config` call for the same instance agrees.
+fn default_redstone_config(_env: &Env, redstone_id: &Address) -> OracleFeedConfig {
     OracleFeedConfig {
         contract: redstone_id.clone(),
-        asset: polaris_ctf_math::sep40::Asset::Stellar(Address::generate(env)),
+        asset: polaris_ctf_math::sep40::Asset::Stellar(redstone_id.clone()),
         max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
         tolerance_bps: REFLECTOR_TOLERANCE_BPS,
     }
@@ -120,8 +122,11 @@ fn setup_with_fees(strike_cents: i128, initial_liquidity: i128, base_fee_bps: u3
 
     // `initialize` now rejects an oracle with no price for the configured
     // asset, so seed one before it runs.
-    mock_sep40::MockSep40Client::new(&env, &reflector_id)
-        .set_price(&(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &env.ledger().timestamp());
+    mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(
+        &default_reflector_config(&env, &reflector_id).asset,
+        &(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &env.ledger().timestamp(),
+    );
 
     let client = PolarisMarketClient::new(&env, &market_id);
     client.initialize(
@@ -183,10 +188,16 @@ fn setup_with_redstone(strike_cents: i128, initial_liquidity: i128) -> (Harness,
 
     // Both legs must have a price for the configured asset before
     // `initialize` accepts them.
-    mock_sep40::MockSep40Client::new(&env, &reflector_id)
-        .set_price(&(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &env.ledger().timestamp());
-    mock_sep40::MockSep40Client::new(&env, &redstone_id)
-        .set_price(&(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &env.ledger().timestamp());
+    mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(
+        &default_reflector_config(&env, &reflector_id).asset,
+        &(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &env.ledger().timestamp(),
+    );
+    mock_sep40::MockSep40Client::new(&env, &redstone_id).set_price(
+        &default_redstone_config(&env, &redstone_id).asset,
+        &(1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &env.ledger().timestamp(),
+    );
 
     let client = PolarisMarketClient::new(&env, &market_id);
     client.initialize(
@@ -448,6 +459,60 @@ fn init_rejects_bad_params() {
         Err(Ok(Error::InvalidRedstoneConfig)),
         "same oversize cap applies to an optionally-configured RedStone leg"
     );
+
+    let bad_feed = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_feed);
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &0u32, &100u32, &20u32, &treasury, &1000i128, &reflector_config, &None),
+        Err(Ok(Error::InvalidFeedId)),
+        "feed id 0 is the unset-field value, not a real Lazer feed"
+    );
+
+    let bad_grace = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_grace);
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &0u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &reflector_config, &None),
+        Err(Ok(Error::InvalidGracePeriod)),
+        "grace period 0 would make cancel() immediately permissionless"
+    );
+
+    let bad_liquidity = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_liquidity);
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &0i128, &reflector_config, &None),
+        Err(Ok(Error::InvalidLiquidity)),
+        "an empty pool has no constant-product price"
+    );
+
+    // `decimals()` is checked live at init and pinned; out-of-range values
+    // must fail before any liquidity is pulled.
+    let reflector_client = mock_sep40::MockSep40Client::new(&env, &reflector_id);
+    reflector_client.set_decimals(&1u32);
+    let bad_reflector_decimals = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_reflector_decimals);
+    assert_eq!(
+        c.try_initialize(&admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32, &treasury, &1000i128, &reflector_config, &None),
+        Err(Ok(Error::ReflectorDecimalsOutOfRange))
+    );
+    reflector_client.set_decimals(&REFLECTOR_DECIMALS);
+
+    let redstone_decimals_config = default_redstone_config(&env, &redstone_id);
+    let redstone_client = mock_sep40::MockSep40Client::new(&env, &redstone_id);
+    let price = 1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2);
+    let ts = env.ledger().timestamp();
+    mock_sep40::MockSep40Client::new(&env, &reflector_id)
+        .set_price(&default_reflector_config(&env, &reflector_id).asset, &price, &ts);
+    redstone_client.set_price(&redstone_decimals_config.asset, &price, &ts);
+    redstone_client.set_decimals(&31u32);
+    let bad_redstone_decimals = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &bad_redstone_decimals);
+    assert_eq!(
+        c.try_initialize(
+            &admin, &token_id, &6_000_000i128, &expiry, &3600u64, &lazer_id, &FEED_ID, &100u32, &20u32,
+            &treasury, &1000i128, &default_reflector_config(&env, &reflector_id), &Some(redstone_decimals_config),
+        ),
+        Err(Ok(Error::RedstoneDecimalsOutOfRange))
+    );
 }
 
 #[test]
@@ -480,7 +545,8 @@ fn init_rejects_oracle_with_no_price_for_the_asset() {
     );
 
     // Reflector priced, but the configured RedStone leg has no price.
-    mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(&price, &ts);
+    mock_sep40::MockSep40Client::new(&env, &reflector_id)
+        .set_price(&default_reflector_config(&env, &reflector_id).asset, &price, &ts);
     let no_redstone_price = env.register(PolarisMarket, ());
     let c = PolarisMarketClient::new(&env, &no_redstone_price);
     assert_eq!(
@@ -509,6 +575,39 @@ fn init_seeds_pool_and_pulls_liquidity() {
     let (yes_bps, no_bps) = client.get_price();
     assert_eq!(yes_bps, 5_000);
     assert_eq!(no_bps, 5_000);
+}
+
+#[test]
+fn runtime_negative_paths_return_typed_errors() {
+    // NotInitialized: every entrypoint loads state first, so a fresh
+    // instance reports this instead of trapping.
+    let env = Env::default();
+    env.mock_all_auths();
+    let uninitialized = env.register(PolarisMarket, ());
+    let c = PolarisMarketClient::new(&env, &uninitialized);
+    assert_eq!(c.try_get_fee(), Err(Ok(Error::NotInitialized)));
+
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 5_000);
+
+    // InvalidAmount: zero (and negative) sizes are rejected before any
+    // token transfer or AMM math.
+    assert_eq!(client.try_split(&user, &0), Err(Ok(Error::InvalidAmount)));
+    assert_eq!(client.try_merge(&user, &0), Err(Ok(Error::InvalidAmount)));
+    assert_eq!(client.try_transfer(&user, &user, &Prediction::Yes, &0), Err(Ok(Error::InvalidAmount)));
+
+    // NotFinalized: redeem only makes sense after settle/cancel.
+    assert_eq!(client.try_redeem(&user), Err(Ok(Error::NotFinalized)));
+
+    // InvalidPayload: expiry has passed, but the payload's price is zero,
+    // which the oracle parser accepts as a field yet settlement rejects.
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 0, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    assert_eq!(client.try_settle(&bytes), Err(Ok(Error::InvalidPayload)));
+    assert_eq!(client.get_market().status, MarketStatus::Open);
 }
 
 #[test]
@@ -1232,7 +1331,11 @@ fn settle_rejects_a_stale_reflector_price() {
 
     let stale_ts = h.expiry - REFLECTOR_MAX_STALENESS_SECS - 1;
     let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
-    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &stale_ts);
+    reflector_client.set_price(
+        &default_reflector_config(&h.env, &h.reflector_id).asset,
+        &(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &stale_ts,
+    );
 
     let res = client.try_settle(&bytes);
     assert_eq!(res, Err(Ok(Error::ReflectorPriceStale)));
@@ -1394,7 +1497,11 @@ fn settle_via_reflector_rejects_a_stale_price() {
     h.env.ledger().set_timestamp(h.expiry);
     let stale_ts = h.expiry - REFLECTOR_MAX_STALENESS_SECS - 1;
     let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
-    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &stale_ts);
+    reflector_client.set_price(
+        &default_reflector_config(&h.env, &h.reflector_id).asset,
+        &(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &stale_ts,
+    );
     let res = client.try_settle_via_reflector();
     assert_eq!(res, Err(Ok(Error::ReflectorPriceStale)));
     assert_eq!(client.get_market().status, MarketStatus::Open);
@@ -1409,7 +1516,11 @@ fn settle_via_reflector_does_not_overflow_on_a_u64_max_adjacent_timestamp() {
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     h.env.ledger().set_timestamp(h.expiry);
     let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
-    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &(u64::MAX - 1));
+    reflector_client.set_price(
+        &default_reflector_config(&h.env, &h.reflector_id).asset,
+        &(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &(u64::MAX - 1),
+    );
     let res = client.try_settle_via_reflector();
     assert_eq!(res, Err(Ok(Error::ReflectorPriceStale)));
     assert_eq!(client.get_market().status, MarketStatus::Open);
@@ -1425,7 +1536,11 @@ fn settle_via_reflector_rejects_a_price_that_predates_expiry_by_more_than_the_fr
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     let old_ts = h.expiry - PRICE_FRESHNESS_WINDOW_SECS - 1;
     let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
-    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &old_ts);
+    reflector_client.set_price(
+        &default_reflector_config(&h.env, &h.reflector_id).asset,
+        &(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &old_ts,
+    );
     h.env.ledger().set_timestamp(h.expiry);
     let res = client.try_settle_via_reflector();
     assert_eq!(res, Err(Ok(Error::StalePrice)));
@@ -1441,7 +1556,11 @@ fn settle_via_reflector_rejects_a_price_timestamped_after_the_freshness_window()
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     let future_ts = h.expiry + PRICE_FRESHNESS_WINDOW_SECS + 1;
     let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
-    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &future_ts);
+    reflector_client.set_price(
+        &default_reflector_config(&h.env, &h.reflector_id).asset,
+        &(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &future_ts,
+    );
     h.env.ledger().set_timestamp(future_ts);
     let res = client.try_settle_via_reflector();
     assert_eq!(res, Err(Ok(Error::FuturePrice)));
@@ -1454,7 +1573,11 @@ fn settle_via_reflector_accepts_a_price_at_the_freshness_window_edge() {
     let client = PolarisMarketClient::new(&h.env, &h.market_id);
     let edge_ts = h.expiry + PRICE_FRESHNESS_WINDOW_SECS;
     let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
-    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &edge_ts);
+    reflector_client.set_price(
+        &default_reflector_config(&h.env, &h.reflector_id).asset,
+        &(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &edge_ts,
+    );
     h.env.ledger().set_timestamp(edge_ts);
     client.settle_via_reflector();
     assert_eq!(client.get_market().status, MarketStatus::ResolvedYes);
@@ -1468,7 +1591,11 @@ fn settle_via_reflector_rejects_decimals_drift_since_initialize() {
     h.env.ledger().set_timestamp(h.expiry);
     let reflector_client = mock_sep40::MockSep40Client::new(&h.env, &h.reflector_id);
     reflector_client.set_decimals(&(REFLECTOR_DECIMALS + 1));
-    reflector_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &h.expiry);
+    reflector_client.set_price(
+        &default_reflector_config(&h.env, &h.reflector_id).asset,
+        &(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &h.expiry,
+    );
     let res = client.try_settle_via_reflector();
     assert_eq!(res, Err(Ok(Error::ReflectorDecimalsDriftedSinceInit)));
 }
@@ -1658,7 +1785,11 @@ fn settle_rejects_a_stale_redstone_price() {
     set_reflector_price_cents(&h, 1_000_000);
     let stale_ts = h.expiry - REFLECTOR_MAX_STALENESS_SECS - 1;
     let redstone_client = mock_sep40::MockSep40Client::new(&h.env, &redstone_id);
-    redstone_client.set_price(&(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &stale_ts);
+    redstone_client.set_price(
+        &default_redstone_config(&h.env, &redstone_id).asset,
+        &(1_000_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &stale_ts,
+    );
 
     let res = client.try_settle(&bytes);
     assert_eq!(res, Err(Ok(Error::RedstonePriceStale)));
@@ -2024,18 +2155,6 @@ fn zero_fee_config_charges_nothing_and_round_trip_loses_only_slippage() {
     assert_solvent(&h);
 }
 
-// ---------- global solvency invariant ----------
-
-pub(crate) fn assert_solvent(h: &Harness) {
-    let client = PolarisMarketClient::new(&h.env, &h.market_id);
-    let m = client.get_market();
-    let bal = token::Client::new(&h.env, &h.token_id).balance(&h.market_id);
-    assert_eq!(
-        bal, m.total_supply as i128,
-        "collateral balance must always equal total_supply"
-    );
-}
-
 // ---------- pool-depth guard ----------
 
 #[test]
@@ -2360,6 +2479,30 @@ fn full_lifecycle_initialize_split_buy_sell_settle_redeem_stays_solvent_at_every
     assert_eq!(client.get_market().total_supply, 0);
     assert_eq!(token.balance(&h.market_id), 0);
     assert_eq!(client.try_redeem(&alice), Err(Ok(Error::NothingToRedeem)));
+    assert_solvent(&h);
+}
+
+#[test]
+fn get_fee_returns_typed_error_after_settlement_and_full_redemption() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000);
+    client.split(&user, &1_000);
+
+    h.env.ledger().set_timestamp(h.expiry);
+    set_reflector_price_cents(&h, 1_000_000);
+    client.settle_via_reflector();
+
+    // Open-market fee curve is unavailable as soon as the market finalizes.
+    assert_eq!(client.try_get_fee(), Err(Ok(Error::MarketSettledOrCancelled)));
+
+    client.redeem(&user);
+    client.redeem(&h.treasury);
+    assert_eq!(client.get_market().total_supply, 0);
+
+    // The old implementation divided by this zero supply and trapped.
+    assert_eq!(client.try_get_fee(), Err(Ok(Error::MarketSettledOrCancelled)));
     assert_solvent(&h);
 }
 

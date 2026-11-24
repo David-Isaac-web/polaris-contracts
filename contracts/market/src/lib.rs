@@ -226,6 +226,22 @@ pub enum Error {
     /// `transfer`'s `to` is this contract's own address — shares sent there
     /// could never be moved out again, so they'd be permanently stranded.
     InvalidRecipient = 36,
+    // The variants below were dropped from this enum by an earlier merge
+    // resolution even though the entrypoints that return them survived.
+    // Appended with fresh codes per ERRORS.md's append-only policy rather
+    // than renumbering any code already in use above.
+    /// `initialize` probed `collateral.decimals()` and found more than 18.
+    InvalidCollateral = 37,
+    /// `accept_admin` with no proposal currently stored.
+    NoPendingAdmin = 38,
+    /// Caller is not the stored admin, or is not the exact pending admin
+    /// `accept_admin` expects.
+    Unauthorized = 39,
+    /// Reflector's price is timestamped further ahead of ledger time than
+    /// `MAX_FUTURE_SKEW_SECS` permits.
+    ReflectorPriceFutureDated = 40,
+    /// RedStone leg's equivalent of `ReflectorPriceFutureDated`.
+    RedstonePriceFutureDated = 41,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1294,8 +1310,17 @@ impl PolarisMarket {
     /// as `total_supply` grows. Authoritative source for what `buy`/`sell`
     /// will actually charge right now; callers shouldn't recompute the curve
     /// themselves against a possibly-stale `total_supply` read elsewhere.
+    ///
+    /// Open markets only, the same as `get_price`: after settlement or
+    /// cancellation there is no live fee curve to report, and fully redeemed
+    /// markets can have `total_supply == 0`. Returns
+    /// `MarketSettledOrCancelled` instead of a meaningless value or a
+    /// division-by-zero trap.
     pub fn get_fee(env: Env) -> Result<u32, Error> {
         let m = load_market(&env)?;
+        if m.status != MarketStatus::Open {
+            return Err(Error::MarketSettledOrCancelled);
+        }
         Ok(effective_fee_bps(&m))
     }
 

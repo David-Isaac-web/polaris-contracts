@@ -239,7 +239,9 @@ Errors cross the wasm boundary as bare `u32` codes, so a caller without
 the source sees only a number and a variant name. The name alone has to say
 which condition fired. Two pairs in `contracts/market` used to read as
 synonyms. They were renamed in
-[#58](https://github.com/PolarisQ-xyz/polaris-contracts/issues/58):
+[#58](https://github.com/PolarisQ-xyz/polaris-contracts/issues/58), and the
+same decimals pairs in `contracts/perpetual` were renamed in
+[#59](https://github.com/PolarisQ-xyz/polaris-contracts/issues/59):
 
 | Code | Old name | New name | Fires when |
 |---|---|---|---|
@@ -250,6 +252,8 @@ synonyms. They were renamed in
 | 32 | `RedstoneDecimalsInvalid` | `RedstoneDecimalsOutOfRange` | as 26, RedStone leg |
 | 33 | `RedstoneDecimalsChanged` | `RedstoneDecimalsDriftedSinceInit` | as 29, RedStone leg |
 
+The perpetual equivalents keep their own codes unchanged (22, 25, 28, 29).
+
 **Breaking change to the error ABI (names, not codes).** Every code is
 unchanged (`renamed_error_variants_keep_their_wire_codes` pins them), so a
 deployed instance and anything matching on numbers is unaffected. The
@@ -257,8 +261,7 @@ contract spec's variant names did change, so generated bindings (Rust via
 `polaris-interface`, TypeScript via `stellar contract bindings`) and any
 client matching on the old names must be regenerated or updated. That makes
 the next `polaris-interface` release a minor-version bump (0.2.0). See
-`interface/README.md`. `contracts/perpetual` has the same two decimals
-pairs under its own codes and is not renamed here.
+`interface/README.md`.
 
 ## Emergency pause
 
@@ -321,7 +324,11 @@ a curve: `effective_fee_bps = min_fee_bps + (base_fee_bps - min_fee_bps) *
 initial_liquidity / total_supply`. A fresh market charges `base_fee_bps`;
 as `total_supply` grows (more collateral locked via `split`/`buy`), the fee
 compresses toward `min_fee_bps` automatically. Query the current value with
-`get_fee()` rather than recomputing it elsewhere.
+`get_fee()` rather than recomputing it elsewhere. `get_fee()` is available
+only while a market is `Open`; after settlement/cancellation (or perpetual
+`terminate`) it returns the same not-open error as `get_price()` instead of
+a meaningless value, including when full redemption has made
+`total_supply == 0`.
 
 **Adjusting a live curve is decrease-only.** `set_fee_curve(base_fee_bps,
 min_fee_bps)` (admin-gated, `market` and `perpetual`, `Open` only) can
