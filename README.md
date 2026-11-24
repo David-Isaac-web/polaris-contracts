@@ -116,6 +116,9 @@ Polaris instead uses a **fully-collateralized conditional-token market**
 with a **constant-product AMM** (Uniswap-style `x*y=k`, not LMSR — LMSR needs
 floating-point `exp`/`ln`, which isn't safe to hand-roll in an integer-only
 WASM contract) for continuous pricing between the two outcome shares.
+Multi-outcome/categorical markets are out of scope for v1; the decision and
+the trigger for revisiting it are recorded in
+`docs/issues/29-multi-outcome-markets.md` (#29).
 
 ## Core mechanism
 
