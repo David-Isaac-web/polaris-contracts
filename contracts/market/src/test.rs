@@ -1429,6 +1429,92 @@ fn settle_via_reflector_no_wins_below_strike() {
     assert_solvent(&h);
 }
 
+// ---------- preview_settlement: read-only what-if ----------
+
+#[test]
+fn preview_settlement_matches_settle_and_changes_nothing() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.expiry * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+    set_reflector_price_cents(&h, 1_000_000);
+
+    let before = client.get_market();
+    let unchanged = (before.status, before.final_price, before.pool_yes, before.pool_no);
+    let preview = client.preview_settlement(&bytes);
+    assert_eq!(
+        preview,
+        SettlementPreview {
+            final_price: 1_000_000,
+            outcome: MarketStatus::ResolvedYes,
+        }
+    );
+    // Zero state change: still open, untouched price/pools.
+    let after_preview = client.get_market();
+    assert_eq!(
+        (after_preview.status, after_preview.final_price, after_preview.pool_yes, after_preview.pool_no),
+        unchanged
+    );
+
+    client.settle(&bytes);
+    let after = client.get_market();
+    assert_eq!(after.status, preview.outcome);
+    assert_eq!(after.final_price, preview.final_price);
+}
+
+#[test]
+fn preview_settlement_via_reflector_matches_settle_via_reflector() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    h.env.ledger().set_timestamp(h.expiry);
+    set_reflector_price_cents(&h, 999_900);
+
+    let before = client.get_market();
+    let unchanged = (before.status, before.final_price, before.pool_yes, before.pool_no);
+    let preview = client.preview_settlement_via_reflector();
+    assert_eq!(
+        preview,
+        SettlementPreview {
+            final_price: 999_900,
+            outcome: MarketStatus::ResolvedNo,
+        }
+    );
+    let after_preview = client.get_market();
+    assert_eq!(
+        (after_preview.status, after_preview.final_price, after_preview.pool_yes, after_preview.pool_no),
+        unchanged
+    );
+
+    client.settle_via_reflector();
+    assert_eq!(client.get_market().status, preview.outcome);
+}
+
+#[test]
+fn preview_settlement_reports_why_it_cannot_resolve_yet() {
+    let h = setup(1_000_000, 10_000);
+    let client = PolarisMarketClient::new(&h.env, &h.market_id);
+    let payload = build_payload(FEED_ID, 10_000_00000000, -8, h.env.ledger().timestamp() as u64 * 1_000_000);
+    let bytes = Bytes::from_slice(&h.env, &payload);
+
+    // Before expiry, the same error settle() would return.
+    assert_eq!(
+        client.try_preview_settlement(&bytes),
+        Err(Ok(Error::ExpiryNotReached))
+    );
+    assert_eq!(
+        client.try_preview_settlement_via_reflector(),
+        Err(Ok(Error::ExpiryNotReached))
+    );
+
+    h.env.ledger().set_timestamp(h.expiry);
+    // Reflector has no print yet — fails closed exactly as settle would.
+    assert_eq!(
+        client.try_preview_settlement_via_reflector(),
+        Err(Ok(Error::ReflectorPriceUnavailable))
+    );
+}
+
 /// The `settle` event's third data field is the path discriminator, so an
 /// indexer can tell the two settlement paths apart from the event alone.
 #[test]
