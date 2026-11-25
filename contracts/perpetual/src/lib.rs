@@ -134,12 +134,21 @@ pub enum Error {
     /// fails closed, same as `polaris-market`'s `settle`.
     ReflectorPriceUnavailable = 20,
     ReflectorPriceStale = 21,
-    ReflectorDecimalsInvalid = 22,
+    /// Reflector's live `decimals()` is outside `2..=30`, the range the
+    /// `10^decimals` cents scaling supports without overflow/underflow.
+    /// Checked at `initialize` and again on every checkpoint. Was
+    /// `ReflectorDecimalsInvalid` before #59 (same code).
+    ///
+    /// Not to be confused with `ReflectorDecimalsDriftedSinceInit`, which
+    /// is an in-range value that differs from the one pinned at init.
+    ReflectorDecimalsOutOfRange = 22,
     OracleDivergence = 23,
     InvalidReflectorConfig = 24,
     /// Reflector's live `decimals()` no longer matches the value pinned at
     /// `initialize()` — see `polaris_ctf_math::OracleCheckError::DecimalsChanged`.
-    ReflectorDecimalsChanged = 25,
+    /// Checkpoint-time only. Was `ReflectorDecimalsChanged` before #59
+    /// (same code).
+    ReflectorDecimalsDriftedSinceInit = 25,
     /// RedStone's `lastprice` returned `None` — same fail-closed treatment
     /// as the Reflector leg. RedStone is a required part of the
     /// `price_oracle` bundle whenever one is configured at all (see
@@ -148,12 +157,15 @@ pub enum Error {
     /// Reflector.
     RedstonePriceUnavailable = 26,
     RedstonePriceStale = 27,
-    RedstoneDecimalsInvalid = 28,
-    /// See `Error::ReflectorDecimalsChanged` — the same landmine RedStone's
-    /// own SEP-40 wrapper contract documents on-chain (its `decimals()` is
-    /// the max across every asset it has registered, not this asset's own
-    /// precision, and can change): see this repo's README.
-    RedstoneDecimalsChanged = 29,
+    /// RedStone leg's equivalent of `ReflectorDecimalsOutOfRange`. Was
+    /// `RedstoneDecimalsInvalid` before #59 (same code).
+    RedstoneDecimalsOutOfRange = 28,
+    /// See `Error::ReflectorDecimalsDriftedSinceInit` — the same landmine
+    /// RedStone's own SEP-40 wrapper contract documents on-chain (its
+    /// `decimals()` is the max across every asset it has registered, not
+    /// this asset's own precision, and can change): see this repo's README.
+    /// Was `RedstoneDecimalsChanged` before #59 (same code).
+    RedstoneDecimalsDriftedSinceInit = 29,
     InvalidRedstoneConfig = 30,
     /// `buy`/`sell` are blocked while the admin has paused trading — see
     /// `pause()`'s doc comment, identical rationale to `polaris-market`'s
@@ -162,6 +174,22 @@ pub enum Error {
     /// `transfer`'s `to` is this contract's own address — shares sent there
     /// could never be moved out again, so they'd be permanently stranded.
     InvalidRecipient = 32,
+    // The variants below were dropped from this enum by an earlier merge
+    // resolution even though the entrypoints that return them survived.
+    // Appended with fresh codes per ERRORS.md's append-only policy rather
+    // than renumbering any code already in use above.
+    /// `initialize` probed `collateral.decimals()` and found more than 18.
+    InvalidCollateral = 33,
+    /// `set_fee_curve` would have raised either bound of the fee curve.
+    FeeIncreaseNotAllowed = 34,
+    /// A replayed checkpoint payload carried a feed timestamp older than
+    /// the one already stored in `last_price_at`.
+    StaleCheckpoint = 35,
+    /// Reflector's price is timestamped further ahead of ledger time than
+    /// `MAX_FUTURE_SKEW_SECS` permits.
+    ReflectorPriceFutureDated = 36,
+    /// RedStone leg's equivalent of `ReflectorPriceFutureDated`.
+    RedstonePriceFutureDated = 37,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,10 +408,10 @@ impl PolarisPerpetual {
     ///   - `InvalidReflectorConfig` / `InvalidRedstoneConfig` — that leg's
     ///     `max_staleness_secs` is narrower than the oracle's own live
     ///     `resolution()`, so every checkpoint would be stale.
-    ///   - `ReflectorDecimalsInvalid` / `RedstoneDecimalsInvalid` — that
-    ///     leg's live `decimals()` is outside `2..=30`. The value read
+    ///   - `ReflectorDecimalsOutOfRange` / `RedstoneDecimalsOutOfRange` —
+    ///     that leg's live `decimals()` is outside `2..=30`. The value read
     ///     here is pinned and re-checked on every checkpoint (see
-    ///     `ReflectorDecimalsChanged`/`RedstoneDecimalsChanged`).
+    ///     `ReflectorDecimalsDriftedSinceInit`/`RedstoneDecimalsDriftedSinceInit`).
     ///
     /// Not validated here, and failing as a trap rather than a typed
     /// error: an oracle `contract` that doesn't implement SEP-40's
@@ -444,7 +472,7 @@ impl PolarisPerpetual {
             }
             let reflector_decimals_at_init = reflector_client.decimals();
             if !(2..=30).contains(&reflector_decimals_at_init) {
-                return Err(Error::ReflectorDecimalsInvalid);
+                return Err(Error::ReflectorDecimalsOutOfRange);
             }
             // Fail closed at init, not at first checkpoint: an oracle with
             // no price for the configured asset can never be used.
@@ -463,7 +491,7 @@ impl PolarisPerpetual {
             }
             let redstone_decimals_at_init = redstone_client.decimals();
             if !(2..=30).contains(&redstone_decimals_at_init) {
-                return Err(Error::RedstoneDecimalsInvalid);
+                return Err(Error::RedstoneDecimalsOutOfRange);
             }
             if redstone_client.lastprice(oracle.redstone.asset.clone()).is_none() {
                 return Err(Error::RedstonePriceUnavailable);
@@ -775,8 +803,8 @@ impl PolarisPerpetual {
             .map_err(|e| match e {
                 OracleCheckError::Unavailable => Error::ReflectorPriceUnavailable,
                 OracleCheckError::Stale => Error::ReflectorPriceStale,
-                OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsInvalid,
-                OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsChanged,
+                OracleCheckError::DecimalsInvalid => Error::ReflectorDecimalsOutOfRange,
+                OracleCheckError::DecimalsChanged => Error::ReflectorDecimalsDriftedSinceInit,
                 OracleCheckError::FutureDated => Error::ReflectorPriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             })?;
@@ -784,8 +812,8 @@ impl PolarisPerpetual {
             .map_err(|e| match e {
                 OracleCheckError::Unavailable => Error::RedstonePriceUnavailable,
                 OracleCheckError::Stale => Error::RedstonePriceStale,
-                OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsInvalid,
-                OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsChanged,
+                OracleCheckError::DecimalsInvalid => Error::RedstoneDecimalsOutOfRange,
+                OracleCheckError::DecimalsChanged => Error::RedstoneDecimalsDriftedSinceInit,
                 OracleCheckError::FutureDated => Error::RedstonePriceFutureDated,
                 OracleCheckError::Divergent => Error::OracleDivergence,
             })?;
@@ -901,8 +929,16 @@ impl PolarisPerpetual {
         Ok((yes_bps, 10_000 - yes_bps))
     }
 
+    /// Current swap fee (bps), same curve as `polaris-market`'s `get_fee`.
+    /// Open markets only, the same as `get_price`: once terminated there is
+    /// no live fee curve to report, and fully redeemed markets can have
+    /// `total_supply == 0`. Returns `MarketNotOpen` instead of a meaningless
+    /// value or a division-by-zero trap.
     pub fn get_fee(env: Env) -> Result<u32, Error> {
         let m = load_market(&env)?;
+        if m.status != PerpetualStatus::Open {
+            return Err(Error::MarketNotOpen);
+        }
         Ok(effective_fee_bps(&m))
     }
 }

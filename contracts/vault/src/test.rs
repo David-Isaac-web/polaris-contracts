@@ -455,7 +455,11 @@ fn redeem_from_market_traps_when_the_vault_holds_only_losing_shares() {
     // is zero, so `redeem` pays out 0.
     let payload = build_payload(FEED_ID, 500_000, -2, expiry * 1_000_000);
     let reflector_client = mock_reflector::MockReflectorClient::new(&h.env, &reflector_id);
-    reflector_client.set_price(&(500_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)), &expiry);
+    reflector_client.set_price(
+        &market_contract::Asset::Other(soroban_sdk::Symbol::new(&h.env, "XLM")),
+        &(500_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2)),
+        &expiry,
+    );
     market_client.settle(&Bytes::from_slice(&h.env, &payload));
 
     let (vault_yes, vault_no) = market_client.get_position(&h.vault_id);

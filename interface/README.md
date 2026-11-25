@@ -50,6 +50,13 @@ are not affected. Renamed in #58:
 - `RedstoneDecimalsInvalid` → `RedstoneDecimalsOutOfRange` (32)
 - `RedstoneDecimalsChanged` → `RedstoneDecimalsDriftedSinceInit` (33)
 
+Renamed in #59, under `perpetual`'s own codes (also names only):
+
+- `ReflectorDecimalsInvalid` → `ReflectorDecimalsOutOfRange` (22)
+- `ReflectorDecimalsChanged` → `ReflectorDecimalsDriftedSinceInit` (25)
+- `RedstoneDecimalsInvalid` → `RedstoneDecimalsOutOfRange` (28)
+- `RedstoneDecimalsChanged` → `RedstoneDecimalsDriftedSinceInit` (29)
+
 Added: `market::Client::get_pool_growth` and the `market::PoolGrowth` type
 (#31).
 

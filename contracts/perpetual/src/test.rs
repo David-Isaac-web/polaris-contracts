@@ -78,7 +78,7 @@ fn default_price_oracle(env: &Env, lazer_id: &Address, reflector_id: &Address, r
         reflector_decimals_at_init: 0,
         redstone: OracleFeedConfig {
             contract: redstone_id.clone(),
-            asset: polaris_ctf_math::sep40::Asset::Stellar(Address::generate(env)),
+            asset: polaris_ctf_math::sep40::Asset::Stellar(redstone_id.clone()),
             max_staleness_secs: REFLECTOR_MAX_STALENESS_SECS,
             tolerance_bps: REFLECTOR_TOLERANCE_BPS,
         },
@@ -122,8 +122,9 @@ fn setup_with_fees(initial_liquidity: i128, with_oracle: bool, base_fee_bps: u32
     if with_oracle {
         let price = 1_000i128 * 10i128.pow(REFLECTOR_DECIMALS - 2);
         let ts = env.ledger().timestamp();
-        mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(&price, &ts);
-        mock_sep40::MockSep40Client::new(&env, &redstone_id).set_price(&price, &ts);
+        let oracle = default_price_oracle(&env, &lazer_id, &reflector_id, &redstone_id);
+        mock_sep40::MockSep40Client::new(&env, &reflector_id).set_price(&oracle.reflector.asset, &price, &ts);
+        mock_sep40::MockSep40Client::new(&env, &redstone_id).set_price(&oracle.redstone.asset, &price, &ts);
     }
 
     let client = PolarisPerpetualClient::new(&env, &market_id);
@@ -340,12 +341,12 @@ fn split_then_merge_round_trips_collateral() {
     fund(&h, &user, 1_000);
 
     client.split(&user, &1_000i128);
-    assert_eq!(client.get_position(&user).yes, 1_000);
-    assert_eq!(client.get_position(&user).no, 1_000);
+    assert_eq!(client.get_position(&user).0, 1_000);
+    assert_eq!(client.get_position(&user).1, 1_000);
 
     client.merge(&user, &1_000i128);
-    assert_eq!(client.get_position(&user).yes, 0);
-    assert_eq!(client.get_position(&user).no, 0);
+    assert_eq!(client.get_position(&user).0, 0);
+    assert_eq!(client.get_position(&user).1, 0);
     assert_eq!(token::Client::new(&h.env, &h.token_id).balance(&user), 1_000);
     assert_solvent(&h);
 }
@@ -362,7 +363,7 @@ fn sell_large_enough_to_exhaust_a_reserve_is_rejected() {
     client.split(&user, &10_000i128);
     // Selling more YES than the pool holds must be rejected by the
     // pool-depth guard rather than draining the reserve.
-    let res = client.try_sell(&user, &Side::Yes, &20_000i128, &0i128);
+    let res = client.try_sell(&user, &Prediction::Yes, &20_000i128, &0i128);
     assert!(res.is_err(), "sell exceeding pool depth must be rejected");
     assert_solvent(&h);
 }
@@ -375,11 +376,11 @@ fn buy_then_sell_returns_close_to_original_minus_fees() {
     fund(&h, &user, 1_000);
 
     let start = token::Client::new(&h.env, &h.token_id).balance(&user);
-    client.buy(&user, &Side::Yes, &100i128, &1_000i128);
-    let yes = client.get_position(&user).yes;
+    client.buy(&user, &Prediction::Yes, &100i128, &1_000i128);
+    let yes = client.get_position(&user).0;
     assert!(yes > 0);
 
-    client.sell(&user, &Side::Yes, &yes, &0i128);
+    client.sell(&user, &Prediction::Yes, &yes, &0i128);
     let end = token::Client::new(&h.env, &h.token_id).balance(&user);
 
     // Round trip should return close to the original, minus fees and
@@ -397,13 +398,13 @@ fn fee_never_exceeds_base_even_if_total_supply_dips_back_toward_seed() {
     fund(&h, &user, 10_000);
 
     // Grow the pool, then shrink it back toward the seed size.
-    client.buy(&user, &Side::Yes, &5_000i128, &10_000i128);
-    let yes = client.get_position(&user).yes;
-    client.sell(&user, &Side::Yes, &yes, &0i128);
+    client.buy(&user, &Prediction::Yes, &5_000i128, &10_000i128);
+    let yes = client.get_position(&user).0;
+    client.sell(&user, &Prediction::Yes, &yes, &0i128);
 
     // A subsequent trade's fee must still be bounded by the base fee.
     let before = token::Client::new(&h.env, &h.token_id).balance(&user);
-    client.buy(&user, &Side::No, &100i128, &1_000i128);
+    client.buy(&user, &Prediction::No, &100i128, &1_000i128);
     let after = token::Client::new(&h.env, &h.token_id).balance(&user);
     let spent = before - after;
     assert!(spent >= 100, "must spend at least the requested amount");
@@ -419,10 +420,10 @@ fn normal_sized_trades_are_unaffected_by_the_pool_depth_guard() {
     fund(&h, &user, 1_000);
 
     // A normal-sized buy and sell should both succeed.
-    client.buy(&user, &Side::Yes, &100i128, &1_000i128);
-    let yes = client.get_position(&user).yes;
+    client.buy(&user, &Prediction::Yes, &100i128, &1_000i128);
+    let yes = client.get_position(&user).0;
     assert!(yes > 0);
-    client.sell(&user, &Side::Yes, &yes, &0i128);
+    client.sell(&user, &Prediction::Yes, &yes, &0i128);
     assert_solvent(&h);
 }
 
@@ -493,4 +494,41 @@ fn zero_fee_config_charges_nothing_and_round_trip_loses_only_slippage() {
     assert!(1_000 - back < 100, "loss must be slippage-only, got {}", 1_000 - back);
 
     assert_solvent(&h);
+}
+
+// ---------- get_fee after termination (#77) ----------
+
+#[test]
+fn get_fee_returns_typed_error_after_terminate_and_full_redemption() {
+    let h = setup(10_000, true);
+    let client = PolarisPerpetualClient::new(&h.env, &h.market_id);
+    let user = Address::generate(&h.env);
+    fund(&h, &user, 1_000);
+    client.split(&user, &1_000);
+
+    client.terminate(&h.admin);
+
+    // The fee curve only describes a live AMM, so a terminated instance
+    // reports a typed error rather than a meaningless value.
+    assert_eq!(client.try_get_fee(), Err(Ok(Error::MarketNotOpen)));
+
+    client.redeem(&user);
+    client.redeem(&h.treasury);
+    assert_eq!(client.get_market().total_supply, 0);
+
+    // The old implementation divided by this zero supply and trapped.
+    assert_eq!(client.try_get_fee(), Err(Ok(Error::MarketNotOpen)));
+    assert_solvent(&h);
+}
+
+// ---------- unambiguous error names (#59) ----------
+
+/// Same names-only rename as `polaris-market` (#58): every wire code stays
+/// exactly where a deployed caller might already be matching on it.
+#[test]
+fn renamed_error_variants_keep_their_wire_codes() {
+    assert_eq!(Error::ReflectorDecimalsOutOfRange as u32, 22);
+    assert_eq!(Error::ReflectorDecimalsDriftedSinceInit as u32, 25);
+    assert_eq!(Error::RedstoneDecimalsOutOfRange as u32, 28);
+    assert_eq!(Error::RedstoneDecimalsDriftedSinceInit as u32, 29);
 }

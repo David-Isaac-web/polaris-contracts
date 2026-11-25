@@ -23,8 +23,8 @@ with the next unused number. See `CONTRIBUTING.md`.
 | 6 | `InvalidFeedId` | Pyth Lazer feed id invalid | `initialize` | "Invalid price feed." |
 | 7 | `InvalidFeeBps` | Fee above `MAX_FEE_BPS` | `initialize` | "Fee is too high." |
 | 8 | `InvalidLiquidity` | Initial liquidity invalid | `initialize` | "Invalid initial liquidity." |
-| 9 | `MarketNotOpen` | Market is not in `Open` status | `split`, `merge`, `buy`, `sell`, `transfer` | "This market is no longer open." |
-| 10 | `TradingClosed` | Trading window has closed | `buy`, `sell` | "Trading has closed for this market." |
+| 9 | `MarketSettledOrCancelled` | Market is not in `Open` status | `split`, `merge`, `buy`, `sell`, `transfer`, `get_price`, `get_fee`, `get_pool_growth` | "This market is no longer open." |
+| 10 | `MarketExpiredAwaitingSettlement` | Trading window has closed | `buy`, `sell` | "Trading has closed for this market." |
 | 11 | `InvalidAmount` | Amount is zero or otherwise invalid | `split`, `merge`, `buy`, `sell`, `transfer`, `redeem` | "Enter a valid amount." |
 | 12 | `InsufficientBalance` | Caller lacks the shares/collateral | `merge`, `sell`, `transfer`, `redeem` | "Insufficient balance." |
 | 13 | `SlippageExceeded` | Trade output below `min_out` | `buy`, `sell` | "Price moved — slippage limit exceeded." |
@@ -40,16 +40,22 @@ with the next unused number. See `CONTRIBUTING.md`.
 | 23 | `PoolDepthExceeded` | Trade would drain an AMM reserve | `buy`, `sell` | "Trade is too large for the current pool." |
 | 24 | `ReflectorPriceUnavailable` | Reflector returned no price | `settle` | "Secondary oracle price unavailable." |
 | 25 | `ReflectorPriceStale` | Reflector price too old | `settle` | "Secondary oracle price is stale." |
-| 26 | `ReflectorDecimalsInvalid` | Reflector decimals out of range | `settle` | "Secondary oracle misconfigured." |
+| 26 | `ReflectorDecimalsOutOfRange` | Reflector decimals out of range | `settle` | "Secondary oracle misconfigured." |
 | 27 | `OracleDivergence` | Lazer and secondary oracle disagree | `settle` | "Oracles disagree — settlement rejected." |
 | 28 | `InvalidReflectorConfig` | Reflector config invalid at init | `initialize` | "Invalid secondary oracle config." |
-| 29 | `ReflectorDecimalsChanged` | Reflector decimals changed since init | `settle` | "Secondary oracle changed — settlement rejected." |
+| 29 | `ReflectorDecimalsDriftedSinceInit` | Reflector decimals changed since init | `settle` | "Secondary oracle changed — settlement rejected." |
 | 30 | `RedstonePriceUnavailable` | RedStone returned no price | `settle` | "Third oracle price unavailable." |
 | 31 | `RedstonePriceStale` | RedStone price too old | `settle` | "Third oracle price is stale." |
-| 32 | `RedstoneDecimalsInvalid` | RedStone decimals out of range | `settle` | "Third oracle misconfigured." |
-| 33 | `RedstoneDecimalsChanged` | RedStone decimals changed since init | `settle` | "Third oracle changed — settlement rejected." |
+| 32 | `RedstoneDecimalsOutOfRange` | RedStone decimals out of range | `settle` | "Third oracle misconfigured." |
+| 33 | `RedstoneDecimalsDriftedSinceInit` | RedStone decimals changed since init | `settle` | "Third oracle changed — settlement rejected." |
 | 34 | `InvalidRedstoneConfig` | RedStone config invalid at init | `initialize` | "Invalid third oracle config." |
 | 35 | `Paused` | Admin paused trading | `buy`, `sell` | "Trading is paused." |
+| 36 | `InvalidRecipient` | `transfer` target is this contract | `transfer` | "Cannot send shares to the contract." |
+| 37 | `InvalidCollateral` | Collateral token reports >18 decimals | `initialize` | "Unsupported collateral token." |
+| 38 | `NoPendingAdmin` | `accept_admin` with no pending proposal | `accept_admin` | "No admin change is pending." |
+| 39 | `Unauthorized` | Caller is not the expected admin | `propose_admin`, `accept_admin` | "Not authorized." |
+| 40 | `ReflectorPriceFutureDated` | Reflector price timestamped ahead of ledger time | `settle`, `settle_via_reflector` | "Secondary oracle price timestamp is invalid." |
+| 41 | `RedstonePriceFutureDated` | RedStone price timestamped ahead of ledger time | `settle`, `settle_via_reflector` | "Third oracle price timestamp is invalid." |
 
 ## `polaris-perpetual`
 
@@ -57,35 +63,41 @@ with the next unused number. See `CONTRIBUTING.md`.
 | ---: | --- | --- | --- | --- |
 | 1 | `NotInitialized` | Contract not initialized | any entrypoint before `initialize` | "Market is not set up yet." |
 | 2 | `AlreadyInitialized` | `initialize` called twice | `initialize` | "Market is already set up." |
-| 3 | `InvalidStrikePrice` | Strike price out of range | `initialize` | "Invalid strike price." |
-| 4 | `InvalidExpiry` | Expiry not in the future | `initialize` | "Invalid expiry." |
-| 5 | `InvalidGracePeriod` | Grace period out of range | `initialize` | "Invalid grace period." |
-| 6 | `MarketNotOpen` | Market is not in `Open` status | `open_position`, `close_position`, `deposit`, `withdraw` | "This market is no longer open." |
-| 7 | `InvalidAmount` | Amount is zero or otherwise invalid | `open_position`, `close_position`, `deposit`, `withdraw`, `liquidate` | "Enter a valid amount." |
-| 8 | `InsufficientBalance` | Caller lacks margin/collateral | `close_position`, `withdraw`, `liquidate` | "Insufficient balance." |
-| 9 | `SlippageExceeded` | Execution price outside limit | `open_position`, `close_position` | "Price moved — slippage limit exceeded." |
-| 10 | `ExpiryNotReached` | `settle` before expiry | `settle` | "Market has not expired yet." |
-| 11 | `InvalidPayload` | Malformed oracle update payload | `settle` | "Invalid price update." |
-| 12 | `FeedNotFound` | Feed id not present in update | `settle` | "Price feed not found in update." |
-| 13 | `StalePrice` | Price older than freshness window | `settle` | "Price update is stale." |
-| 14 | `FuturePrice` | Price timestamped in the future | `settle` | "Price update timestamp is invalid." |
-| 15 | `GracePeriodNotElapsed` | `cancel` before `expiry + grace` | `cancel` | "Grace period has not elapsed." |
-| 16 | `AlreadyFinalized` | Market already resolved/cancelled | `settle`, `cancel` | "Market is already finalized." |
-| 17 | `NotFinalized` | Market not yet resolved/cancelled | `withdraw` | "Market is not finalized yet." |
-| 18 | `PositionNotFound` | No open position for caller | `close_position`, `liquidate` | "No open position." |
-| 19 | `NotLiquidatable` | Position is above maintenance margin | `liquidate` | "Position is not liquidatable." |
-| 20 | `OracleDivergence` | Lazer and secondary oracle disagree | `settle` | "Oracles disagree — settlement rejected." |
-| 21 | `ReflectorPriceUnavailable` | Reflector returned no price | `settle` | "Secondary oracle price unavailable." |
-| 22 | `ReflectorPriceStale` | Reflector price too old | `settle` | "Secondary oracle price is stale." |
-| 23 | `ReflectorDecimalsInvalid` | Reflector decimals out of range | `settle` | "Secondary oracle misconfigured." |
-| 24 | `ReflectorDecimalsChanged` | Reflector decimals changed since init | `settle` | "Secondary oracle changed — settlement rejected." |
-| 25 | `InvalidReflectorConfig` | Reflector config invalid at init | `initialize` | "Invalid secondary oracle config." |
-| 26 | `InvalidFeeBps` | Fee above `MAX_FEE_BPS` | `initialize` | "Fee is too high." |
-| 27 | `InvalidLiquidity` | Initial liquidity invalid | `initialize` | "Invalid initial liquidity." |
-| 28 | `InvalidFeedId` | Pyth Lazer feed id invalid | `initialize` | "Invalid price feed." |
-| 29 | `PoolDepthExceeded` | Trade would drain the AMM reserve | `open_position`, `close_position` | "Trade is too large for the current pool." |
-| 30 | `InvalidLeverage` | Leverage outside allowed range | `open_position` | "Invalid leverage." |
-| 31 | `Paused` | Admin paused trading | `open_position`, `close_position` | "Trading is paused." |
+| 3 | `InvalidFeeBps` | Fee above `MAX_FEE_BPS` or an inverted curve | `initialize`, `set_fee_curve` | "Invalid fee settings." |
+| 4 | `InvalidLiquidity` | Initial liquidity invalid | `initialize` | "Invalid initial liquidity." |
+| 5 | `InvalidFeedId` | Feed id is the unset value 0 | `initialize` | "Invalid price feed." |
+| 6 | `MarketNotOpen` | Instance was terminated | split/merge/trade entrypoints, `get_price`, `get_fee` | "This market is no longer open." |
+| 7 | `InvalidAmount` | Amount is zero or negative | `split`, `merge`, `buy`, `sell`, `transfer` | "Enter a valid amount." |
+| 8 | `InsufficientBalance` | Caller lacks the shares | `merge`, `sell`, `transfer` | "Insufficient balance." |
+| 9 | `SlippageExceeded` | Trade output below `min_out` | `buy`, `sell` | "Price moved — slippage limit exceeded." |
+| 10 | `PoolDepthExceeded` | Trade would drain an AMM reserve | `buy`, `sell` | "Trade is too large for the current pool." |
+| 11 | `NotFinalized` | `redeem` before `terminate` | `redeem` | "Market is not finalized yet." |
+| 12 | `NothingToRedeem` | Caller holds no shares | `redeem` | "Nothing to redeem." |
+| 13 | `AlreadyFinalized` | `terminate` called twice | `terminate` | "Market is already finalized." |
+| 14 | `Unauthorized` | Caller is not the admin | `terminate` | "Not authorized." |
+| 15 | `PriceOracleNotConfigured` | Checkpointing on an instance with no oracle | `record_price_checkpoint` | "No price oracle configured." |
+| 16 | `InvalidPayload` | Malformed oracle update payload | `record_price_checkpoint` | "Invalid price update." |
+| 17 | `FeedNotFound` | Feed id not present in update | `record_price_checkpoint` | "Price feed not found in update." |
+| 18 | `StalePrice` | Price older than the freshness window | `record_price_checkpoint` | "Price update is stale." |
+| 19 | `FuturePrice` | Price timestamped in the future | `record_price_checkpoint` | "Price update timestamp is invalid." |
+| 20 | `ReflectorPriceUnavailable` | Reflector returned no price | `record_price_checkpoint` | "Secondary oracle price unavailable." |
+| 21 | `ReflectorPriceStale` | Reflector price too old | `record_price_checkpoint` | "Secondary oracle price is stale." |
+| 22 | `ReflectorDecimalsOutOfRange` | Reflector decimals out of range | `initialize`, `record_price_checkpoint` | "Secondary oracle misconfigured." |
+| 23 | `OracleDivergence` | Lazer and Reflector disagree | `record_price_checkpoint` | "Oracles disagree — checkpoint rejected." |
+| 24 | `InvalidReflectorConfig` | Reflector config invalid at init | `initialize` | "Invalid secondary oracle config." |
+| 25 | `ReflectorDecimalsDriftedSinceInit` | Reflector decimals changed since init | `record_price_checkpoint` | "Secondary oracle changed — checkpoint rejected." |
+| 26 | `RedstonePriceUnavailable` | RedStone returned no price | `record_price_checkpoint` | "Third oracle price unavailable." |
+| 27 | `RedstonePriceStale` | RedStone price too old | `record_price_checkpoint` | "Third oracle price is stale." |
+| 28 | `RedstoneDecimalsOutOfRange` | RedStone decimals out of range | `initialize`, `record_price_checkpoint` | "Third oracle misconfigured." |
+| 29 | `RedstoneDecimalsDriftedSinceInit` | RedStone decimals changed since init | `record_price_checkpoint` | "Third oracle changed — checkpoint rejected." |
+| 30 | `InvalidRedstoneConfig` | RedStone config invalid at init | `initialize` | "Invalid third oracle config." |
+| 31 | `Paused` | Admin paused trading | `buy`, `sell` | "Trading is paused." |
+| 32 | `InvalidRecipient` | `transfer` target is this contract | `transfer` | "Cannot send shares to the contract." |
+| 33 | `InvalidCollateral` | Collateral token reports >18 decimals | `initialize` | "Unsupported collateral token." |
+| 34 | `FeeIncreaseNotAllowed` | `set_fee_curve` would raise a bound | `set_fee_curve` | "Fee settings may only be lowered." |
+| 35 | `StaleCheckpoint` | Checkpoint payload older than the last one | `record_price_checkpoint` | "Price checkpoint is older than the latest one." |
+| 36 | `ReflectorPriceFutureDated` | Reflector price timestamped ahead of ledger time | `record_price_checkpoint` | "Secondary oracle price timestamp is invalid." |
+| 37 | `RedstonePriceFutureDated` | RedStone price timestamped ahead of ledger time | `record_price_checkpoint` | "Third oracle price timestamp is invalid." |
 
 ## `polaris-vault`
 
