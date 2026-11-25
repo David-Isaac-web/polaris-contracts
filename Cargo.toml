@@ -4,7 +4,7 @@ members = ["contracts/*", "interface", "tools/*"]
 
 [workspace.dependencies]
 soroban-sdk = "26.1.0"
-pyth-lazer-stellar-sdk = "0.3"
+pyth-lazer-stellar-sdk = "0.4"
 
 [profile.release]
 opt-level = "z"
